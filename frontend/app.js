@@ -2,6 +2,10 @@
 const root = document.querySelector("#app");
 const toast = document.querySelector("#toast");
 const CHARACTER_NAME = "「浮浪倾客」";
+const STORY_REPLY_PLACEHOLDER_MS = 1000;
+const VOICE_STATUS_TIMEOUT_MS = 15000;
+const VOICE_SYNTHESIS_TIMEOUT_MAX_MS = 240000;
+const VOICE_UNLOCK_WAV = "data:audio/wav;base64,UklGRiYAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YQIAAAAAAA==";
 
 const storyCatalog = [
   {
@@ -83,6 +87,10 @@ const appState = {
   chatSessionId: localStorage.getItem("wanderer-chat-session"),
   chatSession: null,
   pendingChat: null,
+  pausedChat: null,
+  chatDraft: "",
+  chatAbortController: null,
+  chatRequestToken: 0,
   regeneratingChat: false,
   revealChatReply: false,
   chatHistory: readChatHistory(),
@@ -91,6 +99,20 @@ const appState = {
   resumePromptRequired: false,
   resumePromptDismissed: false,
   busy: false,
+  pendingTurn: null,
+  voiceAvailable: false,
+  voiceConfigured: false,
+  voiceStatusChecked: false,
+  voiceStatusWaiters: [],
+  activeVoiceText: null,
+  voiceSequence: 0,
+  voiceAbortController: null,
+  voiceAudio: null,
+  voicePlayer: null,
+  voiceUnlocked: false,
+  voiceObjectUrl: null,
+  preparedVoiceAudios: new Set(),
+  voiceStopWaiters: new Set(),
 };
 
 function readChatHistory() {
@@ -149,15 +171,552 @@ async function request(path, options = {}) {
   return body.data;
 }
 
+async function responseError(response) {
+  let body = {};
+  try {
+    body = await response.json();
+  } catch {
+    return new Error("请求失败，请稍后重试。");
+  }
+  const details = body.error?.details || {};
+  const diagnosticLines = [
+    body.request_id ? `本地请求编号：${body.request_id}` : "",
+    details.provider_status ? `上游状态：HTTP ${details.provider_status}` : "",
+    details.provider_code ? `服务商错误码：${details.provider_code}` : "",
+    details.model ? `模型：${details.model}` : "",
+    details.endpoint ? `请求地址：${details.endpoint}` : "",
+    details.provider_request_id ? `服务商请求编号：${details.provider_request_id}` : "",
+  ].filter(Boolean);
+  return new Error([body.error?.message || "请求失败，请稍后重试。", ...diagnosticLines].join("\n"));
+}
+
+function parseSseFrame(frame) {
+  const data = frame
+    .split(/\r?\n/)
+    .filter((line) => line.startsWith("data:"))
+    .map((line) => line.slice(5).trimStart())
+    .join("\n");
+  if (!data || data === "[DONE]") return null;
+  return JSON.parse(data);
+}
+
+async function* readSseEvents(response) {
+  if (!response.body?.getReader) throw new Error("浏览器无法读取流式回复，请刷新后重试。");
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let buffer = "";
+  let completed = false;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+      let boundary = buffer.match(/\r?\n\r?\n/);
+      while (boundary?.index !== undefined) {
+        const frame = buffer.slice(0, boundary.index);
+        buffer = buffer.slice(boundary.index + boundary[0].length);
+        const event = parseSseFrame(frame);
+        if (event) yield event;
+        boundary = buffer.match(/\r?\n\r?\n/);
+      }
+      if (done) {
+        completed = true;
+        break;
+      }
+    }
+    const event = parseSseFrame(buffer);
+    if (event) yield event;
+  } finally {
+    if (!completed) await reader.cancel?.();
+    reader.releaseLock?.();
+  }
+}
+
+async function requestChatReply(path, message, signal, streamId) {
+  const response = await fetch(path, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Accept": "text/event-stream",
+      "X-Chat-Stream-ID": streamId,
+    },
+    body: JSON.stringify({ message }),
+    signal,
+  });
+  if (!response.ok) throw await responseError(response);
+  const contentType = response.headers?.get?.("content-type") || "";
+  if (!contentType.toLowerCase().includes("text/event-stream")) {
+    const body = await response.json();
+    return { result: body.data };
+  }
+  return { events: readSseEvents(response) };
+}
+
 function announce(message) {
   toast.textContent = message;
   toast.hidden = false;
   window.setTimeout(() => { toast.hidden = true; }, 2400);
 }
 
+function voicePauseMarkup(text = "") {
+  if (!appState.voiceAudio || !appState.activeVoiceText) return "";
+  if (text && appState.activeVoiceText !== text) return "";
+  const paused = appState.voiceAudio.paused;
+  return `<button class="chat-action voice-pause-action" type="button" data-action="pause-voice" aria-pressed="${paused}" title="${paused ? "继续朗读" : "暂停朗读"}">${paused ? "继续朗读" : "暂停朗读"}</button>`;
+}
+
+function renderVoiceState() {
+  if (appState.pendingChat?.streaming) return;
+  if (window.location.hash === "#/chat") renderChat();
+  else if (window.location.hash === "#/game" && appState.session) renderRoute();
+}
+
+function stopVoice(shouldRender = true) {
+  appState.voiceSequence += 1;
+  for (const cancel of appState.voiceStopWaiters) cancel();
+  appState.voiceStopWaiters.clear();
+  appState.voiceAbortController?.abort();
+  appState.voiceAbortController = null;
+  const audios = new Set(appState.preparedVoiceAudios);
+  if (appState.voiceAudio) audios.add(appState.voiceAudio);
+  if (appState.voicePlayer?.muted || appState.voicePlayer?.loop) audios.add(appState.voicePlayer);
+  for (const audio of audios) {
+    audio.pause();
+    audio.currentTime = 0;
+    audio.src = "";
+    audio.load?.();
+  }
+  appState.preparedVoiceAudios.clear();
+  if (appState.voiceObjectUrl && typeof URL?.revokeObjectURL === "function") URL.revokeObjectURL(appState.voiceObjectUrl);
+  appState.voiceAudio = null;
+  appState.voiceObjectUrl = null;
+  appState.activeVoiceText = null;
+  resolveVoiceStatusWaiters(false);
+  if (shouldRender) renderVoiceState();
+}
+
+function voicePlayer() {
+  if (typeof Audio !== "function") return null;
+  if (!appState.voicePlayer) appState.voicePlayer = new Audio();
+  return appState.voicePlayer;
+}
+
+function unlockVoiceFromGesture() {
+  const audio = voicePlayer();
+  if (!audio || appState.voiceUnlocked) return;
+  audio.muted = true;
+  audio.volume = 0;
+  audio.loop = true;
+  audio.src = VOICE_UNLOCK_WAV;
+  const playback = audio.play();
+  if (playback && typeof playback.then === "function") {
+    playback.then(() => { appState.voiceUnlocked = true; }).catch(() => {});
+  } else {
+    appState.voiceUnlocked = true;
+  }
+}
+
+function resolveVoiceStatusWaiters(available) {
+  const waiters = appState.voiceStatusWaiters.splice(0);
+  waiters.forEach((resolve) => resolve(available));
+}
+
+function waitForVoiceAvailability(timeoutMs = VOICE_STATUS_TIMEOUT_MS) {
+  if (appState.voiceAvailable) return Promise.resolve(true);
+  if (appState.voiceStatusChecked && !appState.voiceConfigured) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    let settled = false;
+    let waiter;
+    let timeoutId;
+    const finish = (available) => {
+      if (settled) return;
+      settled = true;
+      appState.voiceStatusWaiters = appState.voiceStatusWaiters.filter((pending) => pending !== waiter);
+      window.clearTimeout?.(timeoutId);
+      resolve(available);
+    };
+    waiter = finish;
+    appState.voiceStatusWaiters.push(waiter);
+    timeoutId = window.setTimeout(() => finish(false), timeoutMs);
+  });
+}
+
+function voiceSynthesisTimeout(text) {
+  const extraTime = Math.max(0, String(text || "").length - 80) * 500;
+  return Math.min(VOICE_SYNTHESIS_TIMEOUT_MAX_MS, VOICE_STATUS_TIMEOUT_MS + extraTime);
+}
+
+function waitForVoicePlayable(audio, signal, timeoutMs = 0) {
+  if (audio.readyState >= 3) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    let settled = false;
+    let timeoutId;
+    const finish = (ready) => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout?.(timeoutId);
+      audio.removeEventListener?.("canplay", onReady);
+      audio.removeEventListener?.("error", onError);
+      signal?.removeEventListener?.("abort", onAbort);
+      resolve(ready);
+    };
+    const onReady = () => finish(true);
+    const onError = () => finish(false);
+    const onAbort = () => finish(false);
+    audio.addEventListener?.("canplay", onReady, { once: true });
+    audio.addEventListener?.("error", onError, { once: true });
+    signal?.addEventListener?.("abort", onAbort, { once: true });
+    if (timeoutMs > 0) timeoutId = window.setTimeout(() => finish(false), timeoutMs);
+    if (audio.readyState >= 3) finish(true);
+    else if (signal?.aborted) finish(false);
+  });
+}
+
+async function playVoice(text, { automatic = false, waitUntilPlayable = false, beforePlay = null, shouldRender = true, signal = null } = {}) {
+  if (!text || typeof Audio !== "function") return false;
+  if (appState.activeVoiceText === text && appState.voiceAudio) {
+    appState.voiceAudio.currentTime = 0;
+    if (typeof beforePlay === "function") await beforePlay();
+    await appState.voiceAudio.play();
+    return true;
+  }
+  stopVoice(false);
+  const sequence = ++appState.voiceSequence;
+  const ready = automatic ? await waitForVoiceAvailability(VOICE_STATUS_TIMEOUT_MS) : appState.voiceAvailable;
+  if (sequence !== appState.voiceSequence || !ready) return false;
+  let audio = null;
+  let timeoutId;
+  const timeout = new Promise((resolve) => {
+    timeoutId = window.setTimeout(() => {
+      appState.voiceAvailable = false;
+      stopVoice(false);
+      window.setTimeout(loadVoiceStatus, 2000);
+      resolve(false);
+    }, voiceSynthesisTimeout(text));
+  });
+  try {
+    const playback = (async () => {
+      if (sequence !== appState.voiceSequence) return false;
+      audio = voicePlayer() || new Audio();
+      audio.pause();
+      audio.src = `/api/voice/stream?text=${encodeURIComponent(text)}`;
+      audio.muted = false;
+      audio.volume = 1;
+      audio.loop = false;
+      const playable = waitUntilPlayable ? waitForVoicePlayable(audio, signal) : null;
+      audio.load?.();
+      appState.voiceAudio = audio;
+      appState.activeVoiceText = text;
+      audio.onended = () => {
+        if (sequence === appState.voiceSequence) stopVoice(shouldRender);
+      };
+      if (playable && !await playable) {
+        if (!signal?.aborted) throw new Error("voice audio did not become playable");
+        return false;
+      }
+      if (sequence !== appState.voiceSequence || signal?.aborted) return false;
+      if (typeof beforePlay === "function") await beforePlay();
+      if (sequence !== appState.voiceSequence || signal?.aborted) return false;
+      await audio.play();
+      if (sequence !== appState.voiceSequence || audio.paused) return false;
+      if (shouldRender) renderVoiceState();
+      return true;
+    })();
+    const started = await Promise.race([playback, timeout]);
+    return started;
+  } catch (error) {
+    if (sequence !== appState.voiceSequence) return false;
+    appState.voiceAvailable = false;
+    stopVoice(false);
+    if (!automatic) announce("语音服务暂不可用，文字对话仍可继续。");
+    window.setTimeout(loadVoiceStatus, 2000);
+    return false;
+  } finally {
+    window.clearTimeout?.(timeoutId);
+  }
+}
+
+function disposePreparedVoice(audio) {
+  if (!audio) return;
+  appState.preparedVoiceAudios.delete(audio);
+  if (appState.voiceAudio === audio) {
+    appState.voiceAudio = null;
+    appState.activeVoiceText = null;
+  }
+  audio.pause();
+  audio.currentTime = 0;
+  audio.src = "";
+  audio.load?.();
+}
+
+async function prepareStreamingVoice(text, signal, sequence, availability) {
+  const available = await availability;
+  if (!available || signal?.aborted || sequence !== appState.voiceSequence || typeof Audio !== "function") return null;
+
+  let audio = voicePlayer();
+  if (!audio || appState.preparedVoiceAudios.has(audio) || (appState.voiceAudio === audio && !audio.ended)) {
+    audio = new Audio();
+  }
+  audio.pause();
+  audio.preload = "auto";
+  audio.src = `/api/voice/stream?text=${encodeURIComponent(text)}`;
+  audio.muted = false;
+  audio.volume = 1;
+  audio.loop = false;
+  appState.preparedVoiceAudios.add(audio);
+
+  const playable = waitForVoicePlayable(audio, signal);
+  audio.load?.();
+  const ready = await playable;
+  if (!ready || signal?.aborted || sequence !== appState.voiceSequence) {
+    disposePreparedVoice(audio);
+    return null;
+  }
+  return { audio, text };
+}
+
+async function playPreparedVoiceAndWait(prepared, signal, sequence, releaseText) {
+  const { audio, text } = prepared;
+  if (signal?.aborted || sequence !== appState.voiceSequence) {
+    disposePreparedVoice(audio);
+    return false;
+  }
+
+  appState.voiceAudio = audio;
+  appState.activeVoiceText = text;
+  let releasePromise = null;
+  let sawPlaying = false;
+  let resolveStart;
+  let resolveCancelled;
+  let startTimeoutId;
+  const started = new Promise((resolve) => { resolveStart = resolve; });
+  const cancelled = new Promise((resolve) => { resolveCancelled = resolve; });
+  const release = () => {
+    if (!releasePromise) releasePromise = Promise.resolve(typeof releaseText === "function" ? releaseText() : undefined);
+    return releasePromise;
+  };
+  const onPlaying = () => {
+    if (sawPlaying) return;
+    sawPlaying = true;
+    release();
+    resolveStart("playing");
+  };
+  const onStartError = () => resolveStart("failed");
+  const onCancelled = () => {
+    resolveStart("cancelled");
+    resolveCancelled();
+  };
+  let cleanupEnded = () => {};
+  const ended = new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      cleanupEnded();
+      resolve();
+    };
+    cleanupEnded = () => {
+      audio.removeEventListener?.("ended", finish);
+      audio.removeEventListener?.("error", finish);
+      signal?.removeEventListener?.("abort", finish);
+    };
+    audio.addEventListener?.("ended", finish, { once: true });
+    audio.addEventListener?.("error", finish, { once: true });
+    signal?.addEventListener?.("abort", finish, { once: true });
+    if (audio.ended || signal?.aborted) finish();
+  });
+  audio.addEventListener?.("playing", onPlaying, { once: true });
+  audio.addEventListener?.("error", onStartError, { once: true });
+  signal?.addEventListener?.("abort", onCancelled, { once: true });
+  appState.voiceStopWaiters.add(onCancelled);
+  startTimeoutId = window.setTimeout(() => resolveStart("failed"), voiceSynthesisTimeout(text));
+
+  try {
+    try {
+      const playback = audio.play();
+      if (playback && typeof playback.catch === "function") playback.catch(onStartError);
+    } catch {
+      onStartError();
+    }
+    const outcome = await started;
+    window.clearTimeout?.(startTimeoutId);
+    if (outcome !== "playing") {
+      if (outcome === "failed" && !signal?.aborted && sequence === appState.voiceSequence) await release();
+      return false;
+    }
+    await release();
+    if (signal?.aborted || sequence !== appState.voiceSequence || audio.paused) return false;
+    await Promise.race([ended, cancelled]);
+    return !signal?.aborted && sequence === appState.voiceSequence;
+  } catch {
+    if (!signal?.aborted && sequence === appState.voiceSequence) await release();
+    return false;
+  } finally {
+    window.clearTimeout?.(startTimeoutId);
+    audio.removeEventListener?.("playing", onPlaying);
+    audio.removeEventListener?.("error", onStartError);
+    signal?.removeEventListener?.("abort", onCancelled);
+    appState.voiceStopWaiters.delete(onCancelled);
+    cleanupEnded();
+    disposePreparedVoice(audio);
+  }
+}
+
+function createStreamingVoiceQueue(signal, releaseText) {
+  const sequence = appState.voiceSequence;
+  const availability = waitForVoiceAvailability(VOICE_STATUS_TIMEOUT_MS);
+  const items = [];
+  let closed = false;
+  let cancelled = false;
+  let textOnly = false;
+  let wake = null;
+
+  const notify = () => {
+    const resolve = wake;
+    wake = null;
+    if (resolve) resolve();
+  };
+  const isCancelled = () => cancelled || signal?.aborted || sequence !== appState.voiceSequence;
+  const ensureLookahead = () => {
+    for (const item of items.slice(0, 2)) {
+      if (!item.prepared) item.prepared = prepareStreamingVoice(item.text, signal, sequence, availability);
+    }
+  };
+  const waitForSelectedVoice = (item) => {
+    let timeoutId;
+    let timedOut = false;
+    const timeout = new Promise((resolve) => {
+      timeoutId = window.setTimeout(() => {
+        timedOut = true;
+        resolve(null);
+      }, voiceSynthesisTimeout(item.text));
+    });
+    return Promise.race([item.prepared, timeout]).then((prepared) => {
+      window.clearTimeout?.(timeoutId);
+      if (prepared || !timedOut) return prepared;
+      appState.voiceAvailable = false;
+      window.setTimeout(loadVoiceStatus, 2000);
+      item.prepared.then((latePrepared) => {
+        if (latePrepared) disposePreparedVoice(latePrepared.audio);
+      }).catch(() => {});
+      return null;
+    });
+  };
+  const releaseTextOnlyItems = async () => {
+    while (items.length) {
+      const item = items.shift();
+      await releaseText(item.fullText);
+      item.prepared?.then((latePrepared) => {
+        if (latePrepared) disposePreparedVoice(latePrepared.audio);
+      }).catch(() => {});
+    }
+  };
+
+  const done = (async () => {
+    while (true) {
+      if (isCancelled()) return;
+      if (!items.length) {
+        if (closed) return;
+        await new Promise((resolve) => { wake = resolve; });
+        continue;
+      }
+
+      ensureLookahead();
+      const item = items[0];
+      const prepared = await waitForSelectedVoice(item);
+      if (isCancelled()) return;
+      if (!prepared && !appState.voiceAvailable) {
+        textOnly = true;
+      }
+      if (textOnly) {
+        await releaseTextOnlyItems();
+        continue;
+      }
+      if (prepared) {
+        await playPreparedVoiceAndWait(prepared, signal, sequence, () => releaseText(item.fullText));
+      } else {
+        await releaseText(item.fullText);
+      }
+      items.shift();
+      ensureLookahead();
+    }
+  })();
+
+  signal?.addEventListener?.("abort", notify, { once: true });
+  return {
+    enqueue(text, fullText) {
+      if (closed || isCancelled()) return;
+      if (textOnly) {
+        void releaseText(fullText);
+        return;
+      }
+      items.push({ text, fullText, prepared: null });
+      ensureLookahead();
+      notify();
+    },
+    close() {
+      closed = true;
+      notify();
+    },
+    cancel() {
+      if (cancelled) return;
+      cancelled = true;
+      closed = true;
+      stopVoice(false);
+      notify();
+    },
+    done,
+  };
+}
+
+function pauseVoice() {
+  const audio = appState.voiceAudio;
+  if (!audio) return;
+  if (audio.paused) {
+    unlockVoiceFromGesture();
+    const playback = audio.play();
+    if (playback && typeof playback.catch === "function") playback.catch(() => {});
+  } else {
+    audio.pause();
+  }
+  renderVoiceState();
+}
+
+async function loadVoiceStatus() {
+  try {
+    const result = await request("/api/voice/status");
+    appState.voiceConfigured = Boolean(result.configured || result.enabled);
+    appState.voiceAvailable = Boolean(result.enabled);
+    appState.voiceStatusChecked = true;
+    if (!appState.voiceAvailable) {
+      if (appState.voiceAudio || appState.voiceAbortController) {
+        stopVoice(false);
+        renderVoiceState();
+      }
+      if (appState.voiceConfigured) {
+        window.setTimeout(loadVoiceStatus, 2000);
+      } else {
+        resolveVoiceStatusWaiters(false);
+      }
+      return;
+    }
+    resolveVoiceStatusWaiters(true);
+  } catch {
+    appState.voiceAvailable = false;
+    appState.voiceConfigured = false;
+    appState.voiceStatusChecked = true;
+    resolveVoiceStatusWaiters(false);
+  }
+}
+
 function setBusy(value) {
   appState.busy = value;
-  root.querySelectorAll("button,input").forEach((control) => { control.disabled = value; });
+  root.querySelectorAll("button,input").forEach((control) => {
+    const keepChatInput = appState.pendingChat && control.matches?.("[data-chat-input]");
+    const keepCurrentChatDelete = appState.pendingChat
+      && control.dataset.action === "delete-chat"
+      && control.dataset.chatSession === appState.chatSessionId;
+    control.disabled = value && control.dataset.action !== "pause-chat" && !keepChatInput && !keepCurrentChatDelete;
+  });
 }
 
 function showError(message) {
@@ -253,19 +812,25 @@ function chatMessageText(message) {
 
 function renderReplyActions({ index, canRegenerate = false }) {
   const copy = `<button class="chat-action" type="button" data-action="copy-reply" data-index="${index}" title="复制这条回复">复制</button>`;
+  const text = appState.chatSession?.messages?.[index]?.reply || "";
+  const voice = voicePauseMarkup(text);
   const regenerate = canRegenerate ? `<button class="chat-action" type="button" data-action="regenerate-reply" title="让${CHARACTER_NAME}重新回应这条消息">重新生成</button>` : "";
-  return `<div class="chat-actions">${copy}${regenerate}</div>`;
+  return `<div class="chat-actions">${copy}${regenerate}${voice}</div>`;
 }
 
 function renderChatMessage(message, playerName = appState.playerName || "你", actions = {}) {
   if (message?.role) {
     const pending = message.pending ? " pending" : "";
+    const paused = message.paused ? " paused" : "";
     const reveal = message.reveal ? " reveal" : "";
-    const text = message.pending ? `${CHARACTER_NAME}正在回应……` : chatMessageText(message);
+    const text = message.pending
+      ? `${CHARACTER_NAME}正在思考……`
+      : (message.paused ? `${CHARACTER_NAME}已暂停思考。` : chatMessageText(message));
     const isAssistant = message.role !== "user";
-    const showActions = isAssistant && !message.pending && Number.isInteger(actions.index);
+    const showActions = isAssistant && !message.pending && !message.paused && Number.isInteger(actions.index);
     const replyActions = showActions ? renderReplyActions({ index: actions.index, canRegenerate: Boolean(actions.canRegenerate) }) : "";
-    return `<div class="chat-message ${message.role === "user" ? "user" : "assistant"}${pending}${reveal}"><div class="chat-speaker">${message.role === "user" ? escapeHtml(playerName) : CHARACTER_NAME}</div><p>${escapeHtml(text)}</p><time>${escapeHtml(message.created_at || "")}</time>${replyActions}</div>`;
+    const streamingReply = message.streaming ? " data-streaming-reply" : "";
+    return `<div class="chat-message ${message.role === "user" ? "user" : "assistant"}${pending}${paused}${reveal}"><div class="chat-speaker">${message.role === "user" ? escapeHtml(playerName) : CHARACTER_NAME}</div><p${streamingReply}>${escapeHtml(text)}</p><time>${escapeHtml(message.created_at || "")}</time>${replyActions}</div>`;
   }
   return `${renderChatMessage({ role: "user", message: message?.message }, playerName)}${renderChatMessage({ role: "assistant", reply: message?.reply, reveal: message?.reveal }, playerName, actions)}`;
 }
@@ -292,11 +857,30 @@ function renderChat() {
     ? `${renderChatMessage({ role: "user", message: regeneratingMessage.message }, chatPlayerName)}${renderChatMessage({ role: "assistant", pending: true }, chatPlayerName)}`
     : "";
   const pendingMarkup = appState.pendingChat
-    ? `${renderChatMessage({ role: "user", message: appState.pendingChat.message }, chatPlayerName)}${renderChatMessage({ role: "assistant", pending: true }, chatPlayerName)}`
+    ? `${renderChatMessage({ role: "user", message: appState.pendingChat.message }, chatPlayerName)}${renderChatMessage(
+        appState.pendingChat.reply
+          ? {
+              role: "assistant",
+              reply: appState.pendingChat.reply,
+              reveal: Boolean(appState.pendingChat.streamingReveal),
+              streaming: Boolean(appState.pendingChat.streaming),
+            }
+          : { role: "assistant", pending: true },
+        chatPlayerName,
+      )}`
+    : "";
+  const pausedMarkup = appState.pausedChat
+    ? `${renderChatMessage({ role: "user", message: appState.pausedChat.message }, chatPlayerName)}${renderChatMessage({ role: "assistant", paused: true }, chatPlayerName)}`
     : "";
   const messageMarkup = messages.length
-    ? `${storedMarkup}${regeneratingMarkup}${pendingMarkup}`
-    : (pendingMarkup || `<div class="chat-empty"><div class="role-symbol" aria-hidden="true">風</div><h2>让风听见你的话</h2><p>这里没有预设选项。你可以直接说出想问的事，${CHARACTER_NAME}会以自己的方式回应。</p></div>`);
+    ? `${storedMarkup}${regeneratingMarkup}${pendingMarkup}${pausedMarkup}`
+    : (pendingMarkup || pausedMarkup || `<div class="chat-empty"><div class="role-symbol" aria-hidden="true">風</div><h2>让风听见你的话</h2><p>这里没有预设选项。你可以直接说出想问的事，${CHARACTER_NAME}会以自己的方式回应。</p></div>`);
+  const draft = appState.pausedChat
+    ? (appState.pausedChat.draft || appState.pausedChat.message || "")
+    : appState.chatDraft;
+  const chatSubmitButton = appState.pendingChat
+    ? `<button class="primary-btn" type="button" data-action="pause-chat" title="暂停本轮思考">暂停</button>`
+    : `<button class="primary-btn" type="submit">发送</button>`;
   root.innerHTML = `
     <section class="chat-layout">
       <aside class="chat-history">
@@ -308,7 +892,7 @@ function renderChat() {
         <p class="chat-disclaimer">自由对话不改变剧情模式的状态与结局。</p>
         <div class="chat-messages" aria-live="polite">${messageMarkup}</div>
         <div data-chat-error></div>
-        ${session ? `<form class="input-row chat-input-row" data-form="chat"><label class="screen-reader" for="chat-message">输入对话</label><input id="chat-message" maxlength="1000" placeholder="说点什么……" autocomplete="off"><button class="primary-btn" type="submit">发送</button></form>` : `<button class="primary-btn chat-start-btn" data-action="start-chat">开始自由对话</button>`}
+        ${session ? `<form class="input-row chat-input-row" data-form="chat"><label class="screen-reader" for="chat-message">输入对话</label><input id="chat-message" data-chat-input maxlength="1000" value="${escapeHtml(draft)}" placeholder="说点什么……" autocomplete="off">${chatSubmitButton}</form>` : `<button class="primary-btn chat-start-btn" data-action="start-chat">开始自由对话</button>`}
       </section>
     </section>`;
 }
@@ -319,15 +903,17 @@ function renderGame() {
   const state = session.state;
   const response = session.last_response;
   const history = state.history || [];
+  const pendingTurn = appState.pendingTurn;
   // The backend records the submitted choice on the current history item before
   // returning its response. Keep that player input visible in the same turn;
   // the response is rendered from last_response below to avoid duplicating it.
-  const completedHistory = history.slice(0, -1);
-  const currentPlayerInput = state.is_finished ? null : history.at(-1)?.player_input;
+  const completedHistory = pendingTurn ? history : history.slice(0, -1);
+  const currentPlayerInput = pendingTurn?.playerText || (state.is_finished ? null : history.at(-1)?.player_input);
   const playerName = state.player_name || appState.playerName || "你";
   const lines = completedHistory.map((item) => `<div class="dialogue player"><div class="speaker">${escapeHtml(playerName)}</div><p>${escapeHtml(item.player_input)}</p></div><div class="dialogue"><div class="speaker">${CHARACTER_NAME}</div><p>${escapeHtml(item.response_summary)}</p></div>`).join("");
   const currentLine = currentPlayerInput ? `<div class="dialogue player"><div class="speaker">${escapeHtml(playerName)}</div><p>${escapeHtml(currentPlayerInput)}</p></div>` : "";
-  const options = response?.next_scene?.options || [];
+  const renderedResponse = pendingTurn ? { reply: "……" } : response;
+  const options = pendingTurn ? [] : response?.next_scene?.options || [];
   const ended = state.is_finished;
 
   if (ended) return renderEnding(response, appState.ending, playerName);
@@ -347,17 +933,15 @@ function renderGame() {
         <button class="quiet-btn" data-action="restart">重新开始</button>
       </aside>
       <section class="conversation" aria-label="互动故事">
-        <div class="scene-head"><h3 class="scene-title">${escapeHtml(sceneLabel(state.scene_id))}</h3><span class="turn-count">第 ${state.turn_count + 1} 回合</span></div>
+        <div class="scene-head"><div class="scene-head-title"><h3 class="scene-title">${escapeHtml(sceneLabel(state.scene_id))}</h3><span class="turn-count">第 ${state.turn_count + 1} 回合</span></div></div>
         ${state.turn_count === 0 ? `<section class="story-briefing" aria-label="前情概要"><h2>前情概要</h2><p>须弥近郊有人委托调查一宗旧档案篡改事件，唯一知情的目击者也失去了踪迹。你将和${CHARACTER_NAME}沿着遗留线索寻找真相，并决定保护谁、公开什么，以及谁来承担代价。</p><p>本局将以「${escapeHtml(playerName)}」称呼你。</p></section>` : ""}
         <p class="scene-copy">${escapeHtml(sceneDescriptions[state.scene_id] || `风从身侧掠过，${CHARACTER_NAME}等着你给出一个理由。`)}</p>
         <div class="dialogue-list">
           ${lines}${currentLine}
-          ${response ? `<div class="dialogue"><div class="speaker">${CHARACTER_NAME}</div><p>${escapeHtml(response.reply)}</p></div>` : ""}
+          ${renderedResponse ? `<div class="dialogue"><div class="speaker">${CHARACTER_NAME}</div><div class="dialogue-content"><p>${escapeHtml(renderedResponse.reply)}</p></div></div>` : ""}
         </div>
         <div data-error></div>
         ${options.length ? `<div class="options" aria-label="可选行动">${options.map((option) => `<button class="option-btn" data-action="option" data-option="${escapeHtml(option.id)}">${escapeHtml(option.text)}</button>`).join("")}</div>` : ""}
-
-        <p class="loading" data-loading hidden>正在整理这段回应……</p>
       </section>
     </section>`;
 }
@@ -366,7 +950,8 @@ function renderEnding(response, ending, playerName = "你") {
   const endingDetails = ending
     ? `<div class="ending-id">结局记录 · ${escapeHtml(endingLabel(ending.ending_id))}</div><h2>${escapeHtml(ending.title)}</h2><p>${escapeHtml(ending.summary)}</p>`
     : `<p class="ending-pending">结局说明暂不可用。</p>`;
-  root.innerHTML = `<section class="result"><div class="eyebrow">旅途记录</div><h1>旅途暂告一段落</h1>${endingDetails}<section class="ending-epilogue"><h2>旅途之后</h2><p>${escapeHtml(endingEpilogue(ending?.ending_id, playerName))}</p></section><div class="ending-quote"><span class="speaker">${CHARACTER_NAME}</span><p>${escapeHtml(response?.reply || "风停了片刻。接下来要走哪条路，由你自己决定。")}</p></div><button class="primary-btn" data-action="restart">重新开始</button></section>`;
+  const reply = response?.reply || "风停了片刻。接下来要走哪条路，由你自己决定。";
+  root.innerHTML = `<section class="result"><div class="scene-head"><span class="eyebrow">旅途记录</span></div><h1>旅途暂告一段落</h1>${endingDetails}<section class="ending-epilogue"><h2>旅途之后</h2><p>${escapeHtml(endingEpilogue(ending?.ending_id, playerName))}</p></section><div class="ending-quote"><span class="speaker">${CHARACTER_NAME}</span><p>${escapeHtml(reply)}</p></div><button class="primary-btn" data-action="restart">重新开始</button></section>`;
 }
 
 async function startSession(replayId = appState.selectedReplayId) {
@@ -378,6 +963,9 @@ async function startSession(replayId = appState.selectedReplayId) {
     return;
   }
   appState.playerName = playerName;
+  stopVoice(false);
+  unlockVoiceFromGesture();
+  appState.pendingTurn = null;
   localStorage.setItem("wanderer-player-name", appState.playerName);
   setBusy(true);
   try {
@@ -391,6 +979,7 @@ async function startSession(replayId = appState.selectedReplayId) {
     appState.resumePromptRequired = false;
     window.location.hash = "#/game";
     renderGame();
+    if (session.last_response?.reply) void playVoice(session.last_response.reply, { automatic: true });
   } catch (error) {
     showError(error.message);
   } finally {
@@ -400,27 +989,41 @@ async function startSession(replayId = appState.selectedReplayId) {
 
 async function submitTurn(input) {
   if (!appState.sessionId || appState.busy) return;
+  stopVoice(false);
+  unlockVoiceFromGesture();
+  const options = appState.session?.last_response?.next_scene?.options || [];
+  const selectedOption = options.find((option) => option.id === input.option_id);
+  appState.pendingTurn = {
+    playerText: selectedOption?.text || "选择了一个行动",
+    startedAt: Date.now(),
+  };
   setBusy(true);
-  const loading = root.querySelector("[data-loading]");
-  if (loading) loading.hidden = false;
+  renderGame();
   try {
     const result = await request(`/api/sessions/${appState.sessionId}/turn`, { method: "POST", body: JSON.stringify(input) });
+    const elapsed = Date.now() - appState.pendingTurn.startedAt;
+    const remaining = Math.max(0, STORY_REPLY_PLACEHOLDER_MS - elapsed);
+    if (remaining > 0) await new Promise((resolve) => window.setTimeout(resolve, remaining));
     appState.session.state = result.state;
     appState.session.last_response = result.response;
     appState.ending = result.ending || null;
+    appState.pendingTurn = null;
     renderGame();
+    if (result.response?.reply) void playVoice(result.response.reply, { automatic: true });
   } catch (error) {
-    setBusy(false);
+    appState.pendingTurn = null;
+    renderGame();
     showError(error.message);
   } finally {
     appState.busy = false;
-    root.querySelectorAll("button,input").forEach((control) => { control.disabled = false; });
+    setBusy(false);
   }
 }
 
 async function restoreSession() {
   if (!appState.sessionId) return;
   try {
+    appState.pendingTurn = null;
     appState.session = await request(`/api/sessions/${appState.sessionId}`);
     appState.ending = appState.session.ending || null;
     appState.resumePromptRequired = !appState.session.state?.is_finished;
@@ -439,8 +1042,10 @@ async function restoreSession() {
 
 async function restartSession() {
   if (!appState.sessionId) return startSession();
+  stopVoice(false);
   setBusy(true);
   try {
+    appState.pendingTurn = null;
     const session = await request(`/api/sessions/${appState.sessionId}/restart`, { method: "POST" });
     appState.sessionId = session.session_id;
     appState.session = session;
@@ -460,6 +1065,10 @@ async function startChatSession() {
     renderNameGate("chat");
     return;
   }
+  stopVoice(false);
+  appState.pendingChat = null;
+  appState.pausedChat = null;
+  appState.chatDraft = "";
   setBusy(true);
   try {
     const session = await request("/api/chat/sessions", { method: "POST", body: JSON.stringify({ player_name: appState.playerName || "同行者" }) });
@@ -477,6 +1086,7 @@ async function startChatSession() {
 
 async function restoreChatSession(sessionId = appState.chatSessionId) {
   if (!sessionId) return;
+  stopVoice(false);
   try {
     appState.chatSession = await request(`/api/chat/sessions/${sessionId}`);
     appState.chatSessionId = appState.chatSession.chat_session_id || appState.chatSession.session_id || sessionId;
@@ -487,6 +1097,9 @@ async function restoreChatSession(sessionId = appState.chatSessionId) {
     rememberChatSession(appState.chatSessionId);
     rememberChatTitle(appState.chatSessionId, appState.chatSession.title);
     localStorage.setItem("wanderer-chat-session", appState.chatSessionId);
+    appState.pendingChat = null;
+    appState.pausedChat = null;
+    appState.chatDraft = "";
     renderChat();
   } catch (error) {
     if (sessionId === appState.chatSessionId) {
@@ -497,32 +1110,145 @@ async function restoreChatSession(sessionId = appState.chatSessionId) {
   }
 }
 
+function chatAbortError() {
+  const error = new Error("aborted");
+  error.name = "AbortError";
+  return error;
+}
+
+function releaseStreamingChatText(text) {
+  const pending = appState.pendingChat;
+  if (!pending?.streaming) return;
+  pending.reply = text;
+  if (!pending.streamingStarted) {
+    if (!text) return;
+    pending.streamingStarted = true;
+    pending.streamingReveal = true;
+    renderChat();
+    pending.streamingReveal = false;
+    return;
+  }
+  const replyNode = root.querySelector("[data-streaming-reply]");
+  if (replyNode) replyNode.textContent = text;
+}
+
+async function consumeChatEvents(events, { message, signal, requestToken, sessionId }) {
+  let completed = null;
+  appState.pendingChat = {
+    ...appState.pendingChat,
+    message,
+    streaming: true,
+    streamingStarted: false,
+    streamingReveal: false,
+    bufferedReply: appState.pendingChat?.reply || "",
+  };
+  let voiceQueue = createStreamingVoiceQueue(signal, releaseStreamingChatText);
+  try {
+    for await (const event of events) {
+      if (signal.aborted || requestToken !== appState.chatRequestToken || sessionId !== appState.chatSessionId) {
+        throw chatAbortError();
+      }
+      if (event?.type === "text" && typeof event.delta === "string" && event.delta) {
+        const bufferedReply = `${appState.pendingChat?.bufferedReply || ""}${event.delta}`;
+        appState.pendingChat.bufferedReply = bufferedReply;
+        voiceQueue.enqueue(event.delta, bufferedReply);
+      } else if (event?.type === "reset") {
+        voiceQueue.cancel();
+        voiceQueue = createStreamingVoiceQueue(signal, releaseStreamingChatText);
+        appState.pendingChat.bufferedReply = "";
+        releaseStreamingChatText("");
+      } else if (event?.type === "error") {
+        throw new Error(event.message || "模型服务暂时无法完成回复，请稍后重试。");
+      } else if (event?.type === "done") {
+        completed = event;
+        break;
+      }
+    }
+    if (!completed) throw new Error("流式回复意外中断，请重试。");
+    voiceQueue.close();
+    await voiceQueue.done;
+    if (signal.aborted || requestToken !== appState.chatRequestToken || sessionId !== appState.chatSessionId) {
+      throw chatAbortError();
+    }
+    return completed;
+  } catch (error) {
+    voiceQueue.cancel();
+    throw error;
+  } finally {
+    voiceQueue.close();
+  }
+}
+
 async function submitChat(message) {
   if (!appState.chatSessionId || appState.busy) return;
+  const sessionId = appState.chatSessionId;
+  const requestToken = ++appState.chatRequestToken;
+  stopVoice(false);
+  unlockVoiceFromGesture();
+  appState.chatDraft = "";
   appState.pendingChat = { message };
+  appState.pausedChat = null;
+  appState.chatAbortController = new AbortController();
   renderChat();
   setBusy(true);
   try {
-    const result = await request(`/api/chat/sessions/${appState.chatSessionId}/messages`, { method: "POST", body: JSON.stringify({ message }) });
+    const signal = appState.chatAbortController.signal;
+    const reply = await requestChatReply(
+      `/api/chat/sessions/${sessionId}/messages`,
+      message,
+      signal,
+      `${sessionId}-${requestToken}`,
+    );
+    const result = reply.events
+      ? await consumeChatEvents(reply.events, { message, signal, requestToken, sessionId })
+      : reply.result;
+    if (requestToken !== appState.chatRequestToken || sessionId !== appState.chatSessionId) return;
     const title = result.title || result.response?.title || appState.chatSession.title;
-    appState.chatSession = { ...appState.chatSession, ...result, title, session_id: result.session_id || appState.chatSessionId };
+    const nextChatSession = { ...appState.chatSession, ...result, title, session_id: result.session_id || appState.chatSessionId };
+    appState.chatSession = nextChatSession;
     rememberChatTitle(appState.chatSessionId, title);
     appState.pendingChat = null;
-    appState.revealChatReply = true;
+    appState.pausedChat = null;
+    appState.revealChatReply = !reply.events;
     renderChat();
+    if (!reply.events && result.response?.reply) void playVoice(result.response.reply, { automatic: true });
     window.setTimeout(() => { appState.revealChatReply = false; }, 700);
   } catch (error) {
+    if (requestToken !== appState.chatRequestToken || sessionId !== appState.chatSessionId) return;
+    if (error?.name === "AbortError" || appState.chatAbortController?.signal.aborted) {
+      appState.pausedChat = { message, draft: appState.chatDraft };
+      appState.pendingChat = null;
+      renderChat();
+      return;
+    }
     appState.pendingChat = null;
     renderChat();
     showError(error.message);
   } finally {
-    appState.busy = false;
-    root.querySelectorAll("button,input").forEach((control) => { control.disabled = false; });
+    if (requestToken === appState.chatRequestToken) {
+      appState.chatAbortController = null;
+      appState.busy = false;
+      setBusy(false);
+    }
   }
+}
+
+function pauseChat() {
+  if (!appState.pendingChat || !appState.chatAbortController) return;
+  appState.chatAbortController.abort();
+  stopVoice(false);
 }
 
 async function deleteChatSession(sessionId) {
   if (!sessionId || !window.confirm("删除这段历史对话？删除后无法恢复。")) return;
+  const isCurrentSession = sessionId === appState.chatSessionId;
+  const cancelledPending = isCurrentSession ? appState.pendingChat : null;
+  if (isCurrentSession) {
+    appState.chatRequestToken += 1;
+    appState.chatAbortController?.abort();
+    appState.chatAbortController = null;
+    stopVoice(false);
+  }
   setBusy(true);
   try {
     await request(`/api/chat/sessions/${sessionId}`, { method: "DELETE" });
@@ -533,11 +1259,20 @@ async function deleteChatSession(sessionId) {
     if (sessionId === appState.chatSessionId) {
       appState.chatSessionId = null;
       appState.chatSession = null;
+      appState.pendingChat = null;
+      appState.pausedChat = null;
+      appState.chatDraft = "";
+      appState.chatRequestToken += 1;
       localStorage.removeItem("wanderer-chat-session");
     }
     renderChat();
     announce("这段对话已删除");
   } catch (error) {
+    if (isCurrentSession && cancelledPending && sessionId === appState.chatSessionId) {
+      appState.pendingChat = null;
+      appState.pausedChat = { message: cancelledPending.message, draft: appState.chatDraft };
+      renderChat();
+    }
     showError(error.message);
   } finally {
     appState.busy = false;
@@ -579,15 +1314,19 @@ async function copyReply(index) {
 
 async function regenerateReply() {
   if (!appState.chatSessionId || appState.busy) return;
+  stopVoice(false);
+  unlockVoiceFromGesture();
   appState.regeneratingChat = true;
   renderChat();
   setBusy(true);
   try {
     const result = await request(`/api/chat/sessions/${appState.chatSessionId}/regenerate`, { method: "POST" });
-    appState.chatSession = { ...appState.chatSession, ...result, session_id: result.session_id || appState.chatSessionId };
+    const nextChatSession = { ...appState.chatSession, ...result, session_id: result.session_id || appState.chatSessionId };
+    appState.chatSession = nextChatSession;
     appState.regeneratingChat = false;
     appState.revealChatReply = true;
     renderChat();
+    if (result.response?.reply) void playVoice(result.response.reply, { automatic: true });
     window.setTimeout(() => { appState.revealChatReply = false; }, 700);
   } catch (error) {
     appState.regeneratingChat = false;
@@ -601,7 +1340,20 @@ async function regenerateReply() {
 
 root.addEventListener("click", (event) => {
   const button = event.target.closest("[data-action]");
-  if (!button || appState.busy) return;
+  if (!button) return;
+  if (button.dataset.action === "pause-chat") {
+    pauseChat();
+    return;
+  }
+  if (button.dataset.action === "pause-voice") {
+    pauseVoice();
+    return;
+  }
+  if (button.dataset.action === "delete-chat") {
+    deleteChatSession(button.dataset.chatSession);
+    return;
+  }
+  if (appState.busy) return;
   if (button.dataset.action === "start") startSession();
   if (button.dataset.action === "select-story") selectStory(button.dataset.replayId);
   if (button.dataset.action === "resume-journey" && appState.session && !appState.session.state?.is_finished) {
@@ -615,7 +1367,6 @@ root.addEventListener("click", (event) => {
   if (button.dataset.action === "option") submitTurn({ option_id: button.dataset.option });
   if (button.dataset.action === "start-chat") startChatSession();
   if (button.dataset.action === "restore-chat") restoreChatSession(button.dataset.chatSession);
-  if (button.dataset.action === "delete-chat") deleteChatSession(button.dataset.chatSession);
   if (button.dataset.action === "copy-reply") copyReply(Number(button.dataset.index));
   if (button.dataset.action === "regenerate-reply") regenerateReply();
 });
@@ -641,9 +1392,14 @@ function renderRoute() {
 window.addEventListener("hashchange", renderRoute);
 
 root.addEventListener("input", (event) => {
-  if (!event.target.matches("[data-player-name]")) return;
-  appState.playerName = normalizePlayerName(event.target.value);
-  localStorage.setItem("wanderer-player-name", appState.playerName);
+  if (event.target.matches("[data-player-name]")) {
+    appState.playerName = normalizePlayerName(event.target.value);
+    localStorage.setItem("wanderer-player-name", appState.playerName);
+    return;
+  }
+  if (event.target.matches("[data-chat-input]")) {
+    appState.chatDraft = String(event.target.value || "").slice(0, 1000);
+  }
 });
 
 root.addEventListener("submit", (event) => {
@@ -667,3 +1423,4 @@ root.addEventListener("submit", (event) => {
 
 renderRoute();
 restoreSession();
+loadVoiceStatus();

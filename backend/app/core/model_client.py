@@ -13,7 +13,7 @@ import re
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from typing import Mapping, Protocol
+from typing import Iterable, Mapping, Protocol
 from urllib.parse import urlsplit, urlunsplit
 
 from backend.app.contracts.game import GameState
@@ -257,10 +257,350 @@ class ChatModelRequest:
     player_name: str = "同行者"
 
 
+_REPLY_CHUNK_MAX = 56
+_CHAT_REPLY_MAX = 1000
+_STREAM_PROVIDER_CONTENT_MAX = 65536
+_STREAM_SENTENCE_ENDINGS = frozenset("。！？!?；;")
+_STREAM_SOFT_BREAKS = frozenset("，,、 \t")
+_CHAT_LINE_BREAKS = frozenset("\r\n\u2028\u2029")
+
+
+class ChatReplyLayoutNormalizer:
+    """Incrementally flatten paragraph breaks without losing ordinary word spaces."""
+
+    def __init__(self) -> None:
+        self._pending_spaces = ""
+        self._after_line_break = False
+        self._started = False
+        self._last_char = ""
+
+    def feed(self, text: str) -> str:
+        output: list[str] = []
+        for char in text:
+            if char in _CHAT_LINE_BREAKS:
+                self._pending_spaces = ""
+                self._after_line_break = True
+                continue
+            if char.isspace():
+                self._pending_spaces = " "
+                continue
+            if self._pending_spaces and self._started and not self._after_line_break:
+                output.append(self._pending_spaces)
+            elif (
+                self._after_line_break
+                and self._last_char.isascii()
+                and self._last_char.isalnum()
+                and char.isascii()
+                and char.isalnum()
+            ):
+                output.append(" ")
+            self._pending_spaces = ""
+            self._after_line_break = False
+            self._started = True
+            self._last_char = char
+            output.append(char)
+        return "".join(output)
+
+
+def normalize_chat_reply_layout(text: str) -> str:
+    """Keep a chat reply in one natural paragraph without altering sentence text."""
+    return ChatReplyLayoutNormalizer().feed(text)
+
+
+def chunk_reply_text(
+    text: str,
+    *,
+    max_chars: int = _REPLY_CHUNK_MAX,
+    normalize_layout: bool = True,
+) -> list[str]:
+    """Split display text at sentence punctuation, with a bounded fallback."""
+    if max_chars < 1:
+        raise ValueError("max_chars must be positive")
+    pending = normalize_chat_reply_layout(text) if normalize_layout else text
+    chunks: list[str] = []
+    while pending:
+        limit = min(len(pending), max_chars)
+        ending = next((index for index, char in enumerate(pending[:limit]) if char in _STREAM_SENTENCE_ENDINGS), None)
+        if ending is not None:
+            boundary = ending + 1
+        elif len(pending) < max_chars:
+            boundary = len(pending)
+        else:
+            soft_break = max(
+                (index + 1 for index, char in enumerate(pending[:limit]) if char in _STREAM_SOFT_BREAKS and index + 1 >= max_chars * 0.6),
+                default=0,
+            )
+            boundary = soft_break or max_chars
+        chunks.append(pending[:boundary])
+        pending = pending[boundary:]
+    return chunks
+
+
+class _ReplyTextChunker:
+    def __init__(self, max_chars: int = _REPLY_CHUNK_MAX) -> None:
+        self.max_chars = max_chars
+        self.pending = ""
+        self.layout_normalizer = ChatReplyLayoutNormalizer()
+
+    def feed(self, text: str, *, final: bool = False) -> list[str]:
+        self.pending += self.layout_normalizer.feed(text)
+        output: list[str] = []
+        while self.pending:
+            limit = min(len(self.pending), self.max_chars)
+            ending = next((index for index, char in enumerate(self.pending[:limit]) if char in _STREAM_SENTENCE_ENDINGS), None)
+            if ending is not None:
+                boundary = ending + 1
+            elif len(self.pending) >= self.max_chars:
+                soft_break = max(
+                    (index + 1 for index, char in enumerate(self.pending[:limit]) if char in _STREAM_SOFT_BREAKS and index + 1 >= self.max_chars * 0.6),
+                    default=0,
+                )
+                boundary = soft_break or self.max_chars
+            elif final:
+                boundary = len(self.pending)
+            else:
+                break
+            output.append(self.pending[:boundary])
+            self.pending = self.pending[boundary:]
+        return output
+
+
+def _top_level_reply_value_range(content: str) -> tuple[int | None, int | None]:
+    """Locate a unique top-level string-valued ``reply`` without parsing nested keys."""
+    depth = 0
+    root_started = False
+    expecting_key = False
+    expecting_colon = False
+    expecting_value = False
+    pending_key: str | None = None
+    in_string = False
+    escaped = False
+    string_start = 0
+    string_role: str | None = None
+    reply_start: int | None = None
+    reply_end: int | None = None
+
+    for index, char in enumerate(content):
+        if in_string:
+            if escaped:
+                escaped = False
+                continue
+            if char == "\\":
+                escaped = True
+                continue
+            if char != '"':
+                continue
+            in_string = False
+            if string_role == "key":
+                pending_key = _decode_json_string_prefix(content[string_start:index])
+                expecting_colon = True
+            elif string_role == "reply-value":
+                reply_end = index
+            string_role = None
+            continue
+
+        if not root_started:
+            if char == "{":
+                root_started = True
+                depth = 1
+                expecting_key = True
+            continue
+
+        if depth > 1:
+            if char == '"':
+                in_string = True
+                string_start = index + 1
+                string_role = "nested"
+            elif char in "{[":
+                depth += 1
+            elif char in "}]":
+                depth -= 1
+            continue
+
+        if char.isspace():
+            continue
+        if expecting_key:
+            if char == "}":
+                break
+            if char == ",":
+                continue
+            if char != '"':
+                raise ValueError("streamed response is not a valid top-level JSON object")
+            in_string = True
+            string_start = index + 1
+            string_role = "key"
+            expecting_key = False
+            continue
+        if expecting_colon:
+            if char != ":":
+                raise ValueError("streamed response has an invalid top-level field")
+            expecting_colon = False
+            expecting_value = True
+            continue
+        if expecting_value:
+            key = pending_key
+            pending_key = None
+            expecting_value = False
+            if char == '"':
+                if key == "reply":
+                    if reply_start is not None:
+                        raise ValueError("streamed response contains a duplicate top-level reply field")
+                    reply_start = index + 1
+                    string_role = "reply-value"
+                else:
+                    string_role = "value"
+                in_string = True
+                string_start = index + 1
+                continue
+            if key == "reply":
+                raise ValueError("streamed top-level reply must be a JSON string")
+            if char in "{[":
+                depth += 1
+            continue
+        if char == ",":
+            expecting_key = True
+        elif char == "}":
+            break
+
+    return reply_start, reply_end
+
+
+class _IncrementalReplyExtractor:
+    """Decode only the unique top-level JSON reply string as deltas arrive."""
+
+    def __init__(self) -> None:
+        self.content = ""
+        self.value_start: int | None = None
+        self.closed = False
+        self.decoded = ""
+
+    def feed(self, delta: str) -> str:
+        if len(self.content) + len(delta) > _STREAM_PROVIDER_CONTENT_MAX:
+            raise ValueError("streamed provider response exceeds the buffer limit")
+        self.content += delta
+        value_start, value_end = _top_level_reply_value_range(self.content)
+        if value_start is None:
+            return ""
+        if self.value_start is not None and value_start != self.value_start:
+            raise ValueError("streamed reply changed its top-level location")
+        self.value_start = value_start
+        self.closed = value_end is not None
+        end = value_end if value_end is not None else len(self.content)
+        decoded = _decode_json_string_prefix(self.content[value_start:end])
+        if len(decoded) > _CHAT_REPLY_MAX:
+            raise ValueError("streamed reply exceeds 1000 characters")
+        if not decoded.startswith(self.decoded):
+            raise ValueError("streamed reply was not a stable JSON string prefix")
+        delta_text = decoded[len(self.decoded):]
+        self.decoded = decoded
+        return delta_text
+
+
+def _decode_json_string_prefix(raw: str) -> str:
+    """Decode complete JSON string tokens, withholding incomplete escapes."""
+    decoded: list[str] = []
+    escapes = {'"': '"', "\\": "\\", "/": "/", "b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t"}
+    index = 0
+    while index < len(raw):
+        char = raw[index]
+        if char != "\\":
+            if ord(char) < 0x20:
+                raise ValueError("streamed reply contains an unescaped control character")
+            decoded.append(char)
+            index += 1
+            continue
+        if index + 1 >= len(raw):
+            break
+        escape = raw[index + 1]
+        if escape in escapes:
+            decoded.append(escapes[escape])
+            index += 2
+            continue
+        if escape != "u" or index + 6 > len(raw):
+            if escape == "u" and index + 6 > len(raw):
+                break
+            raise ValueError("streamed reply contains an invalid JSON escape")
+        digits = raw[index + 2:index + 6]
+        try:
+            codepoint = int(digits, 16)
+        except ValueError as exc:
+            raise ValueError("streamed reply contains an invalid Unicode escape") from exc
+        index += 6
+        if 0xD800 <= codepoint <= 0xDBFF:
+            if index + 6 > len(raw):
+                break
+            if raw[index:index + 2] != "\\u":
+                raise ValueError("streamed reply contains an invalid Unicode surrogate")
+            try:
+                low = int(raw[index + 2:index + 6], 16)
+            except ValueError as exc:
+                raise ValueError("streamed reply contains an invalid Unicode escape") from exc
+            if not 0xDC00 <= low <= 0xDFFF:
+                raise ValueError("streamed reply contains an invalid Unicode surrogate")
+            decoded.append(chr(0x10000 + ((codepoint - 0xD800) << 10) + low - 0xDC00))
+            index += 6
+        elif 0xDC00 <= codepoint <= 0xDFFF:
+            raise ValueError("streamed reply contains an invalid Unicode surrogate")
+        else:
+            decoded.append(chr(codepoint))
+    return "".join(decoded)
+
+
+def _chat_sse_data(response) -> Iterable[str]:
+    data_lines: list[str] = []
+    for raw_line in response:
+        line = raw_line.decode("utf-8", errors="replace") if isinstance(raw_line, bytes) else str(raw_line)
+        for part in line.splitlines() or [line]:
+            if not part:
+                if data_lines:
+                    yield "\n".join(data_lines)
+                    data_lines.clear()
+                continue
+            if part.startswith("data:"):
+                data_lines.append(part[5:].lstrip())
+    if data_lines:
+        yield "\n".join(data_lines)
+
+
+def _provider_chat_messages(request: ChatModelRequest) -> list[dict[str, str]]:
+    messages = [{"role": "system", "content": LiveModelClient._system_prompt(request.character_profile, gameplay=False, player_name=request.player_name)}]
+    for player, reply in request.history[-12:]:
+        messages.extend([{"role": "user", "content": player}, {"role": "assistant", "content": reply}])
+    messages.append({"role": "user", "content": request.message})
+    return messages
+
+
+class ChatReplyEventStream:
+    """One-shot iterable of text events followed by a validated provider result."""
+
+    def __init__(self, events: Iterable[dict[str, object]], cancel=None) -> None:
+        self._events = iter(events)
+        self._cancel = cancel
+        self._closed = False
+
+    def cancel(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if callable(self._cancel):
+            self._cancel()
+        close = getattr(self._events, "close", None)
+        if callable(close):
+            close()
+
+    def close(self) -> None:
+        self.cancel()
+
+    def __iter__(self):
+        return self._events
+
+
 class ModelClient(Protocol):
     def generate(self, *, request: ModelRequest) -> Mapping[str, object]: ...
 
     def generate_chat(self, *, request: ChatModelRequest) -> Mapping[str, object]: ...
+
+    def generate_chat_stream(self, *, request: ChatModelRequest) -> ChatReplyEventStream: ...
 
 
 class DeterministicModelClient:
@@ -323,6 +663,16 @@ class DeterministicModelClient:
             "is_ending": False,
             "ending_id": None,
         }
+
+    def generate_chat_stream(self, *, request: ChatModelRequest) -> ChatReplyEventStream:
+        response = self.generate_chat(request=request)
+
+        def events():
+            for chunk in chunk_reply_text(str(response["reply"])):
+                yield {"type": "text", "delta": chunk}
+            yield {"type": "done", "response": response}
+
+        return ChatReplyEventStream(events())
 
     @staticmethod
     def opening_response(replay_id: str) -> Mapping[str, object]:
@@ -409,11 +759,120 @@ class LiveModelClient:
                 "live model client is not configured",
                 user_message="没有读取到模型 API 密钥。请在项目根目录 .env 配置密钥并重启游戏。",
             )
-        messages = [{"role": "system", "content": self._system_prompt(request.character_profile, gameplay=False, player_name=request.player_name)}]
-        for player, reply in request.history[-12:]:
-            messages.extend([{"role": "user", "content": player}, {"role": "assistant", "content": reply}])
-        messages.append({"role": "user", "content": request.message})
-        return self._normalize_response_payload(self._request_json(self._payload(messages=messages)))
+        return self._normalize_response_payload(self._request_json(self._payload(messages=_provider_chat_messages(request))))
+
+    def generate_chat_stream(self, *, request: ChatModelRequest) -> ChatReplyEventStream:
+        if not self.available:
+            raise ModelProviderError(
+                "live model client is not configured",
+                user_message="没有读取到模型 API 密钥。请在项目根目录 .env 配置密钥并重启游戏。",
+            )
+        payload = self._payload(messages=_provider_chat_messages(request))
+        payload["stream"] = True
+        active_responses = []
+
+        def cancel_request() -> None:
+            if active_responses:
+                active_responses[-1].close()
+
+        def events():
+            content_parts: list[str] = []
+            extractor = _IncrementalReplyExtractor()
+            chunker = _ReplyTextChunker()
+            try:
+                http_request = urllib.request.Request(
+                    self.endpoint,
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {self._api_key}",
+                        "User-Agent": "wanderer-game/0.2.0",
+                        "Accept": "text/event-stream",
+                    },
+                    method="POST",
+                )
+                with urllib.request.urlopen(http_request, timeout=self._timeout) as response:
+                    active_responses.append(response)
+                    content_type = response.headers.get("content-type", "") if getattr(response, "headers", None) else ""
+                    if "text/event-stream" not in content_type.lower():
+                        body = json.loads(response.read().decode("utf-8"))
+                        normalized = self._normalize_response_payload(body, strict=True)
+                        for chunk in chunk_reply_text(str(normalized["reply"])):
+                            yield {"type": "text", "delta": chunk}
+                        yield {"type": "done", "response": normalized}
+                        return
+
+                    for data in _chat_sse_data(response):
+                        if data == "[DONE]":
+                            break
+                        try:
+                            event = json.loads(data)
+                        except json.JSONDecodeError as exc:
+                            raise ModelProviderError(
+                                "model provider returned invalid streaming JSON",
+                                user_message="模型服务返回了无法解析的数据，请检查服务商接口是否兼容。",
+                            ) from exc
+                        try:
+                            delta = event["choices"][0]["delta"].get("content", "")
+                        except (KeyError, IndexError, TypeError):
+                            continue
+                        if not isinstance(delta, str) or not delta:
+                            continue
+                        content_parts.append(delta)
+                        reply_delta = extractor.feed(delta)
+                        for chunk in chunker.feed(reply_delta):
+                            yield {"type": "text", "delta": chunk}
+                    active_responses.clear()
+
+                if not extractor.closed:
+                    raise ModelProviderError(
+                        "model provider returned an incomplete streamed response",
+                        user_message="模型服务返回了不完整的回复，请重试。",
+                    )
+                normalized = self._normalize_response_payload(
+                    {"choices": [{"message": {"content": "".join(content_parts)}}]},
+                    strict=True,
+                )
+                for chunk in chunker.feed("", final=True):
+                    yield {"type": "text", "delta": chunk}
+                yield {"type": "done", "response": normalized}
+            except TimeoutError as exc:
+                raise ModelTimeoutError("model request timed out") from exc
+            except urllib.error.HTTPError as exc:
+                message = self._http_error_message(exc.code)
+                provider_code = None
+                try:
+                    body = json.loads(exc.read().decode("utf-8"))
+                    error = body.get("error", body) if isinstance(body, dict) else {}
+                    if isinstance(error, dict):
+                        candidate = error.get("code") or error.get("type")
+                        if isinstance(candidate, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", candidate):
+                            if not (self._api_key and self._api_key in candidate):
+                                provider_code = candidate
+                except (AttributeError, UnicodeDecodeError, json.JSONDecodeError):
+                    pass
+                headers = exc.headers or {}
+                request_id = headers.get("x-request-id") or headers.get("request-id") or headers.get("cf-ray")
+                if not isinstance(request_id, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,120}", request_id):
+                    request_id = None
+                if request_id and self._api_key and self._api_key in request_id:
+                    request_id = None
+                raise ModelProviderError(
+                    f"model provider returned HTTP {exc.code}",
+                    status_code=exc.code,
+                    user_message=message,
+                    provider_code=provider_code,
+                    provider_request_id=request_id,
+                ) from exc
+            except urllib.error.URLError as exc:
+                if isinstance(exc.reason, TimeoutError):
+                    raise ModelTimeoutError("model request timed out") from exc
+                raise ModelProviderError(
+                    "model provider is unreachable",
+                    user_message="无法连接模型服务。请检查网络、服务商地址和代理设置。",
+                ) from exc
+
+        return ChatReplyEventStream(events(), cancel=cancel_request)
 
     def _payload(self, *, system: str | None = None, user: str | None = None, messages: list[dict[str, str]] | None = None) -> dict[str, object]:
         if messages is None:
@@ -448,6 +907,7 @@ class LiveModelClient:
             sections.append(
                 f"你正在以第一人称直接和玩家交谈：自称只能使用“我”；"
                 f"不得以{name_list}中的任何一个名号指代自己，也不得用第三人称代词指代自己；"
+                "这些名号只能作为被讨论的历史称呼出现，例如“「散兵」是我过去在愚人众使用的称呼”，不要写“我是散兵”或“我叫阿帽”；"
                 f"第三人称代词只能用于其他角色，例如杜林或纳西妲；"
                 f"称玩家为“你”或「{player_name}」。不要混淆对话双方与第三方。"
             )

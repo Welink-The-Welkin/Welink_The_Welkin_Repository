@@ -12,6 +12,8 @@
 
 浏览器打开 <http://127.0.0.1:8000>。按 `Ctrl+C` 停止。首次启动会创建 `.venv` 并安装依赖，需要访问 Python 包索引；后续离线回放无需外网。
 
+如果要启用「浮浪倾客」的 GPT-SoVITS 语音，先按下面的语音配置填写 `.env`。启动脚本默认自动检测可用 CUDA 并优先使用 GPU，无法使用时回退 CPU；模型首次加载可能需要几分钟，游戏在语音服务未就绪时仍能正常进行文字对话。
+
 每次开机后，双击 `start.bat` 即可启动服务；启动脚本会显示实际启动目录，等待 `/api/health` 正常后自动打开浏览器。关闭启动脚本窗口会停止本次服务。
 如果当前版本的游戏已经在运行，再次双击 `start.bat` 会直接打开现有页面。启动器通过健康接口中的版本号识别当前版本；遇到旧版服务会跳过并自动尝试其他端口，避免继续打开陈旧页面。若 8000 端口由其他程序占用，启动器会自动尝试 8001 至 8010；只有这些端口都不可用时才会显示错误并暂停窗口。
 
@@ -22,6 +24,7 @@
 - **离线模式**：使用确定性角色引擎，无需联网即可完整走完多分支剧情；自由聊天使用本地固定响应。
 - **剧情分支**：调查、询问、保护、承担等选择会改变状态和后续台词，最终可达四种结局。
 - **模型服务**：仅用于自由对话，由后端 `.env` 中的配置决定是否连接。模型 API 密钥只保存在后端；若凭据、模型名称、网络或额度有问题，页面会显示可识别的错误类别，不会假装模型已回复。剧情旅途始终使用本地剧情。
+- **角色语音**：将 `WANDERER_TTS_ENABLED` 设为 `true` 后，启动时会接入本机 GPT-SoVITS v2Pro。剧情台词和自由对话回复会自动朗读；自由对话的回复操作栏会在播放时提供「暂停朗读/继续朗读」。默认参考音频是训练目录中与提示文本“可别让我失望.这世上没有纯粹的自由.”匹配的切片。
 
 ## 配置实时模型
 
@@ -66,7 +69,37 @@ $env:WANDERER_DEMO_MODE = "live"
 
 服务需兼容 `/chat/completions`，支持 Bearer 密钥鉴权，并返回标准 `choices[0].message.content` JSON 文本或直接 JSON 对象。客户端使用 `response_format: {type: text}`，再由程序解析模型返回的 JSON 文本；这样可以兼容 LM Studio 等不接受 `json_object` 的本地服务。密钥只在后端使用；不要把密钥写入源代码、截图、聊天记录或提交仓库。要回到本地离线模型，将 `WANDERER_DEMO_MODE` 设为 `offline` 并重启。
 
+自由对话会优先使用 SSE 分段接收回复：模型分段持续写入浏览器缓存，只有对应语音真正触发 `playing` 时才同步释放这段文字。播放队列保留“当前段 + 下一段”两段预生成窗口，当前段朗读期间就会加载下一段语音，以消除上一段结束后才开始合成造成的额外停顿；语音仍严格按原文顺序播放。角色回复在进入 SSE、语音队列和历史记录前会统一整理成一个连续自然段，模型产生的换行或空行不会再形成单独语音片段；已有历史回复在读取时也会按同一规则显示。回复气泡只在首段出现时播放一次入场动画，后续文字直接在原气泡内更新，不刷新聊天框。更新到包含该功能的代码后，需要关闭旧的 `start.ps1`/Uvicorn 服务并重新启动；如果浏览器仍加载旧脚本，再按 `Ctrl + F5` 强制刷新。上游模型服务若不支持流式响应，程序仍会回退到原有 JSON 响应。
+
 如果页面提示未读取到 API 密钥，请检查 `.env` 是否在项目根目录，且变量名是 `WANDERER_MODEL_API_KEY`。更新密钥或模型配置后，必须关闭运行中的服务窗口并重新启动。
+
+## 配置 GPT-SoVITS 角色语音
+
+将 `.env.example` 复制为 `.env` 后，保留或补充以下配置。`GPT_SOVITS_ROOT` 指向本机的 `GPT-SoVITS-v2pro-20250604` 目录；`WANDERER_TTS_REFERENCE_AUDIO` 可以使用默认的训练切片，也可以改成同一角色的其他 32 kHz WAV 参考音频。
+
+```text
+WANDERER_TTS_ENABLED=true
+GPT_SOVITS_ROOT=C:\path\to\GPT-SoVITS-v2pro-20250604
+WANDERER_TTS_DEVICE=auto
+WANDERER_TTS_API_URL=http://127.0.0.1:9880/tts
+WANDERER_TTS_REFERENCE_AUDIO=logs/wanderer/5-wav32k/6.1流浪者全语音无音效无背景音乐（自用）.mp3_0000716160_0000856960.wav
+WANDERER_TTS_PROMPT_TEXT=可别让我失望.这世上没有纯粹的自由.
+WANDERER_TTS_TIMEOUT=240
+WANDERER_TTS_STARTUP_TIMEOUT=300
+```
+
+这组配置使用 `GPT_weights_v2Pro\流浪者-e15.ckpt` 和 `GPT_SoVITS\pretrained_models\v2Pro\s2Gv2Pro.pth`。`start.ps1` 会在游戏服务退出时清理本次启动的 TTS 进程；如果 `9880` 已经是一个 GPT-SoVITS 服务，则会复用它，不会停止外部启动的进程。语音合成结果会缓存到 `data/voice-cache`，该目录已被 Git 忽略。
+
+### 角色语音增强候选
+
+已用 `P7-6.2主线.mp3`、`P8-6.3主线.mp3` 和 `P9-6.6主线.mp3` 补充训练集。训练产生的候选 GPT 权重位于
+`data/voice-training/wanderer-augmented-20261024/candidate/weights/wanderer_augmented-e4.ckpt`，并已通过独立 GPT-SoVITS 推理和 WAV 校验。它没有自动覆盖原权重；试听确认音质后，在 `.env` 设置 `WANDERER_TTS_GPT_WEIGHTS` 指向该文件并重启 `start.ps1` 即可切换。候选训练数据和权重属于本机大文件，已由 `.gitignore` 排除。
+
+缓存按回复文本、参考音频、提示词和 GPT/SoVITS 权重指纹命名，重复剧情、重复提问和重新生成相同文本都能命中。当前缓存约几十 MB，可以安全删除；删除后第一次播放对应文本会重新合成，之后会再次建立缓存：
+
+```powershell
+Remove-Item -LiteralPath .\data\voice-cache\*.wav -Force -ErrorAction SilentlyContinue
+```
 
 如果实时对话显示 **HTTP 401**，服务商没有验证通过当前请求。确认密钥属于这个 API 地址对应的服务商、复制的是原始密钥（不要自行加 `Bearer ` 前缀），并确认接口使用 Bearer 鉴权。**HTTP 403** 表示服务商禁止了请求，可能与模型权限、账号策略、IP 白名单或接口访问策略有关，不一定是密钥错误。若错误详情包含 `CF-RAY` 或服务商请求编号，把该编号交给服务商核查；不要把密钥发到聊天、截图或公开仓库。
 

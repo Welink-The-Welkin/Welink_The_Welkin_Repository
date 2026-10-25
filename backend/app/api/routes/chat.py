@@ -1,7 +1,9 @@
 # 本文件由 codex 辅助生成（外围模块）
+import json
 from uuid import UUID
 
 from fastapi import APIRouter, Request
+from fastapi.responses import StreamingResponse
 from pydantic import ValidationError
 
 from backend.app.contracts.game import ChatCreateRequest, ChatMessageRequest
@@ -40,6 +42,21 @@ async def send_chat_message(chat_session_id: UUID, request: Request):
         payload = ChatMessageRequest.model_validate(await request.json())
     except (ValidationError, ValueError) as exc:
         raise AppError("INVALID_REQUEST", "请输入有效的对话内容", 400) from exc
+    if "text/event-stream" in request.headers.get("accept", "").lower():
+        stream_id = request.headers.get("x-chat-stream-id") or request.state.request_id
+
+        def event_source():
+            for event in _service(request).stream_chat_message(chat_session_id, payload.message, stream_id=stream_id):
+                yield f"data: {json.dumps(event, ensure_ascii=False, separators=(',', ':'))}\n\n"
+
+        return StreamingResponse(
+            event_source(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
     response, messages = _service(request).chat_message(chat_session_id, payload.message)
     return {"data": {"response": response, "game_state": None, "messages": messages}, "request_id": request.state.request_id}
 

@@ -1,9 +1,12 @@
 # 本文件由 codex 辅助生成（外围模块）
+import json
 from uuid import UUID
 
+import pytest
 from fastapi.testclient import TestClient
 
 from backend.app.core.errors import ModelProviderError, ModelTimeoutError
+from backend.app.core.model_client import ChatReplyEventStream
 from backend.app.core.pronoun_guard import ELEMENT_SELF_REFERENCE_TERMS, FALLBACK_REPLIES, INTRO_FALLBACK_REPLIES
 from backend.app.main import create_app
 
@@ -19,6 +22,313 @@ def test_live_session_creation_returns_initial_state(tmp_path):
     assert data["state"]["turn_count"] == 0
     assert data["mode"] == "offline"
     assert data["last_response"]["reply"]
+
+
+def test_free_chat_stream_emits_text_before_done_and_persists_only_after_completion(tmp_path):
+    app = create_app(database_path_override=tmp_path / "stream-chat.db", demo_mode_override="live")
+    client = TestClient(app)
+    created = client.post("/api/chat/sessions", json={"mode": "live"})
+    chat_id = created.json()["data"]["chat_session_id"]
+    response_payload = {
+        "reply": "第一句。第二句！",
+        "title": "流式回复",
+        "emotion": "calm",
+        "state_delta": {},
+        "next_scene": None,
+        "is_ending": False,
+        "ending_id": None,
+    }
+    app.state.session_service.chat_model_client.generate_chat_stream = lambda **kwargs: ChatReplyEventStream(iter([
+        {"type": "text", "delta": "第一句。"},
+        {"type": "text", "delta": "第二句！"},
+        {"type": "done", "response": response_payload},
+    ]))
+
+    response = client.post(
+        f"/api/chat/sessions/{chat_id}/messages",
+        json={"message": "你好"},
+        headers={"accept": "text/event-stream"},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    events = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: ")]
+    assert [event["type"] for event in events] == ["text", "text", "done"]
+    assert events[-1]["response"]["reply"] == "第一句。第二句！"
+    restored = client.get(f"/api/chat/sessions/{chat_id}").json()["data"]
+    assert restored["messages"][-1]["reply"] == "第一句。第二句！"
+
+
+def test_free_chat_stream_coalesces_token_deltas_into_sentence_chunks(tmp_path):
+    app = create_app(database_path_override=tmp_path / "stream-chat-token-chunks.db", demo_mode_override="live")
+    client = TestClient(app)
+    created = client.post("/api/chat/sessions", json={"mode": "live"})
+    chat_id = created.json()["data"]["chat_session_id"]
+    response_payload = {
+        "reply": "第一句。第二句！",
+        "title": "连续回复",
+        "emotion": "calm",
+        "state_delta": {},
+        "next_scene": None,
+        "is_ending": False,
+        "ending_id": None,
+    }
+    app.state.session_service.chat_model_client.generate_chat_stream = lambda **kwargs: ChatReplyEventStream(iter([
+        {"type": "text", "delta": "第一"},
+        {"type": "text", "delta": "句"},
+        {"type": "text", "delta": "。第二"},
+        {"type": "text", "delta": "句"},
+        {"type": "text", "delta": "！"},
+        {"type": "done", "response": response_payload},
+    ]))
+
+    response = client.post(
+        f"/api/chat/sessions/{chat_id}/messages",
+        json={"message": "请连续回答"},
+        headers={"accept": "text/event-stream"},
+    )
+
+    assert response.status_code == 200
+    events = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: ")]
+    assert [event["delta"] for event in events if event["type"] == "text"] == ["第一句。", "第二句！"]
+    assert events[-1]["type"] == "done"
+
+
+def test_free_chat_stream_repairs_a_later_delta_without_reporting_a_connection_error(tmp_path):
+    app = create_app(database_path_override=tmp_path / "stream-chat-repair.db", demo_mode_override="live")
+    client = TestClient(app)
+    created = client.post("/api/chat/sessions", json={"mode": "live"})
+    chat_id = created.json()["data"]["chat_session_id"]
+    response_payload = {
+        "reply": "我听见了。浮浪倾客没空陪你说这些废话。",
+        "title": "随口一问",
+        "emotion": "irritated",
+        "state_delta": {},
+        "next_scene": None,
+        "is_ending": False,
+        "ending_id": None,
+    }
+    app.state.session_service.chat_model_client.generate_chat_stream = lambda **kwargs: ChatReplyEventStream(iter([
+        {"type": "text", "delta": "我听见了。"},
+        {"type": "text", "delta": "浮浪倾客没空陪你说这些废话。"},
+        {"type": "done", "response": response_payload},
+    ]))
+
+    response = client.post(
+        f"/api/chat/sessions/{chat_id}/messages",
+        json={"message": "你在忙什么？"},
+        headers={"accept": "text/event-stream"},
+    )
+
+    assert response.status_code == 200
+    events = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: ")]
+    assert all(event["type"] != "error" for event in events)
+    assert "".join(event["delta"] for event in events if event["type"] == "text") == "我听见了。我没空陪你说这些废话。"
+    assert events[-1]["type"] == "done"
+    assert events[-1]["response"]["reply"] == "我听见了。我没空陪你说这些废话。"
+    restored = client.get(f"/api/chat/sessions/{chat_id}").json()["data"]
+    assert restored["messages"][-1]["reply"] == "我听见了。我没空陪你说这些废话。"
+
+
+def test_free_chat_stream_flattens_paragraph_breaks_before_emitting_and_persisting(tmp_path):
+    app = create_app(database_path_override=tmp_path / "stream-chat-single-paragraph.db", demo_mode_override="live")
+    client = TestClient(app)
+    created = client.post("/api/chat/sessions", json={"mode": "live"})
+    chat_id = created.json()["data"]["chat_session_id"]
+    response_payload = {
+        "reply": "第一段。\n\n  第二段。",
+        "title": "连续回复",
+        "emotion": "calm",
+        "state_delta": {},
+        "next_scene": None,
+        "is_ending": False,
+        "ending_id": None,
+    }
+    app.state.session_service.chat_model_client.generate_chat_stream = lambda **kwargs: ChatReplyEventStream(iter([
+        {"type": "text", "delta": "第一段。\n\n"},
+        {"type": "text", "delta": "  第二段。"},
+        {"type": "done", "response": response_payload},
+    ]))
+
+    response = client.post(
+        f"/api/chat/sessions/{chat_id}/messages",
+        json={"message": "请连续回答"},
+        headers={"accept": "text/event-stream"},
+    )
+
+    assert response.status_code == 200
+    events = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: ")]
+    assert [event["delta"] for event in events if event["type"] == "text"] == ["第一段。", "第二段。"]
+    assert events[-1]["response"]["reply"] == "第一段。第二段。"
+    restored = client.get(f"/api/chat/sessions/{chat_id}").json()["data"]
+    assert restored["messages"][-1]["reply"] == "第一段。第二段。"
+
+
+def test_free_chat_stream_preserves_an_intentional_space_across_provider_deltas(tmp_path):
+    app = create_app(database_path_override=tmp_path / "stream-chat-delta-space.db", demo_mode_override="live")
+    client = TestClient(app)
+    created = client.post("/api/chat/sessions", json={"mode": "live"})
+    chat_id = created.json()["data"]["chat_session_id"]
+    response_payload = {
+        "reply": "第一句。 第二句。",
+        "title": "连续回复",
+        "emotion": "calm",
+        "state_delta": {},
+        "next_scene": None,
+        "is_ending": False,
+        "ending_id": None,
+    }
+    app.state.session_service.chat_model_client.generate_chat_stream = lambda **kwargs: ChatReplyEventStream(iter([
+        {"type": "text", "delta": "第一句。"},
+        {"type": "text", "delta": " 第二句。"},
+        {"type": "done", "response": response_payload},
+    ]))
+
+    response = client.post(
+        f"/api/chat/sessions/{chat_id}/messages",
+        json={"message": "请连续回答"},
+        headers={"accept": "text/event-stream"},
+    )
+
+    assert response.status_code == 200
+    events = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: ")]
+    assert all(event["type"] != "reset" for event in events)
+    assert [event["delta"] for event in events if event["type"] == "text"] == ["第一句。", " 第二句。"]
+    assert events[-1]["response"]["reply"] == "第一句。 第二句。"
+
+
+@pytest.mark.parametrize("blank_reply", ["\n\n", "   ", "\u00a0", "\f", "\v"])
+def test_free_chat_stream_replaces_replies_that_become_blank_after_layout_normalization(tmp_path, blank_reply):
+    app = create_app(database_path_override=tmp_path / "stream-chat-blank-layout.db", demo_mode_override="live")
+    client = TestClient(app)
+    created = client.post("/api/chat/sessions", json={"mode": "live"})
+    chat_id = created.json()["data"]["chat_session_id"]
+    response_payload = {
+        "reply": blank_reply,
+        "title": "空白回复",
+        "emotion": "calm",
+        "state_delta": {},
+        "next_scene": None,
+        "is_ending": False,
+        "ending_id": None,
+    }
+    app.state.session_service.chat_model_client.generate_chat_stream = lambda **kwargs: ChatReplyEventStream(iter([
+        {"type": "text", "delta": blank_reply},
+        {"type": "done", "response": response_payload},
+    ]))
+
+    response = client.post(
+        f"/api/chat/sessions/{chat_id}/messages",
+        json={"message": "不要空白回答"},
+        headers={"accept": "text/event-stream"},
+    )
+
+    assert response.status_code == 200
+    events = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: ")]
+    text_deltas = [event["delta"] for event in events if event["type"] == "text"]
+    assert text_deltas and all(delta.strip() for delta in text_deltas)
+    assert events[-1]["response"]["reply"] in FALLBACK_REPLIES
+    restored = client.get(f"/api/chat/sessions/{chat_id}").json()["data"]
+    assert restored["messages"][-1]["reply"] in FALLBACK_REPLIES
+
+
+def test_free_chat_read_flattens_paragraph_breaks_from_existing_sessions(tmp_path):
+    app = create_app(database_path_override=tmp_path / "existing-chat-paragraphs.db", demo_mode_override="live")
+    client = TestClient(app)
+    created = client.post("/api/chat/sessions", json={"mode": "live"})
+    chat_id = created.json()["data"]["chat_session_id"]
+    app.state.session_service.repository.save_chat_messages(
+        UUID(chat_id),
+        [{"message": "讲讲过去", "reply": "旧记录第一段。\n\n旧记录第二段。", "emotion": "calm"}],
+        "旧时的对话",
+    )
+
+    restored = client.get(f"/api/chat/sessions/{chat_id}")
+
+    assert restored.status_code == 200
+    assert restored.json()["data"]["messages"][0]["reply"] == "旧记录第一段。旧记录第二段。"
+    stored = app.state.session_service.repository.get_chat_details(UUID(chat_id))[1]
+    assert stored[0]["reply"] == "旧记录第一段。\n\n旧记录第二段。"
+
+
+def test_free_chat_title_repair_does_not_rewrite_existing_reply_layout(tmp_path):
+    app = create_app(database_path_override=tmp_path / "existing-chat-title-repair.db", demo_mode_override="live")
+    client = TestClient(app)
+    created = client.post("/api/chat/sessions", json={"mode": "live"})
+    chat_id = created.json()["data"]["chat_session_id"]
+    original_reply = "旧记录第一段。\n\n旧记录第二段。"
+    app.state.session_service.repository.save_chat_messages(
+        UUID(chat_id),
+        [{"message": "讲讲过去", "reply": original_reply, "emotion": "calm"}],
+        "新对话",
+    )
+
+    restored = client.get(f"/api/chat/sessions/{chat_id}")
+
+    assert restored.status_code == 200
+    assert restored.json()["data"]["messages"][0]["reply"] == "旧记录第一段。旧记录第二段。"
+    stored = app.state.session_service.repository.get_chat_details(UUID(chat_id))
+    assert stored[1][0]["reply"] == original_reply
+    assert stored[3] != "新对话"
+
+
+def test_free_chat_append_does_not_rewrite_existing_reply_layout(tmp_path):
+    app = create_app(database_path_override=tmp_path / "existing-chat-append.db", demo_mode_override="live")
+    client = TestClient(app)
+    created = client.post("/api/chat/sessions", json={"mode": "live"})
+    chat_id = created.json()["data"]["chat_session_id"]
+    original_reply = "旧记录第一段。\n\n旧记录第二段。"
+    app.state.session_service.repository.save_chat_messages(
+        UUID(chat_id),
+        [{"message": "讲讲过去", "reply": original_reply, "emotion": "calm"}],
+        "旧时的对话",
+    )
+    app.state.session_service.chat_model_client.generate_chat = lambda **kwargs: {
+        "reply": "现在没什么可补充的。",
+        "title": "旧时的对话",
+        "emotion": "calm",
+        "state_delta": {},
+        "next_scene": None,
+        "is_ending": False,
+        "ending_id": None,
+    }
+
+    response = client.post(f"/api/chat/sessions/{chat_id}/messages", json={"message": "还有呢？"})
+
+    assert response.status_code == 200
+    assert response.json()["data"]["messages"][0]["reply"] == "旧记录第一段。旧记录第二段。"
+    stored = app.state.session_service.repository.get_chat_details(UUID(chat_id))[1]
+    assert stored[0]["reply"] == original_reply
+    assert stored[-1]["reply"] == "现在没什么可补充的。"
+
+
+def test_free_chat_stream_does_not_persist_when_client_stops_before_done(tmp_path):
+    app = create_app(database_path_override=tmp_path / "stream-chat-partial.db", demo_mode_override="live")
+    client = TestClient(app)
+    created = client.post("/api/chat/sessions", json={"mode": "live"})
+    chat_id = created.json()["data"]["chat_session_id"]
+    response_payload = {
+        "reply": "完整回复。",
+        "title": "流式回复",
+        "emotion": "calm",
+        "state_delta": {},
+        "next_scene": None,
+        "is_ending": False,
+        "ending_id": None,
+    }
+    cancelled = []
+    app.state.session_service.chat_model_client.generate_chat_stream = lambda **kwargs: ChatReplyEventStream(iter([
+        {"type": "text", "delta": "未完成。"},
+        {"type": "done", "response": response_payload},
+    ]), cancel=lambda: cancelled.append(True))
+
+    events = app.state.session_service.stream_chat_message(UUID(chat_id), "你好", stream_id="partial-stream")
+    assert next(events)["type"] == "text"
+    events.close()
+    assert app.state.session_service.repository.get_chat_details(UUID(chat_id))[1] == []
+    assert cancelled == [True]
+
+
 
 
 def test_story_creation_forces_offline_even_when_live_mode_is_requested(tmp_path, monkeypatch):
@@ -82,6 +392,25 @@ def test_live_free_chat_includes_safe_provider_diagnostics_on_forbidden(tmp_path
     assert details["endpoint"] == "https://provider.example/v1/chat/completions"
     assert "secret" not in response.text
     assert "query-secret" not in response.text
+
+
+def test_live_free_chat_accepts_reply_only_provider_payload(tmp_path):
+    app = create_app(database_path_override=tmp_path / "chat-live-reply-only.db", demo_mode_override="live")
+    client = TestClient(app)
+    created = client.post("/api/chat/sessions", json={"mode": "live"})
+    chat_id = created.json()["data"]["chat_session_id"]
+    app.state.session_service.chat_model_client.generate_chat = lambda **kwargs: {"reply": "我听见了。"}
+
+    response = client.post(f"/api/chat/sessions/{chat_id}/messages", json={"message": "你好"})
+
+    assert response.status_code == 200
+    data = response.json()["data"]["response"]
+    assert data["reply"] == "我听见了。"
+    assert data["emotion"] == "calm"
+    assert data["state_delta"] == {}
+    assert data["next_scene"] is None
+    assert data["is_ending"] is False
+    assert data["ending_id"] is None
 
 
 def test_offline_free_chat_returns_structured_response_without_game_state(tmp_path):
@@ -314,6 +643,37 @@ def test_free_chat_falls_back_after_three_unrepairable_replies(tmp_path):
     assert restored.json()["data"]["messages"][-1]["reply"] in FALLBACK_REPLIES
 
 
+@pytest.mark.parametrize("blank_reply", ["\n\n", "   ", "\u00a0", "\f", "\v"])
+def test_free_chat_retries_then_falls_back_when_layout_normalization_removes_the_reply(tmp_path, blank_reply):
+    app = create_app(database_path_override=tmp_path / "chat-blank-layout-fallback.db", demo_mode_override="live")
+    client = TestClient(app)
+    created = client.post("/api/chat/sessions", json={"mode": "live"})
+    chat_id = created.json()["data"]["chat_session_id"]
+    calls = []
+
+    def blank_response(**kwargs):
+        calls.append(kwargs)
+        return {
+            "reply": blank_reply,
+            "title": "空白回复",
+            "emotion": "calm",
+            "state_delta": {},
+            "next_scene": None,
+            "is_ending": False,
+            "ending_id": None,
+        }
+
+    app.state.session_service.chat_model_client.generate_chat = blank_response
+
+    response = client.post(f"/api/chat/sessions/{chat_id}/messages", json={"message": "不要空白回答"})
+
+    assert response.status_code == 200
+    assert len(calls) == 3
+    assert response.json()["data"]["response"]["reply"] in FALLBACK_REPLIES
+    restored = client.get(f"/api/chat/sessions/{chat_id}").json()["data"]
+    assert restored["messages"][-1]["reply"] in FALLBACK_REPLIES
+
+
 def test_free_chat_retries_and_adopts_the_first_repairable_reply(tmp_path):
     app = create_app(database_path_override=tmp_path / "chat-guard-retry.db", demo_mode_override="live")
     client = TestClient(app)
@@ -454,6 +814,30 @@ def test_free_chat_end_to_end_repairs_wrong_self_reference(tmp_path):
     assert restored.json()["data"]["messages"][-1]["reply"] == expected
 
 
+def test_free_chat_keeps_historical_alias_as_a_name_not_first_person(tmp_path):
+    app = create_app(database_path_override=tmp_path / "chat-historical-alias.db", demo_mode_override="live")
+    client = TestClient(app)
+    created = client.post("/api/chat/sessions", json={"mode": "live"})
+    chat_id = created.json()["data"]["chat_session_id"]
+    historical_reply = "「散兵」是我过去在愚人众使用的称呼。"
+    app.state.session_service.chat_model_client.generate_chat = lambda **kwargs: {
+        "reply": historical_reply,
+        "title": "关于过去身份",
+        "emotion": "guarded",
+        "state_delta": {},
+        "next_scene": None,
+        "is_ending": False,
+        "ending_id": None,
+    }
+
+    response = client.post(f"/api/chat/sessions/{chat_id}/messages", json={"message": "关于你和散兵"})
+
+    assert response.status_code == 200
+    assert response.json()["data"]["response"]["reply"] == historical_reply
+    assert "我是我" not in response.text
+    assert response.json()["data"]["messages"][-1]["reply"] == historical_reply
+
+
 def test_free_chat_regenerate_also_passes_through_pronoun_guard(tmp_path):
     app = create_app(database_path_override=tmp_path / "chat-regen-guard.db", demo_mode_override="live")
     client = TestClient(app)
@@ -552,13 +936,13 @@ def test_intro_scene_shot3_end_to_end_repairs_element_clause_prefix(tmp_path):
     created = client.post("/api/chat/sessions", json={"mode": "live"})
     chat_id = created.json()["data"]["chat_session_id"]
     app.state.session_service.chat_model_client.generate_chat = _intro_reply_mock(
-        "我叫阿帽，如今留在须弥，替纳西妲处理一些麻烦。风元素，擅长战斗。别把我归进任何组织。"
+        "我如今留在须弥，替纳西妲处理一些麻烦。风元素，擅长战斗。别把我归进任何组织。"
     )
 
     response = client.post(f"/api/chat/sessions/{chat_id}/messages", json={"message": "介绍一下你自己"})
 
     assert response.status_code == 200
-    expected = "我叫阿帽，如今留在须弥，替纳西妲处理一些麻烦。擅长战斗。别把我归进任何组织。"
+    expected = "我如今留在须弥，替纳西妲处理一些麻烦。擅长战斗。别把我归进任何组织。"
     data = response.json()["data"]
     assert data["response"]["reply"] == expected
     assert all(term not in data["response"]["reply"] for term in ELEMENT_SELF_REFERENCE_TERMS)

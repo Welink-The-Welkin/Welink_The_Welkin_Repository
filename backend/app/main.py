@@ -6,7 +6,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from backend.app.api.routes import chat, health, sessions
+from backend.app.api.routes import chat, health, sessions, voice
 from backend.app.config import database_path, demo_mode
 from backend.app.errors import AppError
 from backend.app.services.session_service import SessionService
@@ -46,6 +46,7 @@ def create_app(database_path_override=None, demo_mode_override: str | None = Non
     app.include_router(health.router, prefix="/api")
     app.include_router(sessions.router, prefix="/api")
     app.include_router(chat.router, prefix="/api")
+    app.include_router(voice.router, prefix="/api")
 
     if FRONTEND.exists():
         app.mount("/static", StaticFiles(directory=FRONTEND), name="static")

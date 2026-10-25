@@ -35,20 +35,49 @@ function storySession({ id = "story-1", finished = false, history = [] } = {}) {
   };
 }
 
-function makeBrowser({ hash = "#home", storage = {}, providerError = false, deferRegenerate = false, regenerateError = false } = {}) {
+function makeBrowser({ hash = "#home", storage = {}, providerError = false, deferRegenerate = false, regenerateError = false, deleteChatError = false, deferDeleteChat = false, deferChat = false, deferStoryTurn = false, deferVoice = false, deferVoiceAfter = 0, deferVoiceStatus = false, deferAudioReady = false, deferAudioStart = false, deferAudioEnd = false, deferStreamReads = false, suppressAudioPlaying = false, audioRequiresGesture = false, voiceEnabled = false, voiceReadyAfter = 0, voiceError = false, streamChat = false, chatStreamChunks = ["第一句。", "第二句！"], chatReply = "我听见了。" } = {}) {
   const listeners = {};
   const calls = [];
+  const events = [];
+  const audioPlayback = [];
+  const audioInstances = [];
+  const timerDelays = [];
   const values = new Map(Object.entries(storage));
   let markup = "";
   let errorMarkup = "";
   let resolveRegenerate;
+  let resolveChat;
+  let resolveDeleteChat;
+  let resolveStoryTurn;
+  let resolveVoice;
+  let resolveVoiceStatus;
+  const pendingAudioReady = [];
+  let resolveAudioStart;
+  let resolveStreamRead;
+  let audioUnlocked = false;
+  let voiceSynthesisCalls = 0;
+  let voiceStatusChecks = 0;
+  let streamReaderCancelled = false;
+  const timers = [];
+  let nextTimerId = 0;
   const root = {
     get innerHTML() { return markup; },
-    set innerHTML(value) { markup = value; },
+    set innerHTML(value) { markup = value; events.push({ type: "render", html: value }); },
     addEventListener(type, listener) { listeners[`root:${type}`] = listener; },
-    querySelectorAll() { return []; },
+    querySelectorAll() {
+      return [chatInputControl, deleteChatControl];
+    },
     querySelector(selector) {
       if (selector === "[data-player-name]") return null;
+      if (selector === "[data-streaming-reply]" && markup.includes("data-streaming-reply")) {
+        return {
+          set textContent(value) {
+            const escaped = String(value).replace(/[&<>]/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[char]);
+            markup = markup.replace(/(<p data-streaming-reply>)[\s\S]*?(<\/p>)/, `$1${escaped}$2`);
+            events.push({ type: "stream-text", text: String(value) });
+          },
+        };
+      }
       if (selector.includes("data-error") || selector.includes("data-chat-error")) {
         return { set innerHTML(value) { errorMarkup = value; }, get innerHTML() { return errorMarkup; } };
       }
@@ -66,7 +95,22 @@ function makeBrowser({ hash = "#home", storage = {}, providerError = false, defe
   const window = {
     location: { hash },
     addEventListener(type, listener) { listeners[`window:${type}`] = listener; },
-    setTimeout() {},
+    setTimeout(callback, delay = 0) {
+      const id = ++nextTimerId;
+      timers.push({ id, callback, delay });
+      timerDelays.push(delay);
+      return id;
+    },
+    clearTimeout(id) {
+      const timerIndex = timers.findIndex((timer) => timer.id === id);
+      if (timerIndex >= 0) timers.splice(timerIndex, 1);
+    },
+    requestAnimationFrame(callback) {
+      Promise.resolve().then(() => {
+        events.push({ type: "animation-frame" });
+        callback(0);
+      });
+    },
     confirm() { return true; },
   };
   const document = {
@@ -74,8 +118,42 @@ function makeBrowser({ hash = "#home", storage = {}, providerError = false, defe
       return ({ "#app": root, ".topbar-right": modeControl, "#toast": toast })[selector] || null;
     },
   };
+  const streamReply = chatStreamChunks.join("");
+  const streamEvents = [
+    ...chatStreamChunks.map((delta, index) => ({ type: "text", index, delta })),
+    {
+      type: "done",
+      response: { reply: streamReply, title: "围绕问题展开的对话", emotion: "calm", state_delta: {}, next_scene: null, is_ending: false, ending_id: null },
+      messages: [{ message: "你好", reply: streamReply, emotion: "calm" }],
+      title: "围绕问题展开的对话",
+    },
+  ];
+  const streamBytes = new TextEncoder().encode(streamEvents.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""));
+  const streamFrames = streamEvents.map((event) => new TextEncoder().encode(`data: ${JSON.stringify(event)}\n\n`));
   const fetch = async (url, options = {}) => {
     calls.push({ url, options });
+    if (url === "/api/voice/stream" && options.method === "POST") events.push({ type: "voice-request" });
+    if (url === "/api/voice/status") {
+      voiceStatusChecks += 1;
+      const enabled = voiceReadyAfter ? voiceStatusChecks >= voiceReadyAfter : voiceEnabled;
+      const configured = voiceReadyAfter ? true : voiceEnabled;
+      if (deferVoiceStatus && voiceStatusChecks === 1) {
+        return await new Promise((resolve) => {
+          resolveVoiceStatus = () => resolve({ ok: true, json: async () => ({ data: { enabled, configured } }) });
+        });
+      }
+      return { ok: true, json: async () => ({ data: { enabled, configured } }) };
+    }
+    if (url === "/api/voice/stream" && options.method === "POST") {
+      if (voiceError) throw new Error("Voice service unavailable");
+      voiceSynthesisCalls += 1;
+      if (deferVoice && voiceSynthesisCalls > deferVoiceAfter) {
+        return await new Promise((resolve) => {
+          resolveVoice = () => resolve({ ok: true, blob: async () => ({ type: "audio/wav" }) });
+        });
+      }
+      return { ok: true, blob: async () => ({ type: "audio/wav" }) };
+    }
     if (url === "/api/sessions" && options.method === "POST") {
       return { ok: true, json: async () => ({ data: storySession() }) };
     }
@@ -86,7 +164,7 @@ function makeBrowser({ hash = "#home", storage = {}, providerError = false, defe
       return { ok: true, json: async () => ({ data: storySession({ id: "completed-story", finished: true }) }) };
     }
     if (url === "/api/sessions/story-1/turn" && options.method === "POST") {
-      return {
+      const response = {
         ok: true,
         json: async () => ({
           data: {
@@ -105,6 +183,10 @@ function makeBrowser({ hash = "#home", storage = {}, providerError = false, defe
           },
         }),
       };
+      if (deferStoryTurn) {
+        return await new Promise((resolve) => { resolveStoryTurn = () => resolve(response); });
+      }
+      return response;
     }
     if (url === "/api/chat/sessions" && options.method === "POST") {
       return { ok: true, json: async () => ({ data: { chat_session_id: "chat-1", player_name: "清岚", mode: "live", messages: [] } }) };
@@ -144,30 +226,209 @@ function makeBrowser({ hash = "#home", storage = {}, providerError = false, defe
       };
     }
     if (url === "/api/chat/sessions/chat-1/messages" && options.method === "POST") {
+      if (streamChat) {
+        let delivered = false;
+        return {
+          ok: true,
+          headers: { get: (name) => name.toLowerCase() === "content-type" ? "text/event-stream; charset=utf-8" : null },
+          body: {
+            getReader() {
+              let frameIndex = 0;
+              return {
+                async read() {
+                  if (deferStreamReads) {
+                    if (frameIndex >= streamFrames.length) return { done: true, value: undefined };
+                    return await new Promise((resolve) => {
+                      resolveStreamRead = () => resolve({ done: false, value: streamFrames[frameIndex++] });
+                    });
+                  }
+                  if (delivered) return { done: true, value: undefined };
+                  delivered = true;
+                  return { done: false, value: streamBytes };
+                },
+                async cancel() { delivered = true; streamReaderCancelled = true; },
+              };
+            },
+          },
+        };
+      }
+      if (deferChat) {
+        return await new Promise((resolve, reject) => {
+          resolveChat = resolve;
+          options.signal?.addEventListener("abort", () => {
+            const error = new Error("aborted");
+            error.name = "AbortError";
+            reject(error);
+          });
+        });
+      }
       return {
         ok: true,
         json: async () => ({
           data: {
-            response: { reply: "我听见了。", title: "围绕问题展开的对话", emotion: "calm", state_delta: {}, next_scene: null, is_ending: false, ending_id: null },
-            messages: [{ message: "你好", reply: "我听见了。", emotion: "calm" }],
+            response: { reply: chatReply, title: "围绕问题展开的对话", emotion: "calm", state_delta: {}, next_scene: null, is_ending: false, ending_id: null },
+            messages: [{ message: "你好", reply: chatReply, emotion: "calm" }],
           },
         }),
       };
     }
+    if (url === "/api/chat/sessions/chat-1" && options.method === "DELETE") {
+      if (deferDeleteChat) await new Promise((resolve) => { resolveDeleteChat = resolve; });
+      if (deleteChatError) {
+        return { ok: false, json: async () => ({ error: { message: "删除失败，请稍后重试。" } }) };
+      }
+      return { ok: true, json: async () => ({ data: { deleted: true } }) };
+    }
     throw new Error(`Unexpected request: ${options.method || "GET"} ${url}`);
+  };
+  const chatInputControl = {
+    dataset: { chatInput: "true" },
+    disabled: false,
+    matches(selector) { return selector === "[data-chat-input]"; },
+  };
+  const deleteChatControl = {
+    dataset: { action: "delete-chat", chatSession: "chat-1" },
+    disabled: false,
+    matches() { return false; },
   };
   const clipboardWrites = [];
   const navigator = { clipboard: { async writeText(text) { clipboardWrites.push(text); } } };
-  const context = { document, window, localStorage, fetch, console, navigator };
+  class FakeAbortController {
+    constructor() {
+      const listeners = [];
+      this.signal = {
+        aborted: false,
+        addEventListener(type, listener) {
+          if (type === "abort") listeners.push(listener);
+        },
+      };
+      this.abort = () => {
+        this.signal.aborted = true;
+        listeners.forEach((listener) => listener());
+      };
+    }
+  }
+  class FakeAudio {
+    constructor(source) {
+      this.src = source || "";
+      this.muted = false;
+      this.paused = true;
+      this.ended = false;
+      this.readyState = 0;
+      this.readyPromise = Promise.resolve();
+      this.listeners = new Map();
+      audioInstances.push(this);
+    }
+    addEventListener(type, listener) {
+      const handlers = this.listeners.get(type) || new Set();
+      handlers.add(listener);
+      this.listeners.set(type, handlers);
+      if (type === "ended" && !deferAudioEnd) Promise.resolve().then(() => this.finish());
+    }
+    removeEventListener(type, listener) { this.listeners.get(type)?.delete(listener); }
+    dispatch(type) { [...(this.listeners.get(type) || [])].forEach((listener) => listener()); }
+    load() {
+      if (!this.src.startsWith("/api/voice/stream")) return;
+      events.push({ type: "voice-prepare" });
+      if (deferAudioReady) {
+        this.readyPromise = new Promise((resolve) => {
+          pendingAudioReady.push(() => {
+            this.readyState = 3;
+            this.dispatch("canplay");
+            resolve();
+          });
+        });
+      } else {
+        this.readyState = 3;
+        this.dispatch("canplay");
+      }
+    }
+    finish() {
+      if (this.ended || this.paused) return;
+      this.ended = true;
+      this.paused = true;
+      [...(this.listeners.get("ended") || [])].forEach((listener) => listener());
+      this.onended?.();
+    }
+    async play() {
+      if (audioRequiresGesture && !audioUnlocked && !this.muted && !this.src.startsWith("data:")) {
+        const error = new Error("Autoplay is not allowed");
+        error.name = "NotAllowedError";
+        throw error;
+      }
+      const silentUnlock = this.muted || this.src.startsWith("data:");
+      if (silentUnlock) {
+        audioUnlocked = true;
+        this.paused = false;
+        return;
+      }
+      if (this.src.startsWith("/api/voice/stream")) {
+        if (voiceError) throw new Error("Voice service unavailable");
+        voiceSynthesisCalls += 1;
+        calls.push({ url: "/api/voice/stream", requestUrl: this.src, options: { method: "GET" } });
+        events.push({ type: "voice-request" });
+        if (deferVoice && voiceSynthesisCalls > deferVoiceAfter) {
+          await new Promise((resolve) => { resolveVoice = resolve; });
+          if (!this.src) return;
+        }
+        await this.readyPromise;
+        if (!this.src) return;
+      }
+      if (deferAudioStart) {
+        await new Promise((resolve) => { resolveAudioStart = resolve; });
+        if (this.paused) return;
+      }
+      this.ended = false;
+      this.paused = false;
+      audioPlayback.push(this.src.startsWith("/api/voice/stream") ? "blob:voice-response" : this.src);
+      events.push({ type: "audio-play" });
+      if (!suppressAudioPlaying) {
+        events.push({ type: "audio-playing" });
+        this.dispatch("playing");
+      }
+    }
+    pause() { this.paused = true; }
+  }
+  const context = {
+    document,
+    window,
+    localStorage,
+    fetch,
+    console,
+    navigator,
+    Audio: FakeAudio,
+    TextDecoder,
+    URL: { createObjectURL: () => "blob:voice-response", revokeObjectURL() {} },
+    AbortController: FakeAbortController,
+  };
   vm.runInNewContext(source, context, { filename: "frontend/app.js" });
 
   return {
     calls,
+    events,
     root,
     values,
     clipboardWrites,
+    audioPlayback,
+    audioInstances,
+    timerDelays,
+    get chatInputDisabled() { return chatInputControl.disabled; },
+    get currentChatDeleteDisabled() { return deleteChatControl.disabled; },
+    get streamReaderCancelled() { return streamReaderCancelled; },
+    async runNextTimer() {
+      const timer = timers.shift();
+      if (timer) timer.callback();
+      await settle();
+    },
+    async runTimer(delay) {
+      const timerIndex = timers.findIndex((timer) => timer.delay === delay);
+      const [timer] = timerIndex >= 0 ? timers.splice(timerIndex, 1) : [];
+      if (timer) timer.callback();
+      await settle();
+    },
     modeControlHidden: () => toggleState.has("is-hidden"),
     async click(action, dataset = {}) {
+      if (action === "delete-chat" && deleteChatControl.disabled) return;
       listeners["root:click"]({ target: { closest: () => ({ dataset: { action, ...dataset } }) } });
       await settle();
     },
@@ -192,6 +453,9 @@ function makeBrowser({ hash = "#home", storage = {}, providerError = false, defe
         preventDefault() {},
       });
     },
+    inputChat(value) {
+      listeners["root:input"]({ target: { matches: (selector) => selector === "[data-chat-input]", value } });
+    },
     async submitName(name, { target = "story", replayId = "demo_guarded_path" } = {}) {
       listeners["root:submit"]({
         target: {
@@ -212,6 +476,55 @@ function makeBrowser({ hash = "#home", storage = {}, providerError = false, defe
     get hash() { return window.location.hash; },
     resolveRegenerate() {
       if (resolveRegenerate) resolveRegenerate();
+    },
+    resolveChat() {
+      if (resolveChat) resolveChat({
+        ok: true,
+        json: async () => ({
+          data: {
+            response: { reply: chatReply, title: "围绕问题展开的对话", emotion: "calm", state_delta: {}, next_scene: null, is_ending: false, ending_id: null },
+            messages: [{ message: "你好", reply: chatReply, emotion: "calm" }],
+          },
+        }),
+      });
+    },
+    resolveDeleteChat() {
+      if (resolveDeleteChat) resolveDeleteChat();
+    },
+    resolveStoryTurn() {
+      if (resolveStoryTurn) resolveStoryTurn();
+    },
+    resolveVoice() {
+      if (resolveVoice) resolveVoice();
+    },
+    resolveVoiceStatus() {
+      if (resolveVoiceStatus) resolveVoiceStatus();
+    },
+    resolveAudioReady() {
+      while (pendingAudioReady.length) {
+        const resolve = pendingAudioReady.shift();
+        resolve();
+        const audio = [...audioInstances].reverse().find((candidate) => candidate.readyState >= 3 && candidate.src.startsWith("/api/voice/stream"));
+        if (audio) break;
+      }
+    },
+    signalAudioLoadedData() {
+      const audio = [...audioInstances].reverse().find((candidate) => candidate.src.startsWith("/api/voice/stream"));
+      if (audio) {
+        audio.readyState = 2;
+        audio.dispatch("loadeddata");
+      }
+    },
+    resolveAudioStart() {
+      if (resolveAudioStart) resolveAudioStart();
+    },
+    resolveAudioEnd() {
+      [...audioInstances].reverse().find((audio) => !audio.paused && !audio.ended)?.finish();
+    },
+    releaseNextStreamEvent() {
+      const release = resolveStreamRead;
+      resolveStreamRead = undefined;
+      if (release) release();
     },
   };
 }
@@ -255,8 +568,55 @@ test("the submitted option is rendered in the same turn as its response", async 
   await browser.click("select-story", { replayId: "demo_guarded_path" });
   await browser.click("option", { option: "listen" });
 
-  assert.match(browser.root.innerHTML, /先听听他的判断/);
-  assert.equal((browser.root.innerHTML.match(/先听听他的判断/g) || []).length, 1);
+  assert.match(browser.root.innerHTML, /继续调查/);
+  assert.match(browser.root.innerHTML, /<p>……<\/p>/);
+  await browser.runNextTimer();
+  assert.match(browser.root.innerHTML, /沿着这条线索继续查/);
+});
+
+test("story turn immediately shows a single ellipsis placeholder and reveals the reply after the response delay", async () => {
+  const browser = makeBrowser({
+    hash: "#/stories",
+    storage: { "wanderer-player-name": "清岚" },
+    deferStoryTurn: true,
+    voiceEnabled: true,
+  });
+
+  await browser.click("select-story", { replayId: "demo_guarded_path" });
+  browser.click("option", { option: "listen" });
+  await settle();
+
+  assert.match(browser.root.innerHTML, /继续调查/);
+  assert.match(browser.root.innerHTML, /<p>……<\/p>/);
+  assert.doesNotMatch(browser.root.innerHTML, /正在整理这段回应/);
+  assert.doesNotMatch(browser.root.innerHTML, /沿着这条线索继续查/);
+  assert.equal(browser.audioPlayback.length, 1);
+
+  browser.resolveStoryTurn();
+  await settle();
+  assert.match(browser.root.innerHTML, /<p>……<\/p>/);
+
+  await browser.runNextTimer();
+  assert.match(browser.root.innerHTML, /沿着这条线索继续查/);
+  assert.doesNotMatch(browser.root.innerHTML, /正在整理这段回应/);
+  assert.equal(browser.audioPlayback.length, 2);
+});
+
+test("a fast repeated story choice cannot restore the old loading state or duplicate the turn request", async () => {
+  const browser = makeBrowser({
+    hash: "#/stories",
+    storage: { "wanderer-player-name": "清岚" },
+    deferStoryTurn: true,
+  });
+
+  await browser.click("select-story", { replayId: "demo_guarded_path" });
+  browser.click("option", { option: "listen" });
+  browser.click("option", { option: "listen" });
+  await settle();
+
+  assert.equal(browser.calls.filter((call) => call.url === "/api/sessions/story-1/turn").length, 1);
+  assert.match(browser.root.innerHTML, /<p>……<\/p>/);
+  assert.doesNotMatch(browser.root.innerHTML, /正在整理这段回应/);
 });
 
 test("restored unfinished journey can be declined without deleting progress, or resumed", async () => {
@@ -328,12 +688,437 @@ test("free chat shows the user message and assistant placeholder before the resp
   await browser.click("start-chat");
   browser.submitChatPending("你好");
   assert.match(browser.root.innerHTML, /你好/);
-  assert.match(browser.root.innerHTML, /「浮浪倾客」正在回应……/);
+  assert.match(browser.root.innerHTML, /value=""/);
+  assert.match(browser.root.innerHTML, /「浮浪倾客」正在思考……/);
   await settle();
   assert.match(browser.root.innerHTML, /我听见了/);
   assert.match(browser.root.innerHTML, /围绕问题展开的对话/);
   assert.match(browser.root.innerHTML, /reveal/);
   assert.doesNotMatch(browser.root.innerHTML, /平静|class="emotion"/);
+});
+
+test("free chat reveals each streamed chunk from its audio playing event and waits for audio end", async () => {
+  const browser = makeBrowser({
+    hash: "#/chat",
+    storage: { "wanderer-player-name": "清岚" },
+    voiceEnabled: true,
+    streamChat: true,
+    deferAudioEnd: true,
+    chatStreamChunks: ["第一句。", "第二句！", "第三句收尾。"],
+  });
+  await browser.click("start-chat");
+
+  browser.submitChatPending("你好");
+  await settle();
+
+  assert.match(browser.root.innerHTML, /第一句。/);
+  assert.doesNotMatch(browser.root.innerHTML, /第二句|第三句/);
+  const firstRender = browser.events.findIndex((event) => event.type === "render" && event.html.includes("第一句。"));
+  const firstVoicePreparation = browser.events.findIndex((event) => event.type === "voice-prepare");
+  const firstAudioStart = browser.events.findIndex((event) => event.type === "audio-play");
+  const firstAudioPlaying = browser.events.findIndex((event) => event.type === "audio-playing");
+  assert.ok(firstVoicePreparation >= 0 && firstAudioStart > firstVoicePreparation && firstAudioPlaying >= firstAudioStart);
+  assert.equal(firstRender, firstAudioPlaying + 1);
+
+  browser.resolveAudioEnd();
+  await settle();
+  assert.match(browser.root.innerHTML, /第一句。第二句！/);
+  assert.doesNotMatch(browser.root.innerHTML, /第三句/);
+
+  browser.resolveAudioEnd();
+  await settle();
+  assert.match(browser.root.innerHTML, /第一句。第二句！第三句收尾。/);
+
+  browser.resolveAudioEnd();
+  await settle();
+  assert.match(browser.root.innerHTML, /data-action="copy-reply"/);
+  assert.equal(browser.streamReaderCancelled, true);
+});
+
+test("free chat keeps speaking when later streamed chunks arrive after the voice queue drained", async () => {
+  const chunks = Array.from({ length: 12 }, (_, index) => `第${index + 1}句。`);
+  const browser = makeBrowser({
+    hash: "#/chat",
+    storage: { "wanderer-player-name": "清岚" },
+    voiceEnabled: true,
+    streamChat: true,
+    deferStreamReads: true,
+    deferAudioEnd: true,
+    chatStreamChunks: chunks,
+  });
+  await browser.click("start-chat");
+
+  browser.submitChatPending("请完整回答");
+  await settle();
+
+  for (let index = 0; index < chunks.length; index += 1) {
+    browser.releaseNextStreamEvent();
+    await settle();
+    assert.equal(browser.audioPlayback.length, index + 1);
+    browser.resolveAudioEnd();
+    await settle();
+  }
+  browser.releaseNextStreamEvent();
+  await settle();
+
+  assert.equal(browser.audioPlayback.length, chunks.length);
+  assert.match(browser.root.innerHTML, new RegExp(chunks.join("")));
+});
+
+test("free chat preloads the next streamed voice while the current chunk is still playing", async () => {
+  const browser = makeBrowser({
+    hash: "#/chat",
+    storage: { "wanderer-player-name": "清岚" },
+    voiceEnabled: true,
+    streamChat: true,
+    deferAudioEnd: true,
+    chatStreamChunks: ["第一句。", "第二句！", "第三句收尾。"],
+  });
+  await browser.click("start-chat");
+
+  browser.submitChatPending("你好");
+  await settle();
+
+  assert.equal(browser.audioPlayback.length, 1);
+  assert.equal(browser.events.filter((event) => event.type === "voice-prepare").length, 2);
+  assert.doesNotMatch(browser.root.innerHTML, /第二句|第三句/);
+
+  browser.resolveAudioEnd();
+  await settle();
+
+  assert.equal(browser.events.filter((event) => event.type === "voice-prepare").length, 3);
+});
+
+test("queued streamed voice does not expire while an earlier chunk is still playing", async () => {
+  const browser = makeBrowser({
+    hash: "#/chat",
+    storage: { "wanderer-player-name": "清岚" },
+    voiceEnabled: true,
+    streamChat: true,
+    deferAudioReady: true,
+    deferAudioEnd: true,
+    chatStreamChunks: ["第一段语音。", "第二段语音。", "第三段语音。"],
+  });
+  await browser.click("start-chat");
+
+  browser.submitChatPending("请完整回答");
+  await settle();
+  browser.resolveAudioReady();
+  await settle();
+  assert.equal(browser.audioPlayback.length, 1);
+
+  await browser.runTimer(15000);
+  assert.equal(browser.audioPlayback.length, 1);
+  browser.resolveAudioEnd();
+  await settle();
+  browser.resolveAudioReady();
+  await settle();
+
+  assert.equal(browser.audioPlayback.length, 2);
+  assert.match(browser.root.innerHTML, /第一段语音。第二段语音。/);
+});
+
+test("streamed chat creates the animated reply bubble once and updates later text in place", async () => {
+  const browser = makeBrowser({
+    hash: "#/chat",
+    storage: { "wanderer-player-name": "清岚" },
+    voiceEnabled: true,
+    streamChat: true,
+    deferAudioEnd: true,
+    chatStreamChunks: ["第一句。", "第二句！"],
+  });
+  await browser.click("start-chat");
+
+  browser.submitChatPending("你好");
+  await settle();
+
+  const firstChunkRenderCount = browser.events.filter((event) => event.type === "render" && event.html.includes("第一句。")).length;
+  const animatedRenderCount = browser.events.filter((event) => event.type === "render" && event.html.includes("chat-message assistant reveal") && event.html.includes("第一句。")).length;
+  assert.equal(firstChunkRenderCount, 1);
+  assert.equal(animatedRenderCount, 1);
+
+  browser.resolveAudioEnd();
+  await settle();
+
+  assert.match(browser.root.innerHTML, /第一句。第二句！/);
+  assert.equal(browser.events.filter((event) => event.type === "render" && event.html.includes("第一句。")).length, 1);
+  assert.deepEqual(browser.events.filter((event) => event.type === "stream-text").map((event) => event.text), ["第一句。第二句！"]);
+
+  browser.resolveAudioEnd();
+  await settle();
+});
+
+test("streamed tokens stay cached until their voice actually starts playing", async () => {
+  const browser = makeBrowser({
+    hash: "#/chat",
+    storage: { "wanderer-player-name": "清岚" },
+    voiceEnabled: true,
+    streamChat: true,
+    deferAudioReady: true,
+    deferAudioEnd: true,
+    chatStreamChunks: ["等语音准备好再显示。"],
+  });
+  await browser.click("start-chat");
+
+  browser.submitChatPending("你好");
+  await settle();
+
+  assert.equal(browser.events.some((event) => event.type === "voice-prepare"), true);
+  assert.doesNotMatch(browser.root.innerHTML, /等语音准备好再显示/);
+  assert.equal(browser.events.some((event) => event.type === "audio-play"), false);
+
+  browser.signalAudioLoadedData();
+  await settle();
+  assert.doesNotMatch(browser.root.innerHTML, /等语音准备好再显示/);
+  assert.equal(browser.events.some((event) => event.type === "audio-play"), false);
+
+  browser.resolveAudioReady();
+  await settle();
+
+  const textRelease = browser.events.findIndex((event) => event.type === "render" && event.html.includes("等语音准备好再显示。"));
+  const audioPlaying = browser.events.findIndex((event) => event.type === "audio-playing");
+  assert.ok(audioPlaying >= 0);
+  assert.equal(textRelease, audioPlaying + 1);
+  assert.match(browser.root.innerHTML, /等语音准备好再显示。/);
+
+  browser.resolveAudioEnd();
+  await settle();
+});
+
+test("a streamed voice that never becomes playable times out and releases its text", async () => {
+  const browser = makeBrowser({
+    hash: "#/chat",
+    storage: { "wanderer-player-name": "清岚" },
+    voiceEnabled: true,
+    streamChat: true,
+    deferAudioReady: true,
+    chatStreamChunks: ["语音流卡住时仍能完成回复。", "后续文字也应继续出现。"],
+  });
+  await browser.click("start-chat");
+
+  browser.submitChatPending("你好");
+  await settle();
+  assert.doesNotMatch(browser.root.innerHTML, /语音流卡住时仍能完成回复/);
+
+  await browser.runTimer(15000);
+
+  assert.match(browser.root.innerHTML, /语音流卡住时仍能完成回复。后续文字也应继续出现。/);
+  assert.equal(browser.audioPlayback.length, 0);
+  assert.equal(browser.root.innerHTML.includes("正在思考"), false);
+});
+
+test("streamed chat releases cached text when voice preparation fails", async () => {
+  const browser = makeBrowser({
+    hash: "#/chat",
+    storage: { "wanderer-player-name": "清岚" },
+    voiceEnabled: true,
+    voiceError: true,
+    streamChat: true,
+    chatStreamChunks: ["语音失败时仍显示文字。"],
+  });
+  await browser.click("start-chat");
+
+  browser.submitChatPending("你好");
+  await settle();
+
+  assert.match(browser.root.innerHTML, /语音失败时仍显示文字。/);
+  assert.equal(browser.audioPlayback.length, 0);
+  assert.equal(browser.events.filter((event) => event.type === "stream-text").length, 0);
+  assert.equal(
+    browser.audioInstances.reduce((count, audio) => (
+      count
+      + (audio.listeners.get("playing")?.size || 0)
+      + (audio.listeners.get("ended")?.size || 0)
+      + (audio.listeners.get("error")?.size || 0)
+    ), 0),
+    0,
+  );
+  assert.doesNotMatch(browser.root.innerHTML, /正在思考/);
+});
+
+test("pausing a streamed chat discards buffered later chunks and stops its audio", async () => {
+  const browser = makeBrowser({
+    hash: "#/chat",
+    storage: { "wanderer-player-name": "清岚" },
+    voiceEnabled: true,
+    streamChat: true,
+    deferAudioEnd: true,
+    chatStreamChunks: ["先显示这一句。", "这一句不应出现！"],
+  });
+  await browser.click("start-chat");
+
+  browser.submitChatPending("你好");
+  await settle();
+  assert.match(browser.root.innerHTML, /先显示这一句。/);
+  assert.doesNotMatch(browser.root.innerHTML, /这一句不应出现/);
+
+  await browser.click("pause-chat");
+  browser.resolveAudioEnd();
+  await settle();
+
+  assert.doesNotMatch(browser.root.innerHTML, /这一句不应出现/);
+  assert.equal(browser.audioInstances.every((audio) => audio.paused), true);
+  assert.match(browser.root.innerHTML, /已暂停思考/);
+});
+
+test("pausing before voice readiness discards the cached text without ever rendering it", async () => {
+  const browser = makeBrowser({
+    hash: "#/chat",
+    storage: { "wanderer-player-name": "清岚" },
+    voiceEnabled: true,
+    streamChat: true,
+    deferAudioReady: true,
+    deferAudioEnd: true,
+    chatStreamChunks: ["取消后绝不能闪现。"],
+  });
+  await browser.click("start-chat");
+
+  browser.submitChatPending("你好");
+  await settle();
+  assert.doesNotMatch(browser.root.innerHTML, /取消后绝不能闪现/);
+
+  await browser.click("pause-chat");
+  browser.resolveAudioReady();
+  await settle();
+
+  assert.equal(browser.events.some((event) => event.type === "render" && event.html.includes("取消后绝不能闪现。")), false);
+  assert.doesNotMatch(browser.root.innerHTML, /取消后绝不能闪现/);
+  assert.match(browser.root.innerHTML, /已暂停思考/);
+});
+
+test("pausing while streamed audio play is pending settles without releasing cached text", async () => {
+  const browser = makeBrowser({
+    hash: "#/chat",
+    storage: { "wanderer-player-name": "清岚" },
+    voiceEnabled: true,
+    streamChat: true,
+    deferVoice: true,
+    deferAudioEnd: true,
+    chatStreamChunks: ["播放尚未开始时暂停。"],
+  });
+  await browser.click("start-chat");
+
+  browser.submitChatPending("你好");
+  await settle();
+  assert.doesNotMatch(browser.root.innerHTML, /播放尚未开始时暂停/);
+
+  await browser.click("pause-chat");
+  await settle();
+
+  assert.match(browser.root.innerHTML, /已暂停思考/);
+  assert.doesNotMatch(browser.root.innerHTML, /播放尚未开始时暂停/);
+  assert.equal(browser.events.some((event) => event.type === "audio-playing"), false);
+});
+
+test("a resolved play promise without a playing event never releases cached text", async () => {
+  const browser = makeBrowser({
+    hash: "#/chat",
+    storage: { "wanderer-player-name": "清岚" },
+    voiceEnabled: true,
+    streamChat: true,
+    suppressAudioPlaying: true,
+    deferAudioEnd: true,
+    chatStreamChunks: ["没有真实播放事件就不能显示。"],
+  });
+  await browser.click("start-chat");
+
+  browser.submitChatPending("你好");
+  await settle();
+
+  assert.equal(browser.events.some((event) => event.type === "audio-play"), true);
+  assert.equal(browser.events.some((event) => event.type === "audio-playing"), false);
+  assert.doesNotMatch(browser.root.innerHTML, /没有真实播放事件就不能显示/);
+
+  await browser.click("pause-chat");
+  await settle();
+  assert.match(browser.root.innerHTML, /已暂停思考/);
+});
+
+test("deleting before voice readiness discards cached text and never starts its audio", async () => {
+  const browser = makeBrowser({
+    hash: "#/chat",
+    storage: { "wanderer-player-name": "清岚" },
+    voiceEnabled: true,
+    streamChat: true,
+    deferAudioReady: true,
+    deferAudioEnd: true,
+    chatStreamChunks: ["删除后绝不能闪现。"],
+  });
+  await browser.click("start-chat");
+
+  browser.submitChatPending("你好");
+  await settle();
+  await browser.click("delete-chat", { chatSession: "chat-1" });
+  browser.resolveAudioReady();
+  await settle();
+
+  assert.equal(browser.events.some((event) => event.type === "render" && event.html.includes("删除后绝不能闪现。")), false);
+  assert.equal(browser.events.some((event) => event.type === "audio-play"), false);
+  assert.doesNotMatch(browser.root.innerHTML, /删除后绝不能闪现/);
+  assert.equal(browser.values.has("wanderer-chat-session"), false);
+});
+
+test("a failed deletion leaves the cancelled streamed turn in a usable paused state", async () => {
+  const browser = makeBrowser({
+    hash: "#/chat",
+    storage: { "wanderer-player-name": "清岚" },
+    voiceEnabled: true,
+    streamChat: true,
+    deferAudioEnd: true,
+    deleteChatError: true,
+    deferDeleteChat: true,
+    chatStreamChunks: ["已经显示的第一句。", "缓存中的第二句不能闪现。"],
+  });
+  await browser.click("start-chat");
+
+  browser.submitChatPending("你好");
+  await settle();
+  assert.match(browser.root.innerHTML, /已经显示的第一句/);
+
+  await browser.click("delete-chat", { chatSession: "chat-1" });
+  browser.inputChat("删除等待期间输入的新草稿");
+  browser.resolveDeleteChat();
+  await settle();
+
+  assert.match(browser.errorMarkup, /删除失败/);
+  assert.match(browser.root.innerHTML, /已暂停思考/);
+  assert.doesNotMatch(browser.root.innerHTML, /data-action="pause-chat"/);
+  assert.doesNotMatch(browser.root.innerHTML, /缓存中的第二句不能闪现/);
+  assert.match(browser.root.innerHTML, /value="删除等待期间输入的新草稿"/);
+});
+
+test("free chat replaces send with pause and preserves the message when paused", async () => {
+  const browser = makeBrowser({ hash: "#/chat", storage: { "wanderer-player-name": "清岚" }, deferChat: true });
+  await browser.click("start-chat");
+
+  browser.submitChatPending("你好");
+  await settle();
+  assert.match(browser.root.innerHTML, /「浮浪倾客」正在思考……/);
+  assert.match(browser.root.innerHTML, /data-action="pause-chat"/);
+
+  await browser.click("pause-chat");
+
+  assert.match(browser.root.innerHTML, /「浮浪倾客」已暂停思考。/);
+  assert.doesNotMatch(browser.root.innerHTML, /正在思考……/);
+  assert.doesNotMatch(browser.root.innerHTML, /data-action="pause-chat"/);
+  assert.match(browser.root.innerHTML, /value="你好"/);
+  const call = browser.calls.find((item) => item.url === "/api/chat/sessions/chat-1/messages");
+  assert.equal(call.options.signal.aborted, true);
+});
+
+test("free chat keeps the input enabled and preserves a draft typed while the reply is pending", async () => {
+  const browser = makeBrowser({ hash: "#/chat", storage: { "wanderer-player-name": "清岚" }, deferChat: true });
+  await browser.click("start-chat");
+
+  browser.submitChatPending("第一句话");
+  await settle();
+  assert.equal(browser.chatInputDisabled, false);
+
+  browser.inputChat("下一次准备发送的话");
+  browser.resolveChat();
+  await settle();
+
+  assert.match(browser.root.innerHTML, /value="下一次准备发送的话"/);
 });
 
 test("story journey renders preset options without any free text input", async () => {
@@ -359,6 +1144,356 @@ test("free chat reply offers copy and regenerate shortcuts", async () => {
   assert.deepEqual(browser.clipboardWrites, ["我听见了。"]);
 });
 
+test("choosing a story option immediately pauses the previous voice playback", async () => {
+  const browser = makeBrowser({ hash: "#/stories", storage: { "wanderer-player-name": "清岚" }, voiceEnabled: true });
+  await browser.click("select-story", { replayId: "demo_guarded_path" });
+
+  assert.equal(browser.audioInstances.length, 1);
+  assert.equal(browser.audioInstances[0].paused, false);
+  await browser.click("option", { option: "listen" });
+
+  assert.equal(browser.audioInstances[0].paused, true);
+  assert.doesNotMatch(browser.root.innerHTML, /正在整理这段回应/);
+});
+
+test("story replies auto-play without voice controls, while chat uses a pause button", async () => {
+  const story = makeBrowser({ hash: "#/stories", storage: { "wanderer-player-name": "清岚", "wanderer-voice-enabled": "true" }, voiceEnabled: true });
+  await story.click("select-story", { replayId: "demo_guarded_path" });
+
+  assert.doesNotMatch(story.root.innerHTML, /data-action="play-voice"/);
+  assert.doesNotMatch(story.root.innerHTML, /语音已开|语音已关|语音准备中/);
+  assert.deepEqual(story.audioPlayback, ["blob:voice-response"]);
+
+  await story.click("option", { option: "listen" });
+  await story.runNextTimer();
+  assert.doesNotMatch(story.root.innerHTML, /data-action="play-voice"/);
+  assert.doesNotMatch(story.root.innerHTML, /语音已开|语音已关|语音准备中/);
+  assert.deepEqual(story.audioPlayback, ["blob:voice-response", "blob:voice-response"]);
+
+  const chat = makeBrowser({ hash: "#/chat", storage: { "wanderer-player-name": "清岚", "wanderer-voice-enabled": "true" }, voiceEnabled: true });
+  await chat.click("start-chat");
+  await chat.submitChat("你好");
+
+  const voiceRequest = chat.calls.find((call) => call.url === "/api/voice/stream");
+  assert.match(voiceRequest.requestUrl, /\/api\/voice\/stream\?text=/);
+  assert.equal(decodeURIComponent(voiceRequest.requestUrl.split("?text=")[1]), "我听见了。");
+  assert.deepEqual(chat.audioPlayback, ["blob:voice-response"]);
+  assert.doesNotMatch(chat.root.innerHTML, /data-action="toggle-voice"|data-action="play-chat-voice"|语音已开|语音已关/);
+  assert.match(chat.root.innerHTML, /data-action="pause-voice"/);
+  assert.match(chat.root.innerHTML, /<div class="chat-actions">[\s\S]*data-action="pause-voice"/);
+  const sceneHead = chat.root.innerHTML.match(/<div class="scene-head">[\s\S]*?<p class="chat-disclaimer">/)?.[0] || "";
+  assert.doesNotMatch(sceneHead, /data-action="pause-voice"/);
+  await chat.click("pause-voice");
+  assert.equal(chat.audioInstances[0].paused, true);
+  assert.match(chat.root.innerHTML, /继续朗读/);
+  await chat.click("pause-voice");
+  assert.equal(chat.audioInstances[0].paused, false);
+  assert.deepEqual(chat.audioPlayback, ["blob:voice-response", "blob:voice-response"]);
+});
+
+test("free chat reveals the generated reply while starting voice synthesis", async () => {
+  const browser = makeBrowser({ hash: "#/chat", storage: { "wanderer-player-name": "清岚" }, voiceEnabled: true });
+  await browser.click("start-chat");
+  await browser.submitChat("你好");
+
+  const voiceRequestIndex = browser.events.findIndex((event) => event.type === "voice-request");
+  const replyRenderIndex = browser.events.findIndex((event) => event.type === "render" && event.html.includes("我听见了"));
+  assert.ok(voiceRequestIndex >= 0);
+  assert.ok(replyRenderIndex >= 0);
+  assert.ok(replyRenderIndex >= 0);
+});
+
+test("free chat keeps the reply visible while voice playback is pending", async () => {
+  const browser = makeBrowser({
+    hash: "#/chat",
+    storage: { "wanderer-player-name": "清岚" },
+    deferVoice: true,
+    voiceEnabled: true,
+  });
+  await browser.click("start-chat");
+  browser.submitChatPending("你好");
+  await settle();
+
+  assert.match(browser.root.innerHTML, /我听见了/);
+  assert.equal(browser.events.some((event) => event.type === "audio-play"), false);
+
+  browser.resolveVoice();
+  await settle();
+
+  const audioPlayIndex = browser.events.findIndex((event) => event.type === "audio-play");
+  assert.ok(audioPlayIndex >= 0);
+  assert.match(browser.root.innerHTML, /我听见了/);
+});
+
+test("free chat reveals a long reply before its real synthesis request finishes", async () => {
+  const longReply = "这是一段需要完整朗读的较长回复。".repeat(20);
+  const browser = makeBrowser({
+    hash: "#/chat",
+    storage: { "wanderer-player-name": "清岚" },
+    deferVoice: true,
+    voiceEnabled: true,
+    chatReply: longReply,
+  });
+  await browser.click("start-chat");
+  browser.submitChatPending("请详细说明");
+  await settle();
+
+  assert.ok(browser.timerDelays.some((delay) => delay >= 60000));
+  assert.match(browser.root.innerHTML, new RegExp(longReply));
+  browser.resolveVoice();
+  await settle();
+
+  assert.match(browser.root.innerHTML, new RegExp(longReply));
+  assert.deepEqual(browser.audioPlayback, ["blob:voice-response"]);
+});
+
+test("free chat unlocks browser audio from the send gesture before delayed synthesis playback", async () => {
+  const browser = makeBrowser({
+    hash: "#/chat",
+    storage: { "wanderer-player-name": "清岚" },
+    audioRequiresGesture: true,
+    voiceEnabled: true,
+  });
+  await browser.click("start-chat");
+  await browser.submitChat("你好");
+
+  assert.deepEqual(browser.audioPlayback, ["blob:voice-response"]);
+  assert.match(browser.root.innerHTML, /我听见了/);
+});
+
+test("story journey unlocks browser audio from the choice gesture before delayed synthesis playback", async () => {
+  const browser = makeBrowser({
+    hash: "#/stories",
+    storage: { "wanderer-player-name": "清岚" },
+    audioRequiresGesture: true,
+    voiceEnabled: true,
+  });
+  await browser.click("select-story", { replayId: "demo_guarded_path" });
+  assert.deepEqual(browser.audioPlayback, ["blob:voice-response"]);
+
+  await browser.click("option", { option: "listen" });
+  await browser.runNextTimer();
+  assert.deepEqual(browser.audioPlayback, ["blob:voice-response", "blob:voice-response"]);
+  assert.match(browser.root.innerHTML, /沿着这条线索继续查/);
+});
+
+test("free chat waits for the initial voice status without hiding a reply", async () => {
+  const browser = makeBrowser({
+    hash: "#/chat",
+    storage: { "wanderer-player-name": "清岚" },
+    deferVoiceStatus: true,
+    voiceEnabled: true,
+  });
+  await browser.click("start-chat");
+  browser.submitChatPending("你好");
+  await settle();
+
+  assert.match(browser.root.innerHTML, /我听见了/);
+  assert.equal(browser.calls.filter((call) => call.url === "/api/voice/stream").length, 0);
+
+  browser.resolveVoiceStatus();
+  await settle();
+
+  const audioPlayIndex = browser.events.findIndex((event) => event.type === "audio-play");
+  assert.ok(audioPlayIndex >= 0);
+  assert.match(browser.root.innerHTML, /我听见了/);
+});
+
+test("free chat keeps text available if audio playback is delayed", async () => {
+  const browser = makeBrowser({
+    hash: "#/chat",
+    storage: { "wanderer-player-name": "清岚" },
+    deferAudioStart: true,
+    voiceEnabled: true,
+  });
+  await browser.click("start-chat");
+  browser.submitChatPending("你好");
+  await settle();
+
+  assert.match(browser.root.innerHTML, /我听见了/);
+  assert.equal(browser.audioPlayback.length, 0);
+  browser.resolveAudioStart();
+  await settle();
+  browser.resolveAudioStart();
+  await settle();
+  assert.equal(browser.audioPlayback.length, 0);
+});
+
+test("pausing chat while voice is synthesizing prevents later playback", async () => {
+  const browser = makeBrowser({
+    hash: "#/chat",
+    storage: { "wanderer-player-name": "清岚" },
+    deferVoice: true,
+    voiceEnabled: true,
+  });
+  await browser.click("start-chat");
+  browser.submitChatPending("你好");
+  await settle();
+
+  assert.equal(browser.calls.filter((call) => call.url === "/api/voice/stream").length, 1);
+  await browser.click("pause-chat");
+  browser.resolveVoice();
+  await settle();
+
+  assert.equal(browser.audioPlayback.length, 1);
+  assert.match(browser.root.innerHTML, /我听见了/);
+});
+
+test("story turns reveal the generated reply while voice playback is pending", async () => {
+  const browser = makeBrowser({
+    hash: "#/stories",
+    storage: { "wanderer-player-name": "清岚" },
+    deferVoice: true,
+    deferVoiceAfter: 1,
+    voiceEnabled: true,
+  });
+  const starting = browser.click("select-story", { replayId: "demo_guarded_path" });
+  await settle();
+  browser.resolveVoice();
+  await starting;
+
+  const turning = browser.click("option", { option: "listen" });
+  await settle();
+  await browser.runNextTimer();
+  assert.match(browser.root.innerHTML, /沿着这条线索继续查/);
+
+  browser.resolveVoice();
+  await turning;
+  await settle();
+
+  const audioPlayIndex = browser.events.map((event) => event.type).lastIndexOf("audio-play");
+  assert.ok(audioPlayIndex >= 0);
+  assert.match(browser.root.innerHTML, /沿着这条线索继续查/);
+});
+
+test("initial story reply stays visible while voice status and synthesis are pending", async () => {
+  const browser = makeBrowser({
+    hash: "#/stories",
+    storage: { "wanderer-player-name": "清岚" },
+    deferVoice: true,
+    deferVoiceStatus: true,
+    voiceEnabled: true,
+  });
+  const starting = browser.click("select-story", { replayId: "demo_guarded_path" });
+  await settle();
+  browser.resolveVoiceStatus();
+  await settle();
+
+  assert.equal(browser.calls.filter((call) => call.url === "/api/voice/stream").length, 1);
+  assert.match(browser.root.innerHTML, /沿着这条线索继续查/);
+
+  browser.resolveVoice();
+  await starting;
+  await settle();
+
+  const audioPlayIndex = browser.events.findIndex((event) => event.type === "audio-play");
+  assert.ok(audioPlayIndex >= 0);
+  assert.match(browser.root.innerHTML, /沿着这条线索继续查/);
+});
+
+test("free chat starts voice automatically without a voice toggle", async () => {
+  const browser = makeBrowser({ hash: "#/chat", storage: { "wanderer-player-name": "清岚" }, voiceEnabled: true });
+  await browser.click("start-chat");
+  await browser.submitChat("你好");
+
+  assert.deepEqual(browser.audioPlayback, ["blob:voice-response"]);
+  assert.equal(browser.calls.filter((call) => call.url === "/api/voice/stream").length, 1);
+  assert.doesNotMatch(browser.root.innerHTML, /data-action="toggle-voice"|语音已开|语音已关/);
+});
+
+test("free chat uses the streaming voice endpoint so long replies can start without waiting for the full WAV", async () => {
+  const longReply = "这是一段需要尽快开始朗读的较长回复。".repeat(20);
+  const browser = makeBrowser({
+    hash: "#/chat",
+    storage: { "wanderer-player-name": "清岚" },
+    voiceEnabled: true,
+    chatReply: longReply,
+  });
+  await browser.click("start-chat");
+  await browser.submitChat("请详细说明");
+
+  assert.equal(browser.calls.some((call) => call.url === "/api/voice/stream"), true);
+  assert.match(browser.audioInstances[0].src, /^\/api\/voice\/stream\?text=/);
+  assert.match(browser.root.innerHTML, new RegExp(longReply));
+});
+
+test("deleting the current chat stops active voice playback and aborts an in-flight reply", async () => {
+  const playing = makeBrowser({
+    hash: "#/chat",
+    storage: { "wanderer-player-name": "清岚" },
+    voiceEnabled: true,
+  });
+  await playing.click("start-chat");
+  await playing.submitChat("你好");
+  assert.equal(playing.audioInstances.some((audio) => !audio.paused), true);
+
+  await playing.click("delete-chat", { chatSession: "chat-1" });
+  assert.equal(playing.audioInstances.every((audio) => audio.paused), true);
+  assert.equal(playing.values.has("wanderer-chat-session"), false);
+
+  const pending = makeBrowser({
+    hash: "#/chat",
+    storage: { "wanderer-player-name": "清岚" },
+    deferChat: true,
+  });
+  await pending.click("start-chat");
+  pending.submitChatPending("你好");
+  await settle();
+  assert.match(pending.root.innerHTML, /data-action="pause-chat"/);
+  assert.equal(pending.currentChatDeleteDisabled, false);
+
+  await pending.click("delete-chat", { chatSession: "chat-1" });
+  assert.equal(pending.calls.find((call) => call.url === "/api/chat/sessions/chat-1/messages").options.signal.aborted, true);
+});
+
+test("free chat reveals text immediately when synthesis fails", async () => {
+  const browser = makeBrowser({
+    hash: "#/chat",
+    storage: { "wanderer-player-name": "清岚" },
+    voiceEnabled: true,
+    voiceError: true,
+  });
+  await browser.click("start-chat");
+  await browser.submitChat("你好");
+
+  assert.match(browser.root.innerHTML, /我听见了/);
+  assert.doesNotMatch(browser.root.innerHTML, /正在思考……/);
+  assert.equal(browser.audioPlayback.length, 0);
+});
+
+test("voice status retries during model loading and speaks the latest reply once ready", async () => {
+  const browser = makeBrowser({
+    hash: "#/chat",
+    storage: { "wanderer-player-name": "清岚" },
+    voiceReadyAfter: 2,
+  });
+  await browser.click("start-chat");
+  await browser.submitChat("你好");
+
+  assert.equal(browser.calls.filter((call) => call.url === "/api/voice/stream").length, 0);
+  assert.match(browser.root.innerHTML, /我听见了/);
+  assert.doesNotMatch(browser.root.innerHTML, /语音准备中|语音已开|语音已关/);
+
+  await browser.runNextTimer();
+  await settle();
+
+  assert.equal(browser.calls.filter((call) => call.url === "/api/voice/stream").length, 1);
+  assert.deepEqual(browser.audioPlayback, ["blob:voice-response"]);
+  assert.match(browser.root.innerHTML, /我听见了/);
+});
+
+test("story hides voice readiness controls while the local service is loading", async () => {
+  const browser = makeBrowser({
+    hash: "#/stories",
+    storage: { "wanderer-player-name": "清岚" },
+    voiceReadyAfter: 2,
+  });
+  await browser.click("select-story", { replayId: "demo_guarded_path" });
+
+  assert.doesNotMatch(browser.root.innerHTML, /语音已开|语音已关|语音准备中|data-action="play-voice"/);
+  assert.equal(browser.calls.filter((call) => call.url === "/api/voice/stream").length, 0);
+});
+
 test("free chat regenerate replaces the old reply with a pending panel before revealing the new reply", async () => {
   const browser = makeBrowser({ hash: "#/chat", storage: { "wanderer-player-name": "清岚" }, deferRegenerate: true });
   await browser.click("start-chat");
@@ -371,7 +1506,7 @@ test("free chat regenerate replaces the old reply with a pending panel before re
   const regenerateCall = browser.calls.find((call) => call.url === "/api/chat/sessions/chat-1/regenerate");
   assert.ok(regenerateCall);
   assert.match(browser.root.innerHTML, /你好/);
-  assert.match(browser.root.innerHTML, /「浮浪倾客」正在回应……/);
+  assert.match(browser.root.innerHTML, /「浮浪倾客」正在思考……/);
   assert.doesNotMatch(browser.root.innerHTML, /我听见了/);
 
   browser.resolveRegenerate();
@@ -380,7 +1515,7 @@ test("free chat regenerate replaces the old reply with a pending panel before re
 
   assert.match(browser.root.innerHTML, /换一个说法/);
   assert.match(browser.root.innerHTML, /chat-message assistant reveal/);
-  assert.doesNotMatch(browser.root.innerHTML, /正在回应……/);
+  assert.doesNotMatch(browser.root.innerHTML, /正在思考……/);
   assert.doesNotMatch(browser.root.innerHTML, /我听见了/);
 });
 
@@ -392,7 +1527,7 @@ test("free chat regenerate restores the old reply when the request fails", async
   await browser.click("regenerate-reply");
 
   assert.match(browser.root.innerHTML, /我听见了/);
-  assert.doesNotMatch(browser.root.innerHTML, /正在回应……/);
+  assert.doesNotMatch(browser.root.innerHTML, /正在思考……/);
   assert.match(browser.errorMarkup, /重新生成失败，请稍后重试/);
 });
 

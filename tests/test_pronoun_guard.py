@@ -1,5 +1,5 @@
 # 本文件由 codex 辅助生成（外围模块）
-"""人称守门单元测试：6 名号修复、命名/他人语境保护、代词模糊、幂等与性能。"""
+"""人称守门单元测试：名号修复、历史称呼保护、代词模糊、幂等与性能。"""
 import time
 
 import pytest
@@ -19,6 +19,7 @@ SELF_REFERENCE_CASES = [
     ("散兵只相信自己。", "我只相信自己。"),
     ("国崩早已看透这一切。", "我早已看透这一切。"),
     ("阿帽今天在教令院听课。", "我今天在教令院听课。"),
+    ("斯卡拉姆齐今天在教令院听课。", "我今天在教令院听课。"),
     ("「流浪者」不会为这种事停下。", "我不会为这种事停下。"),
     ("“浮浪倾客”不接受怜悯。", "我不接受怜悯。"),
 ]
@@ -28,7 +29,20 @@ NAMING_PRESERVED_CASES = [
     "浮浪倾客这个名头是我自己捡来的。",
     "叫我流浪者也行，随你。",
     "「散兵」这个名字是别人硬安上的。",
+    "「散兵」是我过去在愚人众使用的称呼。",
+    "我过去在愚人众使用过「斯卡拉姆齐」这个称呼。",
 ]
+
+INVALID_SELF_NAME_CASES = [
+    "我曾经被称为国崩。",
+    "我曾经名叫阿帽。",
+    "我过去的名字是流浪者。",
+]
+
+def test_guard_repairs_the_persisted_malformed_historical_sentence():
+    result = guard_reply("我是我过去在愚人众使用的称呼。")
+    assert result.status == "repaired"
+    assert result.text == "那是我过去在愚人众使用的称呼。"
 
 OTHERS_PRESERVED_CASES = [
     "在别人口中，他是浮浪倾客。",
@@ -54,13 +68,27 @@ def test_guard_repairs_each_self_name_variant(original, expected):
     assert result.text == expected
 
 
-def test_guard_covers_all_six_names():
+def test_guard_covers_all_alias_names():
     joined = "、".join(CHARACTER_SELF_NAMES)
-    assert joined == "浮浪倾客、流浪者、倾奇者、散兵、国崩、阿帽"
+    assert joined == "浮浪倾客、流浪者、倾奇者、散兵、国崩、阿帽、斯卡拉姆齐"
     for name in CHARACTER_SELF_NAMES:
         result = guard_reply(f"{name}不会说第二遍。")
         assert result.status == "repaired"
         assert result.text == "我不会说第二遍。"
+
+
+@pytest.mark.parametrize("reply", ["我是散兵。", "我叫阿帽。", "我的名字是斯卡拉姆齐。"])
+def test_guard_rejects_alias_as_a_first_person_name(reply):
+    result = guard_reply(reply)
+    assert result.status == "unrepairable"
+    assert result.text == reply
+
+
+@pytest.mark.parametrize("reply", INVALID_SELF_NAME_CASES)
+def test_guard_rejects_historical_alias_as_first_person_identity(reply):
+    result = guard_reply(reply)
+    assert result.status == "unrepairable"
+    assert result.text == reply
 
 
 @pytest.mark.parametrize("reply", NAMING_PRESERVED_CASES)

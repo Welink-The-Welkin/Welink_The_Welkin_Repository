@@ -6,6 +6,7 @@ import pytest
 
 import backend.app.core.pronoun_guard as pronoun_guard
 from backend.app.core.pronoun_guard import (
+    CHARACTER_SELF_NAMES,
     ELEMENT_SELF_REFERENCE_TERMS,
     FALLBACK_REPLIES,
     INTRO_FALLBACK_REPLIES,
@@ -19,7 +20,7 @@ from backend.app.core.pronoun_guard import (
 INTRO_MESSAGE = "介绍一下你自己"
 
 SHOT1_REPLY = (
-    "我叫阿帽，目前在须弥教令院因论派学习，也与纳西妲合作。风元素。"
+    "我目前在须弥教令院因论派学习，也与纳西妲合作。风元素。"
     "别把我归进任何国家或组织，我不属于那里。至于过去的事，我记得，也会承担。"
     "你不必替我找借口，冰红猹K_K。想知道什么就直说，别拐弯。"
 )
@@ -77,7 +78,7 @@ def test_shot1_word_level_element_removal():
     assert result.status == "repaired"
     assert _no_element_terms(result.text)
     assert result.text == SHOT1_REPLY.replace("风元素。", "")
-    assert "我叫阿帽，目前在须弥教令院因论派学习，也与纳西妲合作。" in result.text
+    assert "我目前在须弥教令院因论派学习，也与纳西妲合作。" in result.text
     assert "别把我归进任何国家或组织" in result.text
 
 
@@ -162,7 +163,7 @@ def test_plain_name_refusal_passes_through(message):
 
 
 def test_direct_introduction_passes_through():
-    reply = "我叫阿帽，目前在须弥教令院因论派学习，也与纳西妲合作。别把我归进任何国家或组织。"
+    reply = "我目前在须弥教令院因论派学习，也与纳西妲合作。别把我归进任何国家或组织。"
     result = guard_chat_reply(INTRO_MESSAGE, reply)
     assert result.status == "clean"
     assert result.text == reply
@@ -234,6 +235,7 @@ def test_intent_component_failure_disables_scene_guard(monkeypatch):
 def test_intro_fallback_pool_is_clean_and_on_character():
     for reply in INTRO_FALLBACK_REPLIES:
         assert _no_element_terms(reply)
+        assert all(name not in reply for name in CHARACTER_SELF_NAMES)
         assert pronoun_guard._PATHOLOGICAL_SELF_INTRO_RE.search(reply) is None
         assert guard_reply(reply).status == "clean"
         assert reply.strip()

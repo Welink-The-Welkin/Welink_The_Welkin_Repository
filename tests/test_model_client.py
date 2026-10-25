@@ -4,6 +4,8 @@ import io
 import urllib.error
 from uuid import uuid4
 
+import pytest
+
 from backend.app.contracts.game import initial_state
 from backend.app.core.character_profile import DEFAULT_CHARACTER_PROFILE
 from backend.app.core.model_client import ChatModelRequest, LiveModelClient, ModelRequest
@@ -60,6 +62,163 @@ def test_live_client_uses_text_response_format_for_openai_compatible_local_serve
     payload = client._payload(user="你好")
 
     assert payload["response_format"] == {"type": "text"}
+
+
+def test_reply_stream_chunker_prefers_sentence_boundaries_and_flushes_long_text():
+    from backend.app.core.model_client import chunk_reply_text
+
+    assert chunk_reply_text("第一句。第二句！") == ["第一句。", "第二句！"]
+    assert chunk_reply_text("第一段。\n\n第二段。") == ["第一段。", "第二段。"]
+    assert chunk_reply_text("甲。" + " " * 60 + "乙。") == ["甲。", " 乙。"]
+    long_text = "甲" * 60
+    chunks = chunk_reply_text(long_text)
+    assert "".join(chunks) == long_text
+    assert all(1 <= len(chunk) <= 56 for chunk in chunks)
+
+
+def test_chat_reply_layout_normalizer_handles_split_line_endings_and_preserves_word_spaces():
+    from backend.app.core.model_client import ChatReplyLayoutNormalizer
+
+    normalizer = ChatReplyLayoutNormalizer()
+    assert normalizer.feed("第一段。\r") == "第一段。"
+    assert normalizer.feed("\n  第二段。\u2028") == "第二段。"
+    assert normalizer.feed("\u2029　第三段。") == "第三段。"
+
+    words = ChatReplyLayoutNormalizer()
+    assert words.feed("keep ") == "keep"
+    assert words.feed("word spaces.") == " word spaces."
+
+    latin_line_wrap = ChatReplyLayoutNormalizer()
+    assert latin_line_wrap.feed("Use HTTP\r\n") == "Use HTTP"
+    assert latin_line_wrap.feed("status 200.") == " status 200."
+
+    whitespace = ChatReplyLayoutNormalizer()
+    assert whitespace.feed("\u00a0\f\v") == ""
+
+
+def test_live_client_stream_request_sends_stream_true_and_extracts_reply_deltas(monkeypatch):
+    monkeypatch.setenv("WANDERER_MODEL_API_KEY", "test-key")
+    monkeypatch.setenv("WANDERER_MODEL_BASE_URL", "https://example.test")
+    client = LiveModelClient()
+    captured = {}
+
+    class Response:
+        headers = {"content-type": "text/event-stream"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def __iter__(self):
+            events = [
+                {"choices": [{"delta": {"content": '{"reply":"第一句。'}}]},
+                {"choices": [{"delta": {"content": '第二句！","emotion":"calm"'}}]},
+                {"choices": [{"delta": {"content": ',"state_delta":{},"next_scene":null,"is_ending":false,"ending_id":null}'}}]},
+            ]
+            for event in events:
+                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n".encode()
+            yield b"data: [DONE]\n\n"
+
+    def capture(request, **kwargs):
+        captured["request"] = request
+        captured["payload"] = json.loads(request.data.decode())
+        return Response()
+
+    monkeypatch.setattr("urllib.request.urlopen", capture)
+    events = list(client.generate_chat_stream(
+        request=ChatModelRequest(character_profile=DEFAULT_CHARACTER_PROFILE, message="你好")
+    ))
+
+    assert captured["payload"]["stream"] is True
+    assert [event["type"] for event in events] == ["text", "text", "done"]
+    assert "".join(event["delta"] for event in events if event["type"] == "text") == "第一句。第二句！"
+    assert events[-1]["response"]["reply"] == "第一句。第二句！"
+
+
+def test_live_client_stream_ignores_nested_reply_keys_and_uses_only_the_top_level_reply(monkeypatch):
+    monkeypatch.setenv("WANDERER_MODEL_API_KEY", "test-key")
+    monkeypatch.setenv("WANDERER_MODEL_BASE_URL", "https://example.test")
+    client = LiveModelClient()
+    content = json.dumps({
+        "meta": {"reply": "错误草稿。"},
+        "reply": "正确回复。",
+        "emotion": "calm",
+        "state_delta": {},
+        "next_scene": None,
+        "is_ending": False,
+        "ending_id": None,
+    }, ensure_ascii=False)
+
+    class Response:
+        headers = {"content-type": "text/event-stream"}
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def __iter__(self):
+            yield f"data: {json.dumps({'choices': [{'delta': {'content': content}}]}, ensure_ascii=False)}\n\n".encode()
+            yield b"data: [DONE]\n\n"
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda *args, **kwargs: Response())
+
+    events = list(client.generate_chat_stream(
+        request=ChatModelRequest(character_profile=DEFAULT_CHARACTER_PROFILE, message="你好")
+    ))
+
+    assert "".join(event["delta"] for event in events if event["type"] == "text") == "正确回复。"
+    assert events[-1]["response"]["reply"] == "正确回复。"
+
+
+def test_live_client_stream_rejects_duplicate_top_level_reply_keys(monkeypatch):
+    monkeypatch.setenv("WANDERER_MODEL_API_KEY", "test-key")
+    client = LiveModelClient()
+    content = '{"reply":"第一份。","reply":"第二份。","emotion":"calm","state_delta":{},"next_scene":null,"is_ending":false,"ending_id":null}'
+
+    class Response:
+        headers = {"content-type": "text/event-stream"}
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def __iter__(self):
+            yield f"data: {json.dumps({'choices': [{'delta': {'content': content}}]}, ensure_ascii=False)}\n\n".encode()
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda *args, **kwargs: Response())
+
+    with pytest.raises(ValueError, match="duplicate top-level reply"):
+        list(client.generate_chat_stream(
+            request=ChatModelRequest(character_profile=DEFAULT_CHARACTER_PROFILE, message="你好")
+        ))
+
+
+def test_live_client_stream_never_emits_text_beyond_the_chat_reply_limit(monkeypatch):
+    monkeypatch.setenv("WANDERER_MODEL_API_KEY", "test-key")
+    client = LiveModelClient()
+    content = json.dumps({
+        "reply": "甲" * 1001,
+        "emotion": "calm",
+        "state_delta": {},
+        "next_scene": None,
+        "is_ending": False,
+        "ending_id": None,
+    }, ensure_ascii=False)
+
+    class Response:
+        headers = {"content-type": "text/event-stream"}
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def __iter__(self):
+            yield f"data: {json.dumps({'choices': [{'delta': {'content': content}}]}, ensure_ascii=False)}\n\n".encode()
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda *args, **kwargs: Response())
+    stream = iter(client.generate_chat_stream(
+        request=ChatModelRequest(character_profile=DEFAULT_CHARACTER_PROFILE, message="你好")
+    ))
+    emitted = []
+
+    with pytest.raises(ValueError, match="reply exceeds 1000 characters"):
+        while True:
+            emitted.append(next(stream))
+
+    assert sum(len(event.get("delta", "")) for event in emitted) <= 1000
 
 
 def test_live_client_uses_safe_cloudflare_request_id_for_provider_diagnostics(monkeypatch):
@@ -343,7 +502,8 @@ def test_live_free_chat_prompt_uses_the_players_chosen_name(monkeypatch):
     assert "自称只能使用“我”" in prompt
     assert "称玩家为“你”或「清岚」" in prompt
     assert "第三人称代词只能用于其他角色" in prompt
-    assert "不得以浮浪倾客、流浪者、倾奇者、散兵、国崩、阿帽中的任何一个名号指代自己" in prompt
+    assert "不得以浮浪倾客、流浪者、倾奇者、散兵、国崩、阿帽、斯卡拉姆齐中的任何一个名号指代自己" in prompt
+    assert "不要写“我是散兵”或“我叫阿帽”" in prompt
 
 def test_live_free_chat_prompt_has_no_exclusive_self_naming_rules(monkeypatch):
     monkeypatch.setenv("WANDERER_MODEL_API_KEY", "test-key")

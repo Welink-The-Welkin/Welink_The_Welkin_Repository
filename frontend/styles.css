@@ -135,6 +135,8 @@ h1,h2,h3,p { margin-top:0; }
 .chat-message.user { align-self:flex-end; border-left:0; border-right:2px solid var(--gold); background:#24312d; text-align:right; }
 .chat-message.pending { min-height:82px; color:#a8b8af; }
 .chat-message.pending p { color:#a8b8af; }
+.chat-message.paused { min-height:82px; color:#c8b58a; }
+.chat-message.paused p { color:#c8b58a; }
 .chat-message.reveal { animation:chat-reply-reveal .7s ease-out both; }
 @keyframes chat-reply-reveal { from { opacity:0; transform:translateY(7px); } to { opacity:1; transform:translateY(0); } }
 .chat-speaker { color:var(--gold); font-size:11px; }

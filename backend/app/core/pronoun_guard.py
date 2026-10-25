@@ -14,7 +14,7 @@ from typing import Literal
 logger = logging.getLogger(__name__)
 
 # 本角色全部名号变体（自称禁用清单，与权威文档「自称约定」章节保持同步）
-CHARACTER_SELF_NAMES: tuple[str, ...] = ("浮浪倾客", "流浪者", "倾奇者", "散兵", "国崩", "阿帽")
+CHARACTER_SELF_NAMES: tuple[str, ...] = ("浮浪倾客", "流浪者", "倾奇者", "散兵", "国崩", "阿帽", "斯卡拉姆齐")
 
 # 已知他人名（出现时代词按他人指称处理，不判为自称）
 KNOWN_OTHER_NAMES: tuple[str, ...] = ("杜林", "纳西妲", "雷电影", "博士", "丹羽")
@@ -41,9 +41,11 @@ _NAMING_PREFIX_RE = re.compile(
     rf"(?:叫我|称我为|称作|叫作|名叫|名为|名字是|自称)\s*{_NAME_PATTERN}"
 )
 
-# 保护模式一（自我介绍）：我是/就是/我叫 + 名号，名号后须为句读或结尾
+# 违规模式（自我介绍）：直接把代号接在第一人称后面。代号只能作为历史称呼的对象，
+# 不能写成“我是散兵”“我叫阿帽”来称呼当前的自己。
 _SELF_INTRO_RE = re.compile(
-    rf"(?:我是|就是|我叫){_NAME_PATTERN}(?=$|[，。！？；、…\s])"
+    rf"(?:我(?:曾经|过去|当年)?是|就是|我叫|我的(?:名字|称呼)是)\s*"
+    rf"{_NAME_PATTERN}(?=$|[，。！？；、…\s])"
 )
 
 # 保护模式一（名称讨论）：名号 +（这(个)?|的）?名称类词，或名号 + 是(一个)?名称类词
@@ -67,6 +69,24 @@ _OTHER_ATTRIBUTE_RE = re.compile(
     rf"[^。！？\n]{{0,10}}?(?:认定|认为|说|觉得|叫|称|称呼|喊)[^。！？\n]{{0,8}}{_NAME_PATTERN}"
 )
 
+# 历史称呼语境：保留代号作为被讨论的名称，而不是把它误改成“我”。
+_HISTORICAL_NAME_RE = re.compile(
+    rf"{_NAME_PATTERN}(?=\s*(?:是|曾是|曾经是|原是)\s*我"
+    rf"(?:过去|曾经|当年|以前)?[^。！？\n]{{0,40}}"
+    rf"(?:使用|用过|用作|换取|得到|获得|被称为|的称呼|的名字|的名号|的称号))"
+)
+_HISTORICAL_OBJECT_RE = re.compile(
+    rf"我(?:过去|曾经|当年|以前)?(?:在[^。！？\n]{{0,24}})?"
+    rf"(?:用过|使用过)\s*{_NAME_PATTERN}"
+)
+_HISTORICAL_SELF_NAME_RE = re.compile(
+    rf"我(?:过去|曾经|当年|以前)?(?:叫|名叫|被称为|被叫作|被称作)\s*{_NAME_PATTERN}"
+    rf"|我(?:过去|曾经|当年|以前)?的(?:名字|称呼|名号|称号)是\s*{_NAME_PATTERN}"
+)
+_MALFORMED_HISTORICAL_SELF_RE = re.compile(
+    r"我是我(?=(?:过去|曾经|当年|以前)[^。！？\n]{0,50}(?:称呼|名字|名号|称号))"
+)
+
 # 语义崩坏模式：修复后禁止出现的文本
 _COLLAPSE_RE = re.compile(r"[他她它祂]是我|我这个名头|我这个名字|我这个称呼|我这个名号|我这个称号")
 
@@ -80,12 +100,13 @@ _OTHERS_RE = re.compile("|".join(re.escape(name) for name in KNOWN_OTHER_NAMES))
 _GOSSIP_ANCHOR_RE = re.compile(r"别人口中|旁人眼|人人都说|据说|别人叫|别人称|旁人叫|旁人称|众人说|人们说")
 
 _PROTECT_PATTERNS = (
-    _SELF_INTRO_RE,
     _NAMING_PREFIX_RE,
     _NAMING_TOPIC_RE,
     _GOSSIP_RE,
     _PEOPLE_CALL_RE,
     _OTHER_ATTRIBUTE_RE,
+    _HISTORICAL_NAME_RE,
+    _HISTORICAL_OBJECT_RE,
 )
 
 
@@ -148,11 +169,16 @@ def _has_residual(reply: str) -> bool:
 def _guard_reply(reply: str) -> GuardResult:
     if not reply:
         return GuardResult(reply, "clean")
+    historical_repaired = _MALFORMED_HISTORICAL_SELF_RE.sub("那是我", reply)
+    was_repaired = historical_repaired != reply
+    reply = historical_repaired
+    if _SELF_INTRO_RE.search(reply) or _HISTORICAL_SELF_NAME_RE.search(reply):
+        return GuardResult(reply, "unrepairable")
     spans = _protected_spans(reply)
     fixable = [match for match in _NAME_RE.finditer(reply) if not _covered(match.span(), spans)]
     pronoun_self = _has_self_narration(reply)
     if not fixable and not pronoun_self:
-        return GuardResult(reply, "clean")
+        return GuardResult(reply, "repaired" if was_repaired else "clean")
     if pronoun_self:
         # 模糊代词自称不做破坏性改写，交由调用方重试或兜底
         return GuardResult(reply, "unrepairable")
@@ -216,8 +242,8 @@ ELEMENT_SELF_REFERENCE_TERMS: tuple[str, ...] = ("风元素", "风属性")
 
 # 场景化兜底：直陈式自我介绍，零元素表述、零病态模式，名号仅处合法命名陈述
 INTRO_FALLBACK_REPLIES: tuple[str, ...] = (
-    "我叫阿帽，在须弥教令院因论派学习，也算纳西妲的合作者。别把我归进任何国家或组织。想知道什么就直问。",
-    "我叫阿帽，如今留在须弥，替纳西妲处理些麻烦。不属于任何国家或组织。想问什么，直说。",
+    "我目前在须弥教令院因论派学习，也算纳西妲的合作者。别把我归进任何国家或组织。想知道什么就直问。",
+    "我如今留在须弥，替纳西妲处理些麻烦。不属于任何国家或组织。想问什么，直说。",
 )
 
 _ELEMENT_TERM_RE = re.compile("|".join(re.escape(term) for term in ELEMENT_SELF_REFERENCE_TERMS))
@@ -308,20 +334,20 @@ def _remove_element_mentions(reply: str) -> str | None:
 def guard_chat_reply(message: str, reply: str) -> GuardResult:
     """场景感知守门唯一入口（自我介绍场景）。
 
-    第一层复用 guard_reply 名号守门（零削弱，unrepairable 直接透传）；
+    第一层复用 guard_reply 名号守门（非自我介绍场景下 unrepairable 直接透传；自我介绍场景允许继续做安全的病态句清理）；
     第二层意图门控 is_self_introduction(message)——判定组件异常按未命中保守处理；
     第三层（命中意图时）病态自称句与元素表述双检测，按「先病态、后元素」迭代
     安全剔除，全部通过才返回 repaired，任一步不可安全剔除返回 unrepairable
     （text 为原文，宁缺毋错）。非自我介绍消息下行为与 guard_reply(reply) 完全一致。
     幂等：guard_chat_reply(m, guard_chat_reply(m, r).text).text == guard_chat_reply(m, r).text。
     """
-    base = _guard_reply(reply)
-    if base.status == "unrepairable":
-        return base
     try:
         triggered = is_self_introduction(message)
     except Exception:
         logger.exception("self-introduction intent check failed; scene guard disabled for this turn")
+        return _guard_reply(reply)
+    base = _guard_reply(reply)
+    if base.status == "unrepairable" and not triggered:
         return base
     if not triggered:
         return base

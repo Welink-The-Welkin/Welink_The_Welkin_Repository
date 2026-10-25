@@ -7,6 +7,9 @@ $ErrorActionPreference = "Stop"
 $projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $projectRoot
 
+$voiceLauncher = $null
+$voiceSessionFile = Join-Path $env:TEMP ("wanderer-game-voice-" + [guid]::NewGuid().ToString("N") + ".json")
+
 $gamePort = $null
 foreach ($candidatePort in (8000..8010)) {
     $candidateUrl = "http://127.0.0.1:$candidatePort"
@@ -65,6 +68,15 @@ if ($LASTEXITCODE -ne 0) {
     if ($LASTEXITCODE -ne 0) { throw "依赖安装失败；请检查 Python 和网络后重试。" }
 }
 
+# Voice is optional. The launcher reads WANDERER_TTS_* from the project .env,
+# starts the user's local GPT-SoVITS API on 127.0.0.1:9880, and exits quietly
+# when voice is disabled. The launcher auto-selects a usable CUDA runtime and
+# falls back to CPU when CUDA is unavailable. Model loading may take a few minutes.
+$voiceLauncher = Start-Process -FilePath $pythonPath -ArgumentList @(
+    "scripts\start_gpt_sovits.py", "--state-file", $voiceSessionFile
+) -WorkingDirectory $projectRoot -PassThru -WindowStyle Hidden
+Write-Host "GPT-SoVITS 语音服务正在后台准备（若已关闭语音则会自动跳过）。"
+
 $server = Start-Process -FilePath $pythonPath -ArgumentList @(
     "-m", "uvicorn", "backend.app.main:app", "--host", "127.0.0.1", "--port", "$gamePort"
 ) -WorkingDirectory $projectRoot -PassThru -NoNewWindow
@@ -90,7 +102,19 @@ try {
     }
     Wait-Process -Id $server.Id
 } finally {
-    if (-not $server.HasExited) {
+    if ($null -ne $server) {
+        $server.Refresh()
+    }
+    if ($null -ne $server -and -not $server.HasExited) {
         Stop-Process -Id $server.Id -Force
+    }
+    if (Test-Path $pythonPath) {
+        & $pythonPath "scripts\start_gpt_sovits.py" --stop --state-file $voiceSessionFile 2>$null
+    }
+    if ($null -ne $voiceLauncher) {
+        $voiceLauncher.Refresh()
+        if (-not $voiceLauncher.HasExited) {
+            Stop-Process -Id $voiceLauncher.Id -Force
+        }
     }
 }
