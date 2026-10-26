@@ -36,6 +36,15 @@ def delete_chat(chat_session_id: UUID, request: Request):
     return {"data": {"deleted": True}, "request_id": request.state.request_id}
 
 
+@router.post("/chat/sessions/{chat_session_id}/cancel")
+def cancel_chat_message(chat_session_id: UUID, request: Request):
+    stream_id = request.headers.get("x-chat-stream-id", "").strip()
+    if not stream_id or len(stream_id) > 128:
+        raise AppError("INVALID_REQUEST", "无法识别需要暂停的对话", 400)
+    cancelled = _service(request).cancel_chat_stream(stream_id, chat_id=chat_session_id)
+    return {"data": {"cancelled": cancelled}, "request_id": request.state.request_id}
+
+
 @router.post("/chat/sessions/{chat_session_id}/messages")
 async def send_chat_message(chat_session_id: UUID, request: Request):
     try:

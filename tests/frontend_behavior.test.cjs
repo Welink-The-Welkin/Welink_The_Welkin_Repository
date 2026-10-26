@@ -35,7 +35,7 @@ function storySession({ id = "story-1", finished = false, history = [] } = {}) {
   };
 }
 
-function makeBrowser({ hash = "#home", storage = {}, providerError = false, deferRegenerate = false, regenerateError = false, deleteChatError = false, deferDeleteChat = false, deferChat = false, deferStoryTurn = false, deferVoice = false, deferVoiceAfter = 0, deferVoiceStatus = false, deferAudioReady = false, deferAudioStart = false, deferAudioEnd = false, deferStreamReads = false, suppressAudioPlaying = false, audioRequiresGesture = false, voiceEnabled = false, voiceReadyAfter = 0, voiceError = false, streamChat = false, chatStreamChunks = ["第一句。", "第二句！"], chatReply = "我听见了。" } = {}) {
+function makeBrowser({ hash = "#home", storage = {}, providerError = false, deferRegenerate = false, regenerateError = false, deleteChatError = false, deferDeleteChat = false, deferChat = false, deferChatDespiteAbort = false, deferChatCancel = false, chatCancelFailures = 0, chatCancelCommitted = false, chatHistory = [], deferStoryTurn = false, deferVoice = false, deferVoiceAfter = 0, deferVoiceStatus = false, deferAudioReady = false, deferAudioStart = false, deferAudioEnd = false, deferStreamReads = false, suppressAudioPlaying = false, audioRequiresGesture = false, voiceEnabled = false, voiceReadyAfter = 0, voiceError = false, streamChat = false, chatStreamChunks = ["第一句。", "第二句！"], chatReply = "我听见了。" } = {}) {
   const listeners = {};
   const calls = [];
   const events = [];
@@ -47,6 +47,9 @@ function makeBrowser({ hash = "#home", storage = {}, providerError = false, defe
   let errorMarkup = "";
   let resolveRegenerate;
   let resolveChat;
+  let resolveChatCancel;
+  let chatPostRequestCount = 0;
+  let chatCancelRequestCount = 0;
   let resolveDeleteChat;
   let resolveStoryTurn;
   let resolveVoice;
@@ -58,6 +61,7 @@ function makeBrowser({ hash = "#home", storage = {}, providerError = false, defe
   let voiceSynthesisCalls = 0;
   let voiceStatusChecks = 0;
   let streamReaderCancelled = false;
+  let serverChatMessages = chatHistory.map((message) => ({ ...message }));
   const timers = [];
   let nextTimerId = 0;
   const root = {
@@ -130,6 +134,16 @@ function makeBrowser({ hash = "#home", storage = {}, providerError = false, defe
   ];
   const streamBytes = new TextEncoder().encode(streamEvents.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""));
   const streamFrames = streamEvents.map((event) => new TextEncoder().encode(`data: ${JSON.stringify(event)}\n\n`));
+  const completedChatResult = (options) => {
+    const message = JSON.parse(options.body).message;
+    serverChatMessages = [...serverChatMessages, { message, reply: chatReply, emotion: "calm" }];
+    return {
+      data: {
+        response: { reply: chatReply, title: "围绕问题展开的对话", emotion: "calm", state_delta: {}, next_scene: null, is_ending: false, ending_id: null },
+        messages: serverChatMessages,
+      },
+    };
+  };
   const fetch = async (url, options = {}) => {
     calls.push({ url, options });
     if (url === "/api/voice/stream" && options.method === "POST") events.push({ type: "voice-request" });
@@ -191,6 +205,27 @@ function makeBrowser({ hash = "#home", storage = {}, providerError = false, defe
     if (url === "/api/chat/sessions" && options.method === "POST") {
       return { ok: true, json: async () => ({ data: { chat_session_id: "chat-1", player_name: "清岚", mode: "live", messages: [] } }) };
     }
+    if (url === "/api/chat/sessions/chat-1/cancel" && options.method === "POST") {
+      chatCancelRequestCount += 1;
+      if (deferChatCancel) {
+        return await new Promise((resolve) => {
+          resolveChatCancel = () => resolve({ ok: true, json: async () => ({ data: { cancelled: true } }) });
+        });
+      }
+      if (chatCancelRequestCount <= chatCancelFailures) {
+        return { ok: false, json: async () => ({ error: { message: "暂停确认失败，请重试。" } }) };
+      }
+      if (chatCancelCommitted) {
+        const priorPost = calls.find((call) => call.url === "/api/chat/sessions/chat-1/messages" && call.options.method === "POST");
+        const message = priorPost ? JSON.parse(priorPost.options.body).message : "已提交的问题";
+        serverChatMessages = [...serverChatMessages, { message, reply: "服务端已提交的旧回答。", emotion: "calm" }];
+        return { ok: true, json: async () => ({ data: { cancelled: false } }) };
+      }
+      return { ok: true, json: async () => ({ data: { cancelled: true } }) };
+    }
+    if (url === "/api/chat/sessions/chat-1" && options.method !== "DELETE") {
+      return { ok: true, json: async () => ({ data: { chat_session_id: "chat-1", player_name: "清岚", title: "恢复的对话", messages: serverChatMessages } }) };
+    }
     if (url === "/api/chat/sessions/chat-1/regenerate" && options.method === "POST") {
       if (deferRegenerate) {
         await new Promise((resolve) => { resolveRegenerate = resolve; });
@@ -226,6 +261,7 @@ function makeBrowser({ hash = "#home", storage = {}, providerError = false, defe
       };
     }
     if (url === "/api/chat/sessions/chat-1/messages" && options.method === "POST") {
+      const requestNumber = chatPostRequestCount++;
       if (streamChat) {
         let delivered = false;
         return {
@@ -252,24 +288,21 @@ function makeBrowser({ hash = "#home", storage = {}, providerError = false, defe
           },
         };
       }
-      if (deferChat) {
+      if (deferChat && requestNumber === 0) {
         return await new Promise((resolve, reject) => {
           resolveChat = resolve;
-          options.signal?.addEventListener("abort", () => {
-            const error = new Error("aborted");
-            error.name = "AbortError";
-            reject(error);
-          });
+          if (!deferChatDespiteAbort) {
+            options.signal?.addEventListener("abort", () => {
+              const error = new Error("aborted");
+              error.name = "AbortError";
+              reject(error);
+            });
+          }
         });
       }
       return {
         ok: true,
-        json: async () => ({
-          data: {
-            response: { reply: chatReply, title: "围绕问题展开的对话", emotion: "calm", state_delta: {}, next_scene: null, is_ending: false, ending_id: null },
-            messages: [{ message: "你好", reply: chatReply, emotion: "calm" }],
-          },
-        }),
+        json: async () => completedChatResult(options),
       };
     }
     if (url === "/api/chat/sessions/chat-1" && options.method === "DELETE") {
@@ -415,6 +448,7 @@ function makeBrowser({ hash = "#home", storage = {}, providerError = false, defe
     get chatInputDisabled() { return chatInputControl.disabled; },
     get currentChatDeleteDisabled() { return deleteChatControl.disabled; },
     get streamReaderCancelled() { return streamReaderCancelled; },
+    get serverChatMessages() { return serverChatMessages.map((message) => ({ ...message })); },
     async runNextTimer() {
       const timer = timers.shift();
       if (timer) timer.callback();
@@ -477,16 +511,19 @@ function makeBrowser({ hash = "#home", storage = {}, providerError = false, defe
     resolveRegenerate() {
       if (resolveRegenerate) resolveRegenerate();
     },
-    resolveChat() {
+    resolveChat({ message = "修订后的问题", reply = chatReply, messages = null } = {}) {
       if (resolveChat) resolveChat({
         ok: true,
         json: async () => ({
           data: {
-            response: { reply: chatReply, title: "围绕问题展开的对话", emotion: "calm", state_delta: {}, next_scene: null, is_ending: false, ending_id: null },
-            messages: [{ message: "你好", reply: chatReply, emotion: "calm" }],
+            response: { reply, title: "围绕问题展开的对话", emotion: "calm", state_delta: {}, next_scene: null, is_ending: false, ending_id: null },
+            messages: messages || [{ message, reply, emotion: "calm" }],
           },
         }),
       });
+    },
+    resolveChatCancel() {
+      if (resolveChatCancel) resolveChatCancel();
     },
     resolveDeleteChat() {
       if (resolveDeleteChat) resolveDeleteChat();
@@ -958,7 +995,7 @@ test("pausing a streamed chat discards buffered later chunks and stops its audio
 
   assert.doesNotMatch(browser.root.innerHTML, /这一句不应出现/);
   assert.equal(browser.audioInstances.every((audio) => audio.paused), true);
-  assert.match(browser.root.innerHTML, /已暂停思考/);
+  assert.match(browser.root.innerHTML, /话戛然而止，略表腻烦的眼神随清风飘来/);
 });
 
 test("pausing before voice readiness discards the cached text without ever rendering it", async () => {
@@ -983,7 +1020,7 @@ test("pausing before voice readiness discards the cached text without ever rende
 
   assert.equal(browser.events.some((event) => event.type === "render" && event.html.includes("取消后绝不能闪现。")), false);
   assert.doesNotMatch(browser.root.innerHTML, /取消后绝不能闪现/);
-  assert.match(browser.root.innerHTML, /已暂停思考/);
+  assert.match(browser.root.innerHTML, /话戛然而止，略表腻烦的眼神随清风飘来/);
 });
 
 test("pausing while streamed audio play is pending settles without releasing cached text", async () => {
@@ -1005,7 +1042,7 @@ test("pausing while streamed audio play is pending settles without releasing cac
   await browser.click("pause-chat");
   await settle();
 
-  assert.match(browser.root.innerHTML, /已暂停思考/);
+  assert.match(browser.root.innerHTML, /话戛然而止，略表腻烦的眼神随清风飘来/);
   assert.doesNotMatch(browser.root.innerHTML, /播放尚未开始时暂停/);
   assert.equal(browser.events.some((event) => event.type === "audio-playing"), false);
 });
@@ -1031,7 +1068,7 @@ test("a resolved play promise without a playing event never releases cached text
 
   await browser.click("pause-chat");
   await settle();
-  assert.match(browser.root.innerHTML, /已暂停思考/);
+  assert.match(browser.root.innerHTML, /话戛然而止，略表腻烦的眼神随清风飘来/);
 });
 
 test("deleting before voice readiness discards cached text and never starts its audio", async () => {
@@ -1081,7 +1118,7 @@ test("a failed deletion leaves the cancelled streamed turn in a usable paused st
   await settle();
 
   assert.match(browser.errorMarkup, /删除失败/);
-  assert.match(browser.root.innerHTML, /已暂停思考/);
+  assert.match(browser.root.innerHTML, /话戛然而止，略表腻烦的眼神随清风飘来/);
   assert.doesNotMatch(browser.root.innerHTML, /data-action="pause-chat"/);
   assert.doesNotMatch(browser.root.innerHTML, /缓存中的第二句不能闪现/);
   assert.match(browser.root.innerHTML, /value="删除等待期间输入的新草稿"/);
@@ -1098,12 +1135,154 @@ test("free chat replaces send with pause and preserves the message when paused",
 
   await browser.click("pause-chat");
 
-  assert.match(browser.root.innerHTML, /「浮浪倾客」已暂停思考。/);
+  assert.match(browser.root.innerHTML, /「浮浪倾客」的话戛然而止，略表腻烦的眼神随清风飘来，示意你接上这场被打断的对话。/);
   assert.doesNotMatch(browser.root.innerHTML, /正在思考……/);
   assert.doesNotMatch(browser.root.innerHTML, /data-action="pause-chat"/);
   assert.match(browser.root.innerHTML, /value="你好"/);
   const call = browser.calls.find((item) => item.url === "/api/chat/sessions/chat-1/messages");
   assert.equal(call.options.signal.aborted, true);
+});
+
+test("pausing a restored chat gates an edited resend and ignores the abandoned late reply", async () => {
+  const previousMessage = { message: "已保存的问题", reply: "已保存的回答。", emotion: "calm" };
+  const browser = makeBrowser({
+    hash: "#/chat",
+    storage: { "wanderer-player-name": "清岚", "wanderer-chat-session": "chat-1" },
+    chatHistory: [previousMessage],
+    deferChat: true,
+    deferChatDespiteAbort: true,
+    deferChatCancel: true,
+    chatReply: "改写问题的新回复。",
+  });
+  await settle();
+  assert.match(browser.root.innerHTML, /已保存的问题/);
+  assert.match(browser.root.innerHTML, /已保存的回答/);
+
+  browser.submitChatPending("暂停前的问题");
+  await settle();
+  const firstPost = browser.calls.find((call) => call.url === "/api/chat/sessions/chat-1/messages");
+  assert.ok(firstPost);
+  const firstStreamId = firstPost.options.headers["X-Chat-Stream-ID"];
+
+  await browser.click("pause-chat");
+  assert.equal(firstPost.options.signal.aborted, true);
+  const cancelCall = browser.calls.find((call) => call.url === "/api/chat/sessions/chat-1/cancel");
+  assert.ok(cancelCall, "pause sends a server cancellation request");
+  assert.equal(cancelCall.options.method, "POST");
+  assert.equal(cancelCall.options.keepalive, true);
+  assert.equal(cancelCall.options.headers["X-Chat-Stream-ID"], firstStreamId);
+
+  browser.inputChat("改写后的问题");
+  browser.submitChatPending("改写后的问题");
+  await settle();
+  assert.equal(browser.calls.filter((call) => call.url === "/api/chat/sessions/chat-1/messages").length, 1,
+    "the edited turn waits for the cancellation acknowledgement");
+
+  browser.resolveChatCancel();
+  await settle();
+  const posts = browser.calls.filter((call) => call.url === "/api/chat/sessions/chat-1/messages");
+  assert.equal(posts.length, 2);
+  const nextStreamId = posts[1].options.headers["X-Chat-Stream-ID"];
+  assert.notEqual(nextStreamId, firstStreamId);
+  assert.equal(JSON.parse(posts[1].options.body).message, "改写后的问题");
+
+  browser.resolveChat({
+    message: "暂停前的问题",
+    reply: "迟到的废弃回答。",
+    messages: [previousMessage, { message: "暂停前的问题", reply: "迟到的废弃回答。", emotion: "calm" }],
+  });
+  await settle();
+
+  assert.match(browser.root.innerHTML, /改写问题的新回复/);
+  assert.doesNotMatch(browser.root.innerHTML, /迟到的废弃回答|暂停前的问题/);
+  assert.match(browser.root.innerHTML, /已保存的问题/);
+  assert.match(browser.root.innerHTML, /改写后的问题/);
+  assert.deepEqual(browser.serverChatMessages.map((message) => message.message), ["已保存的问题", "改写后的问题"]);
+});
+
+test("paused chat uses the exact interrupted-dialogue copy", async () => {
+  const browser = makeBrowser({ hash: "#/chat", storage: { "wanderer-player-name": "清岚" }, deferChat: true });
+  await browser.click("start-chat");
+  browser.submitChatPending("你好");
+  await settle();
+
+  await browser.click("pause-chat");
+
+  assert.match(browser.root.innerHTML, /「浮浪倾客」的话戛然而止，略表腻烦的眼神随清风飘来，示意你接上这场被打断的对话。/);
+  assert.doesNotMatch(browser.root.innerHTML, /「浮浪倾客」已暂停思考。/);
+});
+
+test("a failed server cancellation remains gated and retries before sending the edited turn", async () => {
+  const browser = makeBrowser({
+    hash: "#/chat",
+    storage: { "wanderer-player-name": "清岚" },
+    deferChat: true,
+    chatCancelFailures: 1,
+  });
+  await browser.click("start-chat");
+  browser.submitChatPending("原问题");
+  await settle();
+
+  await browser.click("pause-chat");
+  await settle();
+  assert.match(browser.errorMarkup, /暂停确认失败，请重试/);
+
+  browser.submitChatPending("改写问题");
+  await settle();
+
+  assert.equal(browser.calls.filter((call) => call.url === "/api/chat/sessions/chat-1/cancel").length, 2,
+    "a later submit retries server cancellation instead of bypassing an unconfirmed pause");
+  const posts = browser.calls.filter((call) => call.url === "/api/chat/sessions/chat-1/messages");
+  assert.equal(posts.length, 2);
+  assert.equal(JSON.parse(posts[1].options.body).message, "改写问题");
+});
+
+test("independent tabs assign distinct stream IDs for the same chat session and request number", async () => {
+  const makeTab = () => makeBrowser({
+    hash: "#/chat",
+    storage: { "wanderer-player-name": "清岚", "wanderer-chat-session": "chat-1" },
+    deferChat: true,
+    deferChatDespiteAbort: true,
+  });
+  const first = makeTab();
+  const second = makeTab();
+  await Promise.all([settle(), settle()]);
+  first.submitChatPending("第一标签页");
+  second.submitChatPending("第二标签页");
+  await Promise.all([settle(), settle()]);
+
+  const firstStreamId = first.calls.find((call) => call.url === "/api/chat/sessions/chat-1/messages").options.headers["X-Chat-Stream-ID"];
+  const secondStreamId = second.calls.find((call) => call.url === "/api/chat/sessions/chat-1/messages").options.headers["X-Chat-Stream-ID"];
+  assert.match(firstStreamId, /^chat-1-\d+$/);
+  assert.match(secondStreamId, /^chat-1-\d+$/);
+  assert.notEqual(firstStreamId, secondStreamId);
+});
+
+test("pause reconciles a turn that the server already committed before cancellation", async () => {
+  const browser = makeBrowser({
+    hash: "#/chat",
+    storage: { "wanderer-player-name": "清岚" },
+    voiceEnabled: true,
+    streamChat: true,
+    deferStreamReads: true,
+    deferAudioEnd: true,
+    chatCancelCommitted: true,
+    chatStreamChunks: ["服务端已完成提交的回答。"],
+  });
+  await browser.click("start-chat");
+  browser.submitChatPending("已提交的问题");
+  await settle();
+  browser.releaseNextStreamEvent();
+  await settle();
+  assert.match(browser.root.innerHTML, /data-action="pause-chat"/);
+
+  await browser.click("pause-chat");
+  await settle();
+
+  assert.match(browser.root.innerHTML, /已提交的问题/);
+  assert.match(browser.root.innerHTML, /服务端已提交的旧回答/);
+  assert.doesNotMatch(browser.root.innerHTML, /话戛然而止，略表腻烦的眼神/);
+  assert.doesNotMatch(browser.errorMarkup, /暂停确认失败/);
 });
 
 test("free chat keeps the input enabled and preserves a draft typed while the reply is pending", async () => {

@@ -1,5 +1,6 @@
 # 本文件由 codex 辅助生成（外围模块）
 import json
+import threading
 from uuid import UUID
 
 import pytest
@@ -164,6 +165,115 @@ def test_free_chat_stream_flattens_paragraph_breaks_before_emitting_and_persisti
     assert restored["messages"][-1]["reply"] == "第一段。第二段。"
 
 
+def test_free_chat_removes_external_citations_before_returning_or_persisting(tmp_path):
+    app = create_app(database_path_override=tmp_path / "chat-citation-cleanup.db", demo_mode_override="live")
+    client = TestClient(app)
+    created = client.post("/api/chat/sessions", json={"mode": "live"})
+    chat_id = created.json()["data"]["chat_session_id"]
+    raw_reply = (
+        "你说的是「人偶」的相会那次。([bilibili.com]"
+        "(https://www.bilibili.com/video/BV1GrNz6jEfB/?utm_source=openai))"
+        "我不把那场茶会看作什么和解的仪式。"
+    )
+    expected_reply = "你说的是「人偶」的相会那次。我不把那场茶会看作什么和解的仪式。"
+    app.state.session_service.chat_model_client.generate_chat = lambda **kwargs: {
+        "reply": raw_reply,
+        "title": "关于茶会的外部链接 https://example.com",
+        "emotion": "calm",
+        "state_delta": {},
+        "next_scene": None,
+        "is_ending": False,
+        "ending_id": None,
+    }
+
+    response = client.post(f"/api/chat/sessions/{chat_id}/messages", json={"message": "你如何看待那场茶会？"})
+
+    assert response.status_code == 200
+    data = response.json()["data"]
+    assert data["response"]["reply"] == expected_reply
+    assert data["response"]["title"] == "关于茶会的外部链接"
+    assert "bilibili" not in response.text.lower()
+    assert "https://" not in response.text.lower()
+    restored = client.get(f"/api/chat/sessions/{chat_id}").json()["data"]
+    assert restored["messages"][-1]["reply"] == expected_reply
+
+
+def test_free_chat_buffers_stream_until_the_complete_reply_is_safe(tmp_path):
+    app = create_app(database_path_override=tmp_path / "stream-chat-citation-cleanup.db", demo_mode_override="live")
+    client = TestClient(app)
+    created = client.post("/api/chat/sessions", json={"mode": "live"})
+    chat_id = created.json()["data"]["chat_session_id"]
+    raw_reply = "回答开头。([bilibili.com](https://www.bilibili.com/video/BV1GrNz6jEfB/?utm_source=openai))回答结尾。"
+    expected_reply = "回答开头。回答结尾。"
+    response_payload = {
+        "reply": raw_reply,
+        "title": "流式来源泄漏",
+        "emotion": "calm",
+        "state_delta": {},
+        "next_scene": None,
+        "is_ending": False,
+        "ending_id": None,
+    }
+    upstream_steps = []
+
+    def generate_stream(**kwargs):
+        def events():
+            upstream_steps.append("text")
+            yield {"type": "text", "delta": "回答开头。([bilibili.com](https://www.bilibili.com/"}
+            upstream_steps.append("done")
+            yield {"type": "done", "response": response_payload}
+
+        return ChatReplyEventStream(events())
+
+    app.state.session_service.chat_model_client.generate_chat_stream = generate_stream
+    stream = iter(app.state.session_service.stream_chat_message(UUID(chat_id), "回答？"))
+
+    first_event = next(stream)
+
+    assert upstream_steps == ["text", "done"]
+    events = [first_event, *stream]
+    assert "bilibili" not in json.dumps(events, ensure_ascii=False).lower()
+    assert "https://" not in json.dumps(events, ensure_ascii=False).lower()
+    assert "utm_source" not in json.dumps(events, ensure_ascii=False).lower()
+    assert "".join(event["delta"] for event in events if event["type"] == "text") == expected_reply
+    assert events[-1]["response"]["reply"] == expected_reply
+    stored = app.state.session_service.repository.get_chat_details(UUID(chat_id))[1]
+    assert stored[-1]["reply"] == expected_reply
+
+
+@pytest.mark.parametrize(
+    "reply_with_trace",
+    [
+        "据检索结果显示，这件事早有定论。",
+        "我的训练数据里没有后续消息。",
+        "这段资料的编号是 BV1GrNz6jEfB。",
+    ],
+)
+def test_free_chat_rejects_external_source_and_internal_data_traces(tmp_path, reply_with_trace):
+    app = create_app(database_path_override=tmp_path / "chat-source-trace.db", demo_mode_override="live")
+    client = TestClient(app)
+    created = client.post("/api/chat/sessions", json={"mode": "live"})
+    chat_id = created.json()["data"]["chat_session_id"]
+    app.state.session_service.chat_model_client.generate_chat = lambda **kwargs: {
+        "reply": reply_with_trace,
+        "title": "回答",
+        "emotion": "calm",
+        "state_delta": {},
+        "next_scene": None,
+        "is_ending": False,
+        "ending_id": None,
+    }
+
+    response = client.post(f"/api/chat/sessions/{chat_id}/messages", json={"message": "说说这件事"})
+
+    assert response.status_code == 200
+    reply = response.json()["data"]["response"]["reply"]
+    assert reply in FALLBACK_REPLIES
+    assert "检索" not in response.text
+    assert "训练数据" not in response.text
+    assert "BV1GrNz6jEfB" not in response.text
+
+
 def test_free_chat_stream_preserves_an_intentional_space_across_provider_deltas(tmp_path):
     app = create_app(database_path_override=tmp_path / "stream-chat-delta-space.db", demo_mode_override="live")
     client = TestClient(app)
@@ -251,6 +361,34 @@ def test_free_chat_read_flattens_paragraph_breaks_from_existing_sessions(tmp_pat
     assert stored[0]["reply"] == "旧记录第一段。\n\n旧记录第二段。"
 
 
+def test_free_chat_read_hides_legacy_external_links_without_rewriting_storage(tmp_path):
+    app = create_app(database_path_override=tmp_path / "existing-chat-citation.db", demo_mode_override="live")
+    client = TestClient(app)
+    created = client.post("/api/chat/sessions", json={"mode": "live"})
+    chat_id = created.json()["data"]["chat_session_id"]
+    raw_reply = "我不把这件事当作和解。([example.com](https://example.com/source?id=1))"
+    app.state.session_service.repository.save_chat_messages(
+        UUID(chat_id),
+        [{
+            "message": "你怎么看？",
+            "reply": raw_reply,
+            "emotion": "calm",
+            "provider_metadata": {"model_name": "example-model", "source_url": "https://example.com/source"},
+        }],
+        "旧时的对话 https://example.com/source",
+    )
+
+    restored = client.get(f"/api/chat/sessions/{chat_id}")
+
+    assert restored.status_code == 200
+    assert restored.json()["data"]["messages"][-1]["reply"] == "我不把这件事当作和解。"
+    assert "example.com" not in restored.text
+    assert "provider_metadata" not in restored.text
+    assert "example-model" not in restored.text
+    assert restored.json()["data"]["title"] == "旧时的对话"
+    assert app.state.session_service.repository.get_chat_details(UUID(chat_id))[1][-1]["reply"] == raw_reply
+
+
 def test_free_chat_title_repair_does_not_rewrite_existing_reply_layout(tmp_path):
     app = create_app(database_path_override=tmp_path / "existing-chat-title-repair.db", demo_mode_override="live")
     client = TestClient(app)
@@ -327,6 +465,126 @@ def test_free_chat_stream_does_not_persist_when_client_stops_before_done(tmp_pat
     events.close()
     assert app.state.session_service.repository.get_chat_details(UUID(chat_id))[1] == []
     assert cancelled == [True]
+
+
+def test_cancelled_provider_stream_closes_upstream_before_fallback_or_persistence(tmp_path):
+    app = create_app(database_path_override=tmp_path / "cancelled-provider-stream.db", demo_mode_override="live")
+    client = TestClient(app)
+    chat_id = client.post("/api/chat/sessions", json={"mode": "live"}).json()["data"]["chat_session_id"]
+    service = app.state.session_service
+    provider_started = threading.Event()
+    release_provider = threading.Event()
+    stream_finished = threading.Event()
+    provider_cancellations = []
+    fallback_calls = []
+    stream_events = []
+
+    def generate_stream(**_kwargs):
+        def events():
+            yield {"type": "text", "delta": "这句最终不应保存。"}
+            provider_started.set()
+            release_provider.wait(timeout=3)
+            raise ModelProviderError("upstream stream closed")
+
+        return ChatReplyEventStream(
+            events(),
+            cancel=lambda: (provider_cancellations.append(True), release_provider.set()),
+        )
+
+    def generate_fallback(**_kwargs):
+        fallback_calls.append(True)
+        return {
+            "reply": "旧请求仍然执行了回退生成。",
+            "title": "旧请求标题",
+            "emotion": "calm",
+            "state_delta": {},
+            "next_scene": None,
+            "is_ending": False,
+            "ending_id": None,
+        }
+
+    service.chat_model_client.generate_chat_stream = generate_stream
+    service.chat_model_client.generate_chat = generate_fallback
+
+    def consume_stream():
+        try:
+            stream_events.extend(service.stream_chat_message(UUID(chat_id), "先前的问题", stream_id=f"{chat_id}-1"))
+        finally:
+            stream_finished.set()
+
+    worker = threading.Thread(target=consume_stream)
+    worker.start()
+    try:
+        assert provider_started.wait(timeout=2), "provider did not reach its blocking read"
+        assert service.cancel_chat_stream(f"{chat_id}-1", chat_id=UUID(chat_id)) is True
+        assert stream_finished.wait(timeout=1), "cancel did not close the blocked provider stream"
+    finally:
+        release_provider.set()
+        worker.join(timeout=3)
+
+    assert not worker.is_alive()
+    assert provider_cancellations == [True]
+    assert fallback_calls == []
+    assert all(event.get("type") != "done" for event in stream_events)
+    assert service.repository.get_chat_details(UUID(chat_id))[1] == []
+
+
+def test_chat_cancel_route_requires_a_stream_id_and_is_scoped_to_its_chat_session(tmp_path):
+    client = TestClient(create_app(database_path_override=tmp_path / "chat-cancel-route.db", demo_mode_override="live"))
+    first_chat = client.post("/api/chat/sessions", json={"mode": "live"}).json()["data"]["chat_session_id"]
+    second_chat = client.post("/api/chat/sessions", json={"mode": "live"}).json()["data"]["chat_session_id"]
+    service = client.app.state.session_service
+    first_stream = f"{first_chat}-1"
+    second_stream = f"{second_chat}-1"
+    service.stream_chat_message(UUID(first_chat), "first", stream_id=first_stream)
+    service.stream_chat_message(UUID(second_chat), "second", stream_id=second_stream)
+
+    missing_id = client.post(f"/api/chat/sessions/{first_chat}/cancel")
+    wrong_session = client.post(
+        f"/api/chat/sessions/{second_chat}/cancel",
+        headers={"X-Chat-Stream-ID": first_stream},
+    )
+    first_cancel = client.post(
+        f"/api/chat/sessions/{first_chat}/cancel",
+        headers={"X-Chat-Stream-ID": first_stream},
+    )
+    second_cancel = client.post(
+        f"/api/chat/sessions/{second_chat}/cancel",
+        headers={"X-Chat-Stream-ID": second_stream},
+    )
+    unknown_cancel = client.post(
+        f"/api/chat/sessions/{first_chat}/cancel",
+        headers={"X-Chat-Stream-ID": "not-a-chat-turn"},
+    )
+
+    assert missing_id.status_code == 400
+    assert wrong_session.status_code == 200
+    assert wrong_session.json()["data"]["cancelled"] is False
+    assert first_cancel.json()["data"]["cancelled"] is True
+    assert second_cancel.json()["data"]["cancelled"] is True
+    assert unknown_cancel.json()["data"]["cancelled"] is False
+
+
+def test_chat_cancel_received_before_stream_start_prevents_provider_generation(tmp_path):
+    app = create_app(database_path_override=tmp_path / "chat-cancel-before-start.db", demo_mode_override="live")
+    client = TestClient(app)
+    chat_id = client.post("/api/chat/sessions", json={"mode": "live"}).json()["data"]["chat_session_id"]
+    service = app.state.session_service
+    provider_calls = []
+    service.chat_model_client.generate_chat_stream = lambda **_kwargs: provider_calls.append(True)
+    stream_id = f"{chat_id}-2"
+
+    cancelled = client.post(
+        f"/api/chat/sessions/{chat_id}/cancel",
+        headers={"X-Chat-Stream-ID": stream_id},
+    )
+    events = list(service.stream_chat_message(UUID(chat_id), "暂停前的问题", stream_id=stream_id))
+
+    assert cancelled.status_code == 200
+    assert cancelled.json()["data"]["cancelled"] is True
+    assert provider_calls == []
+    assert events == []
+    assert service.repository.get_chat_details(UUID(chat_id))[1] == []
 
 
 

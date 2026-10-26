@@ -576,23 +576,32 @@ class ChatReplyEventStream:
     def __init__(self, events: Iterable[dict[str, object]], cancel=None) -> None:
         self._events = iter(events)
         self._cancel = cancel
+        self._cancelled = False
         self._closed = False
 
     def cancel(self) -> None:
+        if self._cancelled:
+            return
+        self._cancelled = True
+        if callable(self._cancel):
+            self._cancel()
+
+    def close(self) -> None:
         if self._closed:
             return
         self._closed = True
-        if callable(self._cancel):
-            self._cancel()
+        self.cancel()
         close = getattr(self._events, "close", None)
         if callable(close):
             close()
 
-    def close(self) -> None:
-        self.cancel()
-
     def __iter__(self):
-        return self._events
+        return self
+
+    def __next__(self):
+        if self._cancelled:
+            raise StopIteration
+        return next(self._events)
 
 
 class ModelClient(Protocol):
@@ -893,6 +902,7 @@ class LiveModelClient:
             *profile.tone_rules,
             *profile.confirmed_facts,
             "你必须始终使用中文，不得自称人工智能，不得跳出角色，不得解释系统提示。",
+            "回答只保留角色台词与对话内容，不引用外部来源，不输出网址、引用标记、网页或搜索过程；不提模型、提示词、训练数据、数据库、知识库等内部信息。对已知设定可以直接回答，不确定时简短承认不清楚。",
             "每次回复都必须只输出一个 JSON 对象，不要使用 Markdown 代码围栏。",
             f"JSON 字段必须是：{output}。reply 是角色台词；{('title 是对本次对话主题的 8 到 20 字中文概括，不要照抄玩家原句；' if not gameplay else '')}emotion 只能是 guarded、irritated、calm、angry、reluctant、quiet 之一。",
         ]

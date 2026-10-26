@@ -315,9 +315,28 @@ def test_voice_synthesis_proxies_audio_and_reuses_cached_text(tmp_path, monkeypa
         assert _TTSHandler.requests[0]["text"] == "风从身侧掠过。"
         assert _TTSHandler.requests[0]["prompt_lang"] == "zh"
         assert _TTSHandler.requests[0]["ref_audio_path"] == str(reference_audio)
+        assert _TTSHandler.requests[0]["top_k"] == 5
+        assert _TTSHandler.requests[0]["top_p"] == 0.8
+        assert _TTSHandler.requests[0]["temperature"] == 0.7
+        assert _TTSHandler.requests[0]["speed_factor"] == 0.9
+        assert _TTSHandler.requests[0]["seed"] == 1234
+        assert _TTSHandler.requests[0]["parallel_infer"] is False
     finally:
         server.shutdown()
         thread.join(timeout=2)
+
+
+def test_voice_cache_key_changes_when_articulation_settings_change(tmp_path, monkeypatch):
+    from backend.app.voice import _cache_path
+
+    monkeypatch.setenv("WANDERER_TTS_CACHE_DIR", str(tmp_path / "voice-cache"))
+    monkeypatch.setenv("WANDERER_TTS_SPEED_FACTOR", "0.9")
+    first_path = _cache_path("请把这句话说清楚。")
+    monkeypatch.setenv("WANDERER_TTS_SPEED_FACTOR", "0.85")
+
+    second_path = _cache_path("请把这句话说清楚。")
+
+    assert first_path != second_path
 
 
 def test_voice_stream_proxies_fragmented_audio_and_requests_quality_preserving_fragment_mode(tmp_path, monkeypatch):
@@ -338,7 +357,12 @@ def test_voice_stream_proxies_fragmented_audio_and_requests_quality_preserving_f
         assert response.content == WAV_BYTES
         assert len(_TTSHandler.requests) == 1
         assert _TTSHandler.requests[0]["streaming_mode"] == 1
-        assert _TTSHandler.requests[0]["parallel_infer"] is True
+        assert _TTSHandler.requests[0]["parallel_infer"] is False
+        assert _TTSHandler.requests[0]["speed_factor"] == 0.9
+        assert _TTSHandler.requests[0]["top_k"] == 5
+        assert _TTSHandler.requests[0]["top_p"] == 0.8
+        assert _TTSHandler.requests[0]["temperature"] == 0.7
+        assert _TTSHandler.requests[0]["seed"] == 1234
     finally:
         server.shutdown()
         thread.join(timeout=2)

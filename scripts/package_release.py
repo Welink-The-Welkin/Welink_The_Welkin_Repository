@@ -35,6 +35,7 @@ EXCLUDED_DIRS = {
     "data",
     "dist",
     "node_modules",
+    ".idea",
 }
 EXCLUDED_PREFIXES = (
     ".pytest-basetemp",
@@ -48,6 +49,7 @@ EXCLUDED_PREFIXES = (
     "wanderer-integration-",
 )
 EXCLUDED_SUFFIXES = (".pyc", ".pyo", ".db", ".db-shm", ".db-wal", ".log")
+EXCLUDED_NAMES = {".browser-flow.html"}
 
 
 def _is_excluded(relative: Path, output: Path) -> bool:
@@ -57,6 +59,8 @@ def _is_excluded(relative: Path, output: Path) -> bool:
         if part in EXCLUDED_DIRS or part.startswith(EXCLUDED_PREFIXES):
             return True
     name = relative.name
+    if name in EXCLUDED_NAMES:
+        return True
     if name == ".env" or name.startswith(".env."):
         return name != ".env.example"
     return name.endswith(EXCLUDED_SUFFIXES)

@@ -10,8 +10,9 @@ from backend.app.contracts.game import GameState
 from backend.app.errors import AppError
 from backend.app.storage.session_repository import SessionRepository
 from backend.app.core.character_profile import DEFAULT_CHARACTER_PROFILE
-from backend.app.core.model_client import ChatModelRequest, ChatReplyEventStream, ChatReplyLayoutNormalizer, DeterministicModelClient, LiveModelClient, _ReplyTextChunker, normalize_chat_reply_layout, summarize_chat_title
+from backend.app.core.model_client import ChatModelRequest, ChatReplyEventStream, DeterministicModelClient, LiveModelClient, _ReplyTextChunker, normalize_chat_reply_layout, summarize_chat_title
 from backend.app.core.language_guard import guard_language
+from backend.app.core.output_sanitizer import sanitize_character_reply
 from backend.app.core.pronoun_guard import (
     FALLBACK_REPLIES,
     INTRO_FALLBACK_REPLIES,
@@ -40,13 +41,49 @@ class _ChatStreamControl:
     def __init__(self, chat_id: UUID) -> None:
         self.chat_id = chat_id
         self._cancelled = Event()
+        self._lock = Lock()
+        self._stream = None
+        self._committed = False
+        self._started = False
 
     @property
     def cancelled(self) -> bool:
         return self._cancelled.is_set()
 
-    def cancel(self) -> None:
-        self._cancelled.set()
+    def attach_stream(self, stream) -> None:
+        cancel_now = False
+        with self._lock:
+            self._started = True
+            if self._cancelled.is_set():
+                cancel_now = True
+            else:
+                self._stream = stream
+        if cancel_now:
+            stream.cancel()
+
+    def cancel(self) -> bool:
+        with self._lock:
+            if self._committed:
+                return False
+            self._cancelled.set()
+            stream = self._stream
+        if stream is not None:
+            stream.cancel()
+        return True
+
+    def commit(self, action) -> bool:
+        with self._lock:
+            if self._cancelled.is_set():
+                return False
+            action()
+            self._committed = True
+            self._stream = None
+            return True
+
+    @property
+    def pending_before_start(self) -> bool:
+        with self._lock:
+            return not self._started and self._cancelled.is_set()
 
 
 def normalize_chat_pronouns(reply: str) -> str:
@@ -58,7 +95,10 @@ def _clean_history_pairs(items: list[dict]) -> tuple[tuple[str, str], ...]:
     """回传模型前的场景感知历史清洗：不可安全清洗的条目整体剔除，切断脏历史自我强化。"""
     pairs: list[tuple[str, str]] = []
     for item in items:
-        cleaned = sanitize_history_pair(item.get("message", ""), item.get("reply", ""))
+        safe_reply = sanitize_character_reply(item.get("reply", ""))
+        if safe_reply is None:
+            continue
+        cleaned = sanitize_history_pair(item.get("message", ""), safe_reply)
         if cleaned is not None and guard_language(cleaned).status == "clean":
             pairs.append((item.get("message", ""), cleaned))
     return tuple(pairs)
@@ -68,9 +108,12 @@ def _present_chat_messages(items: list[dict]) -> list[dict]:
     """Build single-paragraph view copies without rewriting stored history."""
     return [
         {
-            **item,
+            **{key: item[key] for key in ("message", "emotion") if key in item},
             "reply": normalize_chat_reply_layout(
-                sanitize_visible_pair(item.get("message", ""), item.get("reply", ""))
+                sanitize_visible_pair(
+                    item.get("message", ""),
+                    sanitize_character_reply(item.get("reply", "")) or FALLBACK_REPLIES[2],
+                )
             ),
         }
         for item in items
@@ -93,26 +136,31 @@ def _coerce_chat_response(raw: Mapping[str, object] | ChatResponse) -> ChatRespo
     metadata is deliberately dropped before Pydantic validation.
     """
     if isinstance(raw, ChatResponse):
-        return raw
-    if not isinstance(raw, Mapping):
-        raise TypeError("chat model response must be an object")
+        response = raw
+    else:
+        if not isinstance(raw, Mapping):
+            raise TypeError("chat model response must be an object")
 
-    payload = {key: raw[key] for key in ChatResponse.model_fields if key in raw}
-    payload.setdefault("emotion", Emotion.CALM.value)
-    payload.setdefault("state_delta", {})
-    payload.setdefault("next_scene", None)
-    payload.setdefault("is_ending", False)
-    payload.setdefault("ending_id", None)
-    if payload.get("emotion") not in {item.value for item in Emotion}:
-        payload["emotion"] = Emotion.CALM.value
-    payload["state_delta"] = {}
-    title = payload.get("title")
-    if not isinstance(title, str) or not 1 <= len(title) <= 30:
-        payload["title"] = None
-    payload["next_scene"] = None
-    payload["is_ending"] = False
-    payload["ending_id"] = None
-    return ChatResponse.model_validate(payload)
+        payload = {key: raw[key] for key in ChatResponse.model_fields if key in raw}
+        payload.setdefault("emotion", Emotion.CALM.value)
+        payload.setdefault("state_delta", {})
+        payload.setdefault("next_scene", None)
+        payload.setdefault("is_ending", False)
+        payload.setdefault("ending_id", None)
+        if payload.get("emotion") not in {item.value for item in Emotion}:
+            payload["emotion"] = Emotion.CALM.value
+        payload["state_delta"] = {}
+        title = payload.get("title")
+        if not isinstance(title, str) or not 1 <= len(title) <= 30:
+            payload["title"] = None
+        payload["next_scene"] = None
+        payload["is_ending"] = False
+        payload["ending_id"] = None
+        response = ChatResponse.model_validate(payload)
+
+    safe_reply = sanitize_character_reply(response.reply)
+    safe_title = sanitize_character_reply(response.title) if response.title else None
+    return response.model_copy(update={"reply": safe_reply or "", "title": safe_title})
 
 
 class SessionService:
@@ -253,6 +301,7 @@ class SessionService:
             first = _present_chat_messages(messages)[0]
             title = summarize_chat_title(first.get("message", ""), first.get("reply", ""))
             self.repository.save_chat_messages(chat_id, messages, title)
+        title = sanitize_character_reply(title) or "新对话"
         return mode, messages, player_name, title
 
     def get_chat(self, chat_id: UUID):
@@ -336,27 +385,26 @@ class SessionService:
     def stream_chat_message(self, chat_id: UUID, message: str, *, stream_id: str | None = None):
         control = None
         if stream_id:
-            control = _ChatStreamControl(chat_id)
             with self._chat_streams_lock:
                 previous = self._chat_streams.get(stream_id)
-                if previous:
-                    previous.cancel()
-                self._chat_streams[stream_id] = control
+                if previous and previous.chat_id == chat_id and previous.pending_before_start:
+                    control = previous
+                else:
+                    control = _ChatStreamControl(chat_id)
+                    self._chat_streams[stream_id] = control
+            if previous and previous is not control:
+                previous.cancel()
 
         def events():
             event_index = 0
-            received_text = ""
-            emitted_text = ""
             stream = None
-            layout_normalizer = ChatReplyLayoutNormalizer()
             reply_chunker = _ReplyTextChunker()
 
             def publish(text: str, *, final: bool = False):
-                nonlocal event_index, emitted_text
+                nonlocal event_index
                 for chunk in reply_chunker.feed(text, final=final):
                     if control and control.cancelled:
                         return False
-                    emitted_text += chunk
                     yield {"type": "text", "index": event_index, "delta": chunk}
                     event_index += 1
                 return True
@@ -376,6 +424,8 @@ class SessionService:
                 return response.model_copy(update={"reply": language.text})
 
             try:
+                if control and control.cancelled:
+                    return
                 mode, messages, player_name, title = self._get_chat_record(chat_id)
                 request = ChatModelRequest(
                     character_profile=DEFAULT_CHARACTER_PROFILE,
@@ -389,35 +439,18 @@ class SessionService:
                 if hasattr(client, "generate_chat_stream"):
                     try:
                         stream = client.generate_chat_stream(request=request)
+                        if control:
+                            control.attach_stream(stream)
+                            if control.cancelled:
+                                return
                         for item in stream:
                             if control and control.cancelled:
                                 return
-                            if item.get("type") == "text":
-                                delta = item.get("delta")
-                                if isinstance(delta, str) and delta:
-                                    delta = layout_normalizer.feed(delta)
-                                    if not delta:
-                                        continue
-                                    received_text += delta
-                                    guarded = guard_chat_reply(message, received_text)
-                                    language = guard_language(guarded.text)
-                                    if (
-                                        guarded.status == "unrepairable"
-                                        or language.status == "unrepairable"
-                                        or not language.text.startswith(emitted_text + reply_chunker.pending)
-                                    ):
-                                        stream_failure = InvalidAIResponseError("streamed chat reply failed an incremental content guard")
-                                        break
-                                    safe_prefix = emitted_text + reply_chunker.pending
-                                    safe_delta = language.text[len(safe_prefix):]
-                                    if not safe_delta:
-                                        continue
-                                    published = yield from publish(safe_delta)
-                                    if not published:
-                                        return
-                            elif item.get("type") == "done":
+                            if item.get("type") == "done":
                                 raw_response = item.get("response")
                     except (AppError, ModelProviderError, ModelTimeoutError, InvalidAIResponseError, ValueError, TypeError) as exc:
+                        if control and control.cancelled:
+                            return
                         stream_failure = exc
                     finally:
                         if control and control.cancelled:
@@ -427,9 +460,6 @@ class SessionService:
 
                 try:
                     if stream_failure or raw_response is None:
-                        if emitted_text and stream_failure:
-                            yield {"type": "error", "message": "模型连接中断，已显示的部分回复未保存；请重新发送。"}
-                            return
                         response = self._generate_chat(mode, request)
                     else:
                         response = prepare_response(raw_response)
@@ -438,14 +468,7 @@ class SessionService:
 
                 if control and control.cancelled:
                     return
-                safe_prefix = emitted_text + reply_chunker.pending
-                remainder = response.reply[len(safe_prefix):] if response.reply.startswith(safe_prefix) else response.reply
-                if not response.reply.startswith(safe_prefix):
-                    yield {"type": "reset", "index": event_index}
-                    emitted_text = ""
-                    reply_chunker = _ReplyTextChunker()
-                    remainder = response.reply
-                published = yield from publish(remainder, final=True)
+                published = yield from publish(response.reply, final=True)
                 if not published:
                     return
 
@@ -454,7 +477,14 @@ class SessionService:
                     conversation_title = response.title or summarize_chat_title(message, response.reply)
                 response = response.model_copy(update={"title": conversation_title})
                 messages.append({"message": message, "reply": response.reply, "emotion": response.emotion.value})
-                self.repository.save_chat_messages(chat_id, messages, conversation_title)
+                if control:
+                    committed = control.commit(
+                        lambda: self.repository.save_chat_messages(chat_id, messages, conversation_title)
+                    )
+                    if not committed:
+                        return
+                else:
+                    self.repository.save_chat_messages(chat_id, messages, conversation_title)
                 yield {
                     "type": "done",
                     "response": response.model_dump(mode="json"),
@@ -481,10 +511,22 @@ class SessionService:
     def cancel_chat_stream(self, stream_id: str, *, chat_id: UUID | None = None) -> bool:
         with self._chat_streams_lock:
             control = self._chat_streams.get(stream_id)
-        if not control or (chat_id is not None and control.chat_id != chat_id):
-            return False
-        control.cancel()
-        return True
+            if control and (chat_id is not None and control.chat_id != chat_id):
+                return False
+            if control is None:
+                prefix = f"{chat_id}-" if chat_id is not None else ""
+                turn_number = stream_id[len(prefix):] if prefix and stream_id.startswith(prefix) else ""
+                if not turn_number.isdecimal() or int(turn_number) < 1:
+                    return False
+                control = _ChatStreamControl(chat_id)
+                self._chat_streams[stream_id] = control
+                stale_before_start = [
+                    key for key, value in self._chat_streams.items()
+                    if value.pending_before_start
+                ]
+                while len(stale_before_start) > 512:
+                    self._chat_streams.pop(stale_before_start.pop(0), None)
+        return control.cancel()
 
     def regenerate_chat(self, chat_id: UUID):
         """按上一条玩家输入重新生成回复；新版本替换原展示位置，失败不改动原回复。"""

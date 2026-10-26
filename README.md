@@ -69,7 +69,7 @@ $env:WANDERER_DEMO_MODE = "live"
 
 服务需兼容 `/chat/completions`，支持 Bearer 密钥鉴权，并返回标准 `choices[0].message.content` JSON 文本或直接 JSON 对象。客户端使用 `response_format: {type: text}`，再由程序解析模型返回的 JSON 文本；这样可以兼容 LM Studio 等不接受 `json_object` 的本地服务。密钥只在后端使用；不要把密钥写入源代码、截图、聊天记录或提交仓库。要回到本地离线模型，将 `WANDERER_DEMO_MODE` 设为 `offline` 并重启。
 
-自由对话会优先使用 SSE 分段接收回复：模型分段持续写入浏览器缓存，只有对应语音真正触发 `playing` 时才同步释放这段文字。播放队列保留“当前段 + 下一段”两段预生成窗口，当前段朗读期间就会加载下一段语音，以消除上一段结束后才开始合成造成的额外停顿；语音仍严格按原文顺序播放。角色回复在进入 SSE、语音队列和历史记录前会统一整理成一个连续自然段，模型产生的换行或空行不会再形成单独语音片段；已有历史回复在读取时也会按同一规则显示。回复气泡只在首段出现时播放一次入场动画，后续文字直接在原气泡内更新，不刷新聊天框。更新到包含该功能的代码后，需要关闭旧的 `start.ps1`/Uvicorn 服务并重新启动；如果浏览器仍加载旧脚本，再按 `Ctrl + F5` 强制刷新。上游模型服务若不支持流式响应，程序仍会回退到原有 JSON 响应。
+自由对话会优先使用 SSE 分段接收回复：模型分段先在服务端完成完整协议、角色、人称、语言和输出净化检查，确认没有网址、Markdown 链接、引用标记、外部来源或模型/提示词/训练数据等内部痕迹后，才写入浏览器缓存、历史记录和语音队列；因此不会再出现“先显示、后发现链接”的泄漏。只有对应语音真正触发 `playing` 时才同步释放这段文字。播放队列保留“当前段 + 下一段”两段预生成窗口，当前段朗读期间就会加载下一段语音，以消除上一段结束后才开始合成造成的额外停顿；语音仍严格按原文顺序播放。角色回复在进入 SSE、语音队列和历史记录前会统一整理成一个连续自然段，模型产生的换行或空行不会再形成单独语音片段；已有历史回复在读取时也会按同一规则显示，并隐藏旧记录里的来源链接和元数据字段。回复气泡只在首段出现时播放一次入场动画，后续文字直接在原气泡内更新，不刷新聊天框。更新到包含该功能的代码后，需要关闭旧的 `start.ps1`/Uvicorn 服务并重新启动；如果浏览器仍加载旧脚本，再按 `Ctrl + F5` 强制刷新。上游模型服务若不支持流式响应，程序仍会回退到原有 JSON 响应。
 
 如果页面提示未读取到 API 密钥，请检查 `.env` 是否在项目根目录，且变量名是 `WANDERER_MODEL_API_KEY`。更新密钥或模型配置后，必须关闭运行中的服务窗口并重新启动。
 
@@ -84,16 +84,16 @@ WANDERER_TTS_DEVICE=auto
 WANDERER_TTS_API_URL=http://127.0.0.1:9880/tts
 WANDERER_TTS_REFERENCE_AUDIO=logs/wanderer/5-wav32k/6.1流浪者全语音无音效无背景音乐（自用）.mp3_0000716160_0000856960.wav
 WANDERER_TTS_PROMPT_TEXT=可别让我失望.这世上没有纯粹的自由.
+WANDERER_TTS_SPEED_FACTOR=0.9
 WANDERER_TTS_TIMEOUT=240
 WANDERER_TTS_STARTUP_TIMEOUT=300
 ```
 
-这组配置使用 `GPT_weights_v2Pro\流浪者-e15.ckpt` 和 `GPT_SoVITS\pretrained_models\v2Pro\s2Gv2Pro.pth`。`start.ps1` 会在游戏服务退出时清理本次启动的 TTS 进程；如果 `9880` 已经是一个 GPT-SoVITS 服务，则会复用它，不会停止外部启动的进程。语音合成结果会缓存到 `data/voice-cache`，该目录已被 Git 忽略。
+这组配置使用 `GPT_weights_v2Pro\流浪者-e15.ckpt` 和 `GPT_SoVITS\pretrained_models\v2Pro\s2Gv2Pro.pth`，并默认采用较低随机度与 `0.9` 语速来改善咬字。可用 `WANDERER_TTS_SPEED_FACTOR` 在 GPT-SoVITS 支持的 `0.6`–`1.65` 范围内微调；改完后重启游戏服务。每组发音参数使用独立缓存，旧语音不会覆盖新设置。`start.ps1` 会在游戏服务退出时清理本次启动的 TTS 进程；如果 `9880` 已经是一个 GPT-SoVITS 服务，则会复用它，不会停止外部启动的进程。语音合成结果会缓存到 `data/voice-cache`，该目录已被 Git 忽略。
 
 ### 角色语音增强候选
 
-已用 `P7-6.2主线.mp3`、`P8-6.3主线.mp3` 和 `P9-6.6主线.mp3` 补充训练集。训练产生的候选 GPT 权重位于
-`data/voice-training/wanderer-augmented-20261024/candidate/weights/wanderer_augmented-e4.ckpt`，并已通过独立 GPT-SoVITS 推理和 WAV 校验。它没有自动覆盖原权重；试听确认音质后，在 `.env` 设置 `WANDERER_TTS_GPT_WEIGHTS` 指向该文件并重启 `start.ps1` 即可切换。候选训练数据和权重属于本机大文件，已由 `.gitignore` 排除。
+提供的主线录音目前只完成了隔离探针，未直接纳入训练：其中可能包含其他说话人、背景音乐或无法可靠校对的片段，而且尚未建立不同说话人的校准分布。因此没有启动候选训练，也没有覆盖现有权重；当前稳定配置仍使用 `流浪者-e15.ckpt`。只有在人工校对、说话人阈值校准和独立试听评测全部通过后，才应在本机 `.env` 中显式设置 `WANDERER_TTS_GPT_WEIGHTS`。
 
 缓存按回复文本、参考音频、提示词和 GPT/SoVITS 权重指纹命名，重复剧情、重复提问和重新生成相同文本都能命中。当前缓存约几十 MB，可以安全删除；删除后第一次播放对应文本会重新合成，之后会再次建立缓存：
 

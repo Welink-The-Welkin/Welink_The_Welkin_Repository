@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -101,17 +102,45 @@ def _timeout() -> float:
         return 120.0
 
 
+def _float_setting(name: str, default: float, minimum: float, maximum: float) -> float:
+    try:
+        value = float(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+    return min(maximum, max(minimum, value))
+
+
+def _int_setting(name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+    return min(maximum, max(minimum, value))
+
+
+def _tts_parameters() -> dict[str, object]:
+    return {
+        "top_k": _int_setting("WANDERER_TTS_TOP_K", 5, 1, 100),
+        "top_p": _float_setting("WANDERER_TTS_TOP_P", 0.8, 0.0, 1.0),
+        "temperature": _float_setting("WANDERER_TTS_TEMPERATURE", 0.7, 0.0, 1.0),
+        "speed_factor": _float_setting("WANDERER_TTS_SPEED_FACTOR", 0.9, 0.6, 1.65),
+        "seed": _int_setting("WANDERER_TTS_SEED", 1234, -1, 2**32 - 1),
+        "parallel_infer": _as_bool(os.getenv("WANDERER_TTS_PARALLEL_INFER", "false")),
+    }
+
+
 def _cache_path(text: str) -> Path:
     cache_dir = Path(os.getenv("WANDERER_TTS_CACHE_DIR", "data/voice-cache"))
     root = os.getenv("GPT_SOVITS_ROOT", "")
     fingerprint = hashlib.sha256(
         "\0".join((
-            "v1",
+            "v2",
             text,
             _reference_audio(),
             _prompt_text(),
             os.getenv("WANDERER_TTS_GPT_WEIGHTS", "") or f"{root}/GPT_weights_v2Pro/流浪者-e15.ckpt",
             os.getenv("WANDERER_TTS_SOVITS_WEIGHTS", "") or f"{root}/GPT_SoVITS/pretrained_models/v2Pro/s2Gv2Pro.pth",
+            json.dumps(_tts_parameters(), ensure_ascii=False, sort_keys=True, separators=(",", ":")),
         )).encode("utf-8")
     ).hexdigest()
     return cache_dir / f"{fingerprint}.wav"
@@ -128,12 +157,8 @@ def _tts_payload(text: str, *, streaming_mode: int | bool = False) -> dict[str, 
         "batch_size": 1,
         "media_type": "wav",
         "streaming_mode": streaming_mode,
-        "parallel_infer": True,
-        "top_k": 15,
-        "top_p": 1,
-        "temperature": 1,
         "repetition_penalty": 1.35,
-        "seed": -1,
+        **_tts_parameters(),
     }
 
 

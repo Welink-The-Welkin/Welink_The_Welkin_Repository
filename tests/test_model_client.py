@@ -504,6 +504,9 @@ def test_live_free_chat_prompt_uses_the_players_chosen_name(monkeypatch):
     assert "第三人称代词只能用于其他角色" in prompt
     assert "不得以浮浪倾客、流浪者、倾奇者、散兵、国崩、阿帽、斯卡拉姆齐中的任何一个名号指代自己" in prompt
     assert "不要写“我是散兵”或“我叫阿帽”" in prompt
+    assert "不引用外部来源" in prompt
+    assert "2026-10-21" not in prompt
+    assert "游戏版本 7.1" not in prompt
 
 def test_live_free_chat_prompt_has_no_exclusive_self_naming_rules(monkeypatch):
     monkeypatch.setenv("WANDERER_MODEL_API_KEY", "test-key")

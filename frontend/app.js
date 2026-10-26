@@ -2,6 +2,7 @@
 const root = document.querySelector("#app");
 const toast = document.querySelector("#toast");
 const CHARACTER_NAME = "「浮浪倾客」";
+const PAUSED_CHAT_COPY = "「浮浪倾客」的话戛然而止，略表腻烦的眼神随清风飘来，示意你接上这场被打断的对话。";
 const STORY_REPLY_PLACEHOLDER_MS = 1000;
 const VOICE_STATUS_TIMEOUT_MS = 15000;
 const VOICE_SYNTHESIS_TIMEOUT_MAX_MS = 240000;
@@ -90,6 +91,7 @@ const appState = {
   pausedChat: null,
   chatDraft: "",
   chatAbortController: null,
+  chatCancellation: null,
   chatRequestToken: 0,
   regeneratingChat: false,
   revealChatReply: false,
@@ -145,6 +147,12 @@ function rememberChatTitle(sessionId, title) {
     appState.chatTitles[sessionId] = title.trim().slice(0, 24);
     localStorage.setItem("wanderer-chat-titles", JSON.stringify(appState.chatTitles));
   }
+}
+
+function createChatStreamId(sessionId, requestSequence) {
+  const nonce = Math.floor(Math.random() * 10000000000).toString().padStart(10, "0");
+  const sequence = `${Date.now()}${nonce}${String(requestSequence).padStart(10, "0")}`;
+  return `${sessionId}-${sequence}`;
 }
 
 const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]);
@@ -825,7 +833,7 @@ function renderChatMessage(message, playerName = appState.playerName || "你", a
     const reveal = message.reveal ? " reveal" : "";
     const text = message.pending
       ? `${CHARACTER_NAME}正在思考……`
-      : (message.paused ? `${CHARACTER_NAME}已暂停思考。` : chatMessageText(message));
+      : (message.paused ? PAUSED_CHAT_COPY : chatMessageText(message));
     const isAssistant = message.role !== "user";
     const showActions = isAssistant && !message.pending && !message.paused && Number.isInteger(actions.index);
     const replyActions = showActions ? renderReplyActions({ index: actions.index, canRegenerate: Boolean(actions.canRegenerate) }) : "";
@@ -876,7 +884,7 @@ function renderChat() {
     ? `${storedMarkup}${regeneratingMarkup}${pendingMarkup}${pausedMarkup}`
     : (pendingMarkup || pausedMarkup || `<div class="chat-empty"><div class="role-symbol" aria-hidden="true">風</div><h2>让风听见你的话</h2><p>这里没有预设选项。你可以直接说出想问的事，${CHARACTER_NAME}会以自己的方式回应。</p></div>`);
   const draft = appState.pausedChat
-    ? (appState.pausedChat.draft || appState.pausedChat.message || "")
+    ? (appState.chatDraft || appState.pausedChat.draft || appState.pausedChat.message || "")
     : appState.chatDraft;
   const chatSubmitButton = appState.pendingChat
     ? `<button class="primary-btn" type="button" data-action="pause-chat" title="暂停本轮思考">暂停</button>`
@@ -1116,7 +1124,8 @@ function chatAbortError() {
   return error;
 }
 
-function releaseStreamingChatText(text) {
+function releaseStreamingChatText(text, requestToken, sessionId) {
+  if (requestToken !== appState.chatRequestToken || sessionId !== appState.chatSessionId) return;
   const pending = appState.pendingChat;
   if (!pending?.streaming) return;
   pending.reply = text;
@@ -1132,17 +1141,25 @@ function releaseStreamingChatText(text) {
   if (replyNode) replyNode.textContent = text;
 }
 
-async function consumeChatEvents(events, { message, signal, requestToken, sessionId }) {
+async function consumeChatEvents(events, { message, signal, requestToken, sessionId, streamId }) {
+  const currentPending = appState.pendingChat;
+  if (signal.aborted
+    || requestToken !== appState.chatRequestToken
+    || sessionId !== appState.chatSessionId
+    || currentPending?.streamId !== streamId) {
+    throw chatAbortError();
+  }
   let completed = null;
   appState.pendingChat = {
-    ...appState.pendingChat,
+    ...currentPending,
     message,
     streaming: true,
     streamingStarted: false,
     streamingReveal: false,
     bufferedReply: appState.pendingChat?.reply || "",
   };
-  let voiceQueue = createStreamingVoiceQueue(signal, releaseStreamingChatText);
+  const releaseText = (text) => releaseStreamingChatText(text, requestToken, sessionId);
+  let voiceQueue = createStreamingVoiceQueue(signal, releaseText);
   try {
     for await (const event of events) {
       if (signal.aborted || requestToken !== appState.chatRequestToken || sessionId !== appState.chatSessionId) {
@@ -1154,9 +1171,9 @@ async function consumeChatEvents(events, { message, signal, requestToken, sessio
         voiceQueue.enqueue(event.delta, bufferedReply);
       } else if (event?.type === "reset") {
         voiceQueue.cancel();
-        voiceQueue = createStreamingVoiceQueue(signal, releaseStreamingChatText);
+        voiceQueue = createStreamingVoiceQueue(signal, releaseText);
         appState.pendingChat.bufferedReply = "";
-        releaseStreamingChatText("");
+        releaseText("");
       } else if (event?.type === "error") {
         throw new Error(event.message || "模型服务暂时无法完成回复，请稍后重试。");
       } else if (event?.type === "done") {
@@ -1182,25 +1199,51 @@ async function consumeChatEvents(events, { message, signal, requestToken, sessio
 async function submitChat(message) {
   if (!appState.chatSessionId || appState.busy) return;
   const sessionId = appState.chatSessionId;
+  const cancellation = appState.chatCancellation?.sessionId === sessionId ? appState.chatCancellation : null;
+  if (cancellation) {
+    const waitToken = ++appState.chatRequestToken;
+    appState.chatDraft = message;
+    setBusy(true);
+    try {
+      const result = await cancellation.request();
+      if (!result.confirmed) {
+        if (waitToken === appState.chatRequestToken && sessionId === appState.chatSessionId) {
+          showError(result.error?.message || "服务端未确认本轮已暂停，请检查当前对话后重试。");
+        }
+        return;
+      }
+    } finally {
+      if (waitToken === appState.chatRequestToken && sessionId === appState.chatSessionId) setBusy(false);
+    }
+    if (waitToken !== appState.chatRequestToken || sessionId !== appState.chatSessionId) return;
+    if (appState.chatCancellation === cancellation) appState.chatCancellation = null;
+    return submitChat(message);
+  }
   const requestToken = ++appState.chatRequestToken;
   stopVoice(false);
   unlockVoiceFromGesture();
   appState.chatDraft = "";
-  appState.pendingChat = { message };
+  const streamId = createChatStreamId(sessionId, requestToken);
+  appState.pendingChat = {
+    message,
+    streamId,
+    previousMessageCount: appState.chatSession?.messages?.length || 0,
+  };
   appState.pausedChat = null;
-  appState.chatAbortController = new AbortController();
+  const controller = new AbortController();
+  appState.chatAbortController = controller;
   renderChat();
   setBusy(true);
   try {
-    const signal = appState.chatAbortController.signal;
+    const signal = controller.signal;
     const reply = await requestChatReply(
       `/api/chat/sessions/${sessionId}/messages`,
       message,
       signal,
-      `${sessionId}-${requestToken}`,
+      streamId,
     );
     const result = reply.events
-      ? await consumeChatEvents(reply.events, { message, signal, requestToken, sessionId })
+      ? await consumeChatEvents(reply.events, { message, signal, requestToken, sessionId, streamId })
       : reply.result;
     if (requestToken !== appState.chatRequestToken || sessionId !== appState.chatSessionId) return;
     const title = result.title || result.response?.title || appState.chatSession.title;
@@ -1216,7 +1259,7 @@ async function submitChat(message) {
   } catch (error) {
     if (requestToken !== appState.chatRequestToken || sessionId !== appState.chatSessionId) return;
     if (error?.name === "AbortError" || appState.chatAbortController?.signal.aborted) {
-      appState.pausedChat = { message, draft: appState.chatDraft };
+      appState.pausedChat = { message, draft: appState.chatDraft || message, streamId };
       appState.pendingChat = null;
       renderChat();
       return;
@@ -1234,9 +1277,78 @@ async function submitChat(message) {
 }
 
 function pauseChat() {
-  if (!appState.pendingChat || !appState.chatAbortController) return;
-  appState.chatAbortController.abort();
+  const pending = appState.pendingChat;
+  const controller = appState.chatAbortController;
+  const sessionId = appState.chatSessionId;
+  if (!pending || !controller || !sessionId || !pending.streamId) return;
+  const draft = appState.chatDraft || pending.message;
+  controller.abort();
+  appState.chatRequestToken += 1;
+  appState.chatAbortController = null;
+  appState.pendingChat = null;
+  appState.pausedChat = { message: pending.message, draft, streamId: pending.streamId };
+  appState.chatDraft = draft;
+  appState.busy = false;
+  setBusy(false);
   stopVoice(false);
+  renderChat();
+
+  const cancellation = {
+    sessionId,
+    streamId: pending.streamId,
+    message: pending.message,
+    previousMessageCount: pending.previousMessageCount || 0,
+    promise: null,
+  };
+  const requestCancellation = () => {
+    if (cancellation.promise) return cancellation.promise;
+    const attempt = (async () => {
+      try {
+        const response = await fetch(`/api/chat/sessions/${sessionId}/cancel`, {
+          method: "POST",
+          headers: { "X-Chat-Stream-ID": pending.streamId },
+          keepalive: true,
+        });
+        if (!response.ok) throw await responseError(response);
+        const body = await response.json();
+        if (body?.data?.cancelled === true) return { confirmed: true };
+
+        // A false result can mean the server committed just before pause won
+        // the network race. Preserve that completed turn, but never resend
+        // until the authoritative session confirms it is in history.
+        const completedSession = await request(`/api/chat/sessions/${sessionId}`);
+        const newMessages = completedSession.messages?.slice(cancellation.previousMessageCount) || [];
+        const committed = newMessages.some((item) => item.message === cancellation.message);
+        if (committed) return { confirmed: true, completedSession };
+        throw new Error("服务端未确认本轮已暂停，请检查当前对话后重试。");
+      } catch (error) {
+        return { confirmed: false, error };
+      }
+    })();
+    cancellation.promise = attempt;
+    attempt.then((result) => {
+      if (cancellation.promise === attempt) cancellation.promise = null;
+      if (result.confirmed && result.completedSession && appState.chatSessionId === sessionId) {
+        appState.chatSession = result.completedSession;
+        appState.pausedChat = null;
+        renderChat();
+      }
+    });
+    return attempt;
+  };
+  cancellation.request = requestCancellation;
+  const initialCancellation = requestCancellation();
+  appState.chatCancellation = cancellation;
+  initialCancellation.then((result) => {
+    if (appState.chatCancellation !== cancellation) return;
+    if (result.confirmed) {
+      appState.chatCancellation = null;
+      return;
+    }
+    if (appState.chatSessionId === sessionId && appState.pausedChat?.streamId === pending.streamId) {
+      showError(result.error?.message || "服务端未确认本轮已暂停，请检查当前对话后重试。");
+    }
+  });
 }
 
 async function deleteChatSession(sessionId) {
