@@ -457,7 +457,8 @@ function disposePreparedVoice(audio) {
 }
 
 async function prepareStreamingVoice(text, signal, sequence, availability) {
-  const available = await availability;
+  let available = appState.voiceAvailable;
+  if (!available) available = await availability;
   if (!available || signal?.aborted || sequence !== appState.voiceSequence || typeof Audio !== "function") return null;
 
   let audio = voicePlayer();
@@ -480,6 +481,29 @@ async function prepareStreamingVoice(text, signal, sequence, availability) {
     return null;
   }
   return { audio, text };
+}
+
+function prepareStoryReplyVoice(text) {
+  if (!text || typeof Audio !== "function") return null;
+  const controller = new AbortController();
+  const sequence = ++appState.voiceSequence;
+  appState.voiceAbortController = controller;
+  const availability = waitForVoiceAvailability(VOICE_STATUS_TIMEOUT_MS);
+  const prepared = prepareStreamingVoice(text, controller.signal, sequence, availability);
+  return { controller, signal: controller.signal, sequence, prepared };
+}
+
+async function playPreparedStoryReply(preparation) {
+  if (!preparation) return false;
+  const { controller, signal, sequence } = preparation;
+  try {
+    if (signal.aborted || sequence !== appState.voiceSequence) return false;
+    const prepared = await preparation.prepared;
+    if (!prepared || signal.aborted || sequence !== appState.voiceSequence) return false;
+    return await playPreparedVoiceAndWait(prepared, signal, sequence);
+  } finally {
+    if (appState.voiceAbortController === controller) appState.voiceAbortController = null;
+  }
 }
 
 async function playPreparedVoiceAndWait(prepared, signal, sequence, releaseText) {
@@ -986,8 +1010,9 @@ async function startSession(replayId = appState.selectedReplayId) {
     appState.resumePromptDismissed = false;
     appState.resumePromptRequired = false;
     window.location.hash = "#/game";
+    const voicePreparation = prepareStoryReplyVoice(session.last_response?.reply);
     renderGame();
-    if (session.last_response?.reply) void playVoice(session.last_response.reply, { automatic: true });
+    if (voicePreparation) void playPreparedStoryReply(voicePreparation);
   } catch (error) {
     showError(error.message);
   } finally {
@@ -1009,6 +1034,7 @@ async function submitTurn(input) {
   renderGame();
   try {
     const result = await request(`/api/sessions/${appState.sessionId}/turn`, { method: "POST", body: JSON.stringify(input) });
+    const voicePreparation = prepareStoryReplyVoice(result.response?.reply);
     const elapsed = Date.now() - appState.pendingTurn.startedAt;
     const remaining = Math.max(0, STORY_REPLY_PLACEHOLDER_MS - elapsed);
     if (remaining > 0) await new Promise((resolve) => window.setTimeout(resolve, remaining));
@@ -1017,7 +1043,7 @@ async function submitTurn(input) {
     appState.ending = result.ending || null;
     appState.pendingTurn = null;
     renderGame();
-    if (result.response?.reply) void playVoice(result.response.reply, { automatic: true });
+    if (voicePreparation) void playPreparedStoryReply(voicePreparation);
   } catch (error) {
     appState.pendingTurn = null;
     renderGame();
@@ -1060,7 +1086,9 @@ async function restartSession() {
     appState.ending = session.ending || null;
     localStorage.setItem("wanderer-session", session.session_id);
     window.location.hash = "#/game";
+    const voicePreparation = prepareStoryReplyVoice(session.last_response?.reply);
     renderGame();
+    if (voicePreparation) void playPreparedStoryReply(voicePreparation);
   } catch (error) {
     showError(error.message);
   } finally {

@@ -186,6 +186,19 @@ def test_story_directory_and_resume_dialog_keep_the_existing_visual_palette():
     assert "var(--line)" in styles
 
 
+def test_free_chat_long_user_messages_use_left_aligned_intrinsic_bubbles():
+    styles = (ROOT / "frontend" / "styles.css").read_text(encoding="utf-8")
+    message_block = styles.split(".chat-message {", 1)[1].split(".chat-message.user", 1)[0]
+    user_block = styles.split(".chat-message.user", 1)[1].split(".chat-message.pending", 1)[0]
+    paragraph_block = styles.split(".chat-message p", 1)[1].split(".chat-message time", 1)[0]
+
+    assert "width:fit-content" in message_block
+    assert "min-width:0" in message_block
+    assert "text-align:left" in user_block
+    assert "overflow-wrap:anywhere" in paragraph_block
+    assert "word-break:break-word" in paragraph_block
+
+
 def test_frontend_resumes_saved_journey_and_always_has_home_navigation():
     html = (ROOT / "frontend" / "index.html").read_text(encoding="utf-8")
     script = (ROOT / "frontend" / "app.js").read_text(encoding="utf-8")

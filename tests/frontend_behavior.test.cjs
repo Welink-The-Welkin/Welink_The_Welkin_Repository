@@ -587,6 +587,21 @@ test("story catalog selection creates a fixed replay, hides mode controls, and r
   assert.doesNotMatch(browser.root.innerHTML, /resume-dialog/);
 });
 
+test("story voice starts preparing before the initial reply is rendered", async () => {
+  const browser = makeBrowser({
+    hash: "#/stories",
+    storage: { "wanderer-player-name": "清岚" },
+    voiceEnabled: true,
+  });
+
+  await browser.click("select-story", { replayId: "demo_guarded_path" });
+
+  const replyRenderIndex = browser.events.findIndex((event) => event.type === "render" && event.html.includes("沿着这条线索继续查"));
+  const voicePrepareIndex = browser.events.findIndex((event) => event.type === "voice-prepare");
+  assert.ok(voicePrepareIndex >= 0);
+  assert.ok(voicePrepareIndex < replyRenderIndex);
+});
+
 test("selected route is retained while the player enters a name", async () => {
   const browser = makeBrowser({ hash: "#/stories" });
   assert.equal((browser.root.innerHTML.match(/class="story-row"/g) || []).length, 2);
@@ -637,6 +652,31 @@ test("story turn immediately shows a single ellipsis placeholder and reveals the
   assert.match(browser.root.innerHTML, /沿着这条线索继续查/);
   assert.doesNotMatch(browser.root.innerHTML, /正在整理这段回应/);
   assert.equal(browser.audioPlayback.length, 2);
+});
+
+test("story voice starts preparing before the delayed turn reply is rendered", async () => {
+  const browser = makeBrowser({
+    hash: "#/stories",
+    storage: { "wanderer-player-name": "清岚" },
+    deferStoryTurn: true,
+    voiceEnabled: true,
+  });
+
+  await browser.click("select-story", { replayId: "demo_guarded_path" });
+  const eventStart = browser.events.length;
+  const turning = browser.click("option", { option: "listen" });
+  await settle();
+  browser.resolveStoryTurn();
+  await settle();
+  await browser.runTimer(1000);
+  await turning;
+
+  const events = browser.events.slice(eventStart);
+  const replyRenderIndex = events.findIndex((event) => event.type === "render" && event.html.includes("沿着这条线索继续查"));
+  const voicePrepareIndex = events.findIndex((event) => event.type === "voice-prepare");
+  assert.ok(voicePrepareIndex >= 0);
+  assert.ok(replyRenderIndex >= 0);
+  assert.ok(voicePrepareIndex < replyRenderIndex);
 });
 
 test("a fast repeated story choice cannot restore the old loading state or duplicate the turn request", async () => {
