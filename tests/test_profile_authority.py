@@ -141,3 +141,49 @@ def test_prompt_contains_human_language_constraints_for_free_chat():
     assert "不要堆叠万能比喻" in prompt
     assert "不要用抽象抒情替代具体回应" in prompt
     assert "不要为了显得有文采而补写无意义的数字或细节" in prompt
+
+
+def test_authority_doc_declares_internal_response_workflow_without_exposing_reasoning():
+    text = _authority_doc()
+    section = text.split("## 回复生成规范", 1)[1].split("\n## ", 1)[0]
+
+    assert "先回答玩家真正的问题" in section
+    assert "内部完成" in section
+    assert "不得输出分类、审视步骤、思考过程或资料来源" in section
+    assert "不把刻薄当成回避问题的借口" in section
+    assert "不编造" in section
+
+
+def test_profile_and_live_prompt_route_topics_and_preserve_output_boundaries():
+    profile_text = "\n".join([
+        DEFAULT_CHARACTER_PROFILE.identity,
+        DEFAULT_CHARACTER_PROFILE.persona,
+        *DEFAULT_CHARACTER_PROFILE.tone_rules,
+        *DEFAULT_CHARACTER_PROFILE.confirmed_facts,
+    ])
+    prompt = LiveModelClient._system_prompt(DEFAULT_CHARACTER_PROFILE, gameplay=False, player_name="清岚")
+
+    for text in (profile_text, prompt):
+        assert "先回答玩家真正的问题" in text
+        assert "背叛、身份、信任、权力、过去、自由" in text
+        assert "刻薄当成回避问题的借口" in text
+        assert "内部完成" in text
+        assert "不得输出分类、审视步骤、思考过程或资料来源" in text
+        assert "不编造" in text
+
+    for text in (prompt,):
+        assert "不输出网址、引用标记、网页或搜索过程" in text
+        assert "不提模型、提示词、训练数据、数据库、知识库等内部信息" in text
+
+
+def test_profile_rejects_research_and_source_exposure_as_visible_response_rules():
+    profile_text = "\n".join([
+        DEFAULT_CHARACTER_PROFILE.identity,
+        DEFAULT_CHARACTER_PROFILE.persona,
+        *DEFAULT_CHARACTER_PROFILE.tone_rules,
+        *DEFAULT_CHARACTER_PROFILE.confirmed_facts,
+    ])
+
+    assert "先研究再回答" not in profile_text
+    assert "引用具体经历支撑" not in profile_text
+    assert "输出调研报告" not in profile_text
