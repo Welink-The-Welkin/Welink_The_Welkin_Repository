@@ -192,11 +192,15 @@ def test_free_chat_long_user_messages_use_left_aligned_intrinsic_bubbles():
     user_block = styles.split(".chat-message.user", 1)[1].split(".chat-message.pending", 1)[0]
     paragraph_block = styles.split(".chat-message p", 1)[1].split(".chat-message time", 1)[0]
 
-    assert "width:fit-content" in message_block
-    assert "min-width:0" in message_block
-    assert "text-align:left" in user_block
-    assert "overflow-wrap:anywhere" in paragraph_block
-    assert "word-break:break-word" in paragraph_block
+    compact_message = "".join(message_block.split())
+    compact_user = "".join(user_block.split())
+    compact_paragraph = "".join(paragraph_block.split())
+
+    assert "width:fit-content" in compact_message
+    assert "min-width:0" in compact_message
+    assert "text-align:left" in compact_user
+    assert "overflow-wrap:anywhere" in compact_paragraph
+    assert "word-break:break-word" in compact_paragraph
 
 
 def test_frontend_resumes_saved_journey_and_always_has_home_navigation():
@@ -208,6 +212,15 @@ def test_frontend_resumes_saved_journey_and_always_has_home_navigation():
     assert "resume-journey" in script
     assert "dismiss-resume" in script
     assert "is_finished" in script
+
+
+def test_frontend_navigation_links_have_a_consistent_blue_border():
+    styles = (ROOT / "frontend" / "styles.css").read_text(encoding="utf-8")
+
+    navigation_block = styles.split(".site-nav a,", 1)[1].split(".wordmark-mark", 1)[0]
+    assert "border: 1px solid" in navigation_block
+    assert "var(--wind)" in navigation_block
+    assert "padding:" in navigation_block
 
 
 def test_home_action_keeps_saved_story_when_declining_resume():
@@ -295,8 +308,9 @@ def test_free_chat_reply_supports_copy_and_regenerate_shortcuts():
 def test_free_chat_reply_actions_reuse_existing_design_tokens():
     styles = (ROOT / "frontend" / "styles.css").read_text(encoding="utf-8")
     actions_block = styles.split(".chat-actions", 1)[1].split(".chat-empty", 1)[0]
+    compact_actions = "".join(actions_block.split())
 
     assert "var(--wind)" in actions_block
     assert "var(--line)" in actions_block
-    assert "#52645d" in actions_block
-    assert "border-radius:2px" in actions_block
+    assert "var(--cyan-blue)" in actions_block
+    assert "border-radius:2px" in compact_actions

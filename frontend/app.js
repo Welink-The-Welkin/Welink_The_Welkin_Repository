@@ -8,6 +8,63 @@ const VOICE_STATUS_TIMEOUT_MS = 15000;
 const VOICE_SYNTHESIS_TIMEOUT_MAX_MS = 240000;
 const VOICE_UNLOCK_WAV = "data:audio/wav;base64,UklGRiYAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YQIAAAAAAA==";
 
+// 背景图片路径映射
+const BACKGROUND_IMAGES = {
+  home: "/api/background/home",
+  stories: "/api/background/stories",
+  chat: "/api/background/chat",
+  intro: "/api/background/intro",
+  game: "/api/background/game"
+};
+
+function backgroundUrl(routeKey) {
+  const basePath = BACKGROUND_IMAGES[routeKey] || BACKGROUND_IMAGES.home;
+  if (routeKey === "chat") {
+    const cacheBuster = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    return `${basePath}?v=${encodeURIComponent(cacheBuster)}`;
+  }
+  return basePath;
+}
+
+// 应用背景图片
+function applyBackground(route) {
+  const body = document.body;
+  if (!body) return;
+  const routeKey = route.replace(/^#\/?/, '').split('/')[0] || 'home';
+  const bgPath = backgroundUrl(routeKey);
+
+  // 为 body 添加背景样式
+  body.style.backgroundImage = `url("${bgPath}")`;
+  body.style.backgroundSize = 'cover';
+  body.style.backgroundPosition = 'center';
+  body.style.backgroundAttachment = 'fixed';
+  body.style.backgroundRepeat = 'no-repeat';
+
+  // 添加柔和的深色遮罩层（降低不透明度以显示背景图）
+  const overlay = document.createElement('div');
+  overlay.style.cssText = `
+    position: fixed;
+    inset: 0;
+    background: rgba(10, 36, 99, 0.35);
+    pointer-events: none;
+    z-index: 0;
+  `;
+
+  // 移除旧遮罩
+  const oldOverlay = document.querySelector('.bg-overlay');
+  if (oldOverlay) oldOverlay.remove();
+
+  overlay.className = 'bg-overlay';
+  document.body.insertBefore(overlay, document.body.firstChild);
+
+  // 确保 app-shell 有正确的 z-index
+  const appShell = document.querySelector('.app-shell');
+  if (appShell) {
+    appShell.style.position = 'relative';
+    appShell.style.zIndex = '1';
+  }
+}
+
 const storyCatalog = [
   {
     id: "archive-wind",
@@ -15,7 +72,7 @@ const storyCatalog = [
     title: "旧档案里的风声",
     summary: "从一宗遭人改写的旧档案开始，沿着目击者留下的线索，查明真相并决定由谁承担代价。",
     replayId: "demo_guarded_path",
-    mark: "風",
+    mark: "旧",
   },
   {
     id: "archive-truth",
@@ -506,6 +563,16 @@ async function playPreparedStoryReply(preparation) {
   }
 }
 
+function prepareStoryReplyVoiceIfOngoing(state, response) {
+  if (!state || state.is_finished || response?.is_ending) return null;
+  return prepareStoryReplyVoice(response?.reply);
+}
+
+function playStoryReplyIfOngoing(state, response) {
+  const preparation = prepareStoryReplyVoiceIfOngoing(state, response);
+  if (preparation) void playPreparedStoryReply(preparation);
+}
+
 async function playPreparedVoiceAndWait(prepared, signal, sequence, releaseText) {
   const { audio, text } = prepared;
   if (signal?.aborted || sequence !== appState.voiceSequence) {
@@ -760,7 +827,6 @@ function showError(message) {
 function renderHome() {
   root.innerHTML = `
     <section class="home">
-      <div class="home-mark"><span>風</span></div>
       <div class="eyebrow">文字互动旅途</div>
       <h1>风起异途</h1>
       <p class="home-lead">一段关于选择、真相与承担的短途旅程。<br>风不会替任何人停留，答案也不会自己出现。</p>
@@ -815,7 +881,10 @@ function renderRoleIntro() {
       <h2>前情概要</h2>
       <p>一名委托人声称，旧档案里记录的事故经过遭人改写，唯一知情的目击者也失去了踪迹。你将在荒野与旧址间寻找证据，判断该保护谁、公开什么，以及谁应该承担代价。</p>
       <h2>操作方式</h2>
-       <p>每回合点击当前选项推进剧情。剧情旅途无需网络；自由对话是否连接模型服务由项目配置决定。</p>
+      <h3 class="intro-mode">剧情旅途</h3>
+      <p>在目录中选择一段故事，每回合点击当前选项推进剧情；不同的选择会通向不同的结局，进度会自动保存，可随时继续或重新开始。剧情旅途无需网络。</p>
+      <h3 class="intro-mode">自由对话</h3>
+      <p>没有预设选项，直接在输入框里说出想问的事，${CHARACTER_NAME}会以自己的方式回应。可以新建、切换或删除历史对话，也可以复制、重新生成或暂停回复。自由对话不会改变剧情的状态与结局；是否连接模型服务由项目配置决定。</p>
       <label class="player-name-field" for="intro-player-name">你希望故事如何称呼你？</label>
       <input class="player-name-input" id="intro-player-name" data-player-name name="player_name" maxlength="20" autocomplete="nickname" required placeholder="输入你的名字" value="${escapeHtml(appState.playerName)}">
       <div class="home-actions"><button class="primary-btn" data-action="start">开始剧情旅途 <span aria-hidden="true">→</span></button><a class="secondary-btn home-chat-link" href="#/chat">进入自由对话</a></div>
@@ -873,6 +942,7 @@ function chatHistoryMarkup() {
 }
 
 function renderChat() {
+  if (window.location.hash !== "#/chat") return;
   const session = appState.chatSession;
   const messages = session?.messages || [];
   const chatPlayerName = session?.player_name || appState.playerName || "你";
@@ -906,7 +976,7 @@ function renderChat() {
     : "";
   const messageMarkup = messages.length
     ? `${storedMarkup}${regeneratingMarkup}${pendingMarkup}${pausedMarkup}`
-    : (pendingMarkup || pausedMarkup || `<div class="chat-empty"><div class="role-symbol" aria-hidden="true">風</div><h2>让风听见你的话</h2><p>这里没有预设选项。你可以直接说出想问的事，${CHARACTER_NAME}会以自己的方式回应。</p></div>`);
+    : (pendingMarkup || pausedMarkup || `<div class="chat-empty"><h2>让风听见你的话</h2><p>这里没有预设选项。你可以直接说出想问的事，${CHARACTER_NAME}会以自己的方式回应。</p></div>`);
   const draft = appState.pausedChat
     ? (appState.chatDraft || appState.pausedChat.draft || appState.pausedChat.message || "")
     : appState.chatDraft;
@@ -953,7 +1023,6 @@ function renderGame() {
   root.innerHTML = `
     <section class="game-layout">
       <aside class="side-rail">
-        <div class="role-symbol" aria-hidden="true">風</div>
         <div><h2>${CHARACTER_NAME}</h2></div>
         <div class="side-divider"></div>
         <div class="side-label">旅途状态</div>
@@ -1010,7 +1079,7 @@ async function startSession(replayId = appState.selectedReplayId) {
     appState.resumePromptDismissed = false;
     appState.resumePromptRequired = false;
     window.location.hash = "#/game";
-    const voicePreparation = prepareStoryReplyVoice(session.last_response?.reply);
+    const voicePreparation = prepareStoryReplyVoiceIfOngoing(session.state, session.last_response);
     renderGame();
     if (voicePreparation) void playPreparedStoryReply(voicePreparation);
   } catch (error) {
@@ -1034,7 +1103,7 @@ async function submitTurn(input) {
   renderGame();
   try {
     const result = await request(`/api/sessions/${appState.sessionId}/turn`, { method: "POST", body: JSON.stringify(input) });
-    const voicePreparation = prepareStoryReplyVoice(result.response?.reply);
+    const voicePreparation = prepareStoryReplyVoiceIfOngoing(result.state, result.response);
     const elapsed = Date.now() - appState.pendingTurn.startedAt;
     const remaining = Math.max(0, STORY_REPLY_PLACEHOLDER_MS - elapsed);
     if (remaining > 0) await new Promise((resolve) => window.setTimeout(resolve, remaining));
@@ -1086,7 +1155,7 @@ async function restartSession() {
     appState.ending = session.ending || null;
     localStorage.setItem("wanderer-session", session.session_id);
     window.location.hash = "#/game";
-    const voicePreparation = prepareStoryReplyVoice(session.last_response?.reply);
+    const voicePreparation = prepareStoryReplyVoiceIfOngoing(session.state, session.last_response);
     renderGame();
     if (voicePreparation) void playPreparedStoryReply(voicePreparation);
   } catch (error) {
@@ -1499,6 +1568,7 @@ root.addEventListener("click", (event) => {
   if (button.dataset.action === "resume-journey" && appState.session && !appState.session.state?.is_finished) {
     appState.resumePromptRequired = false;
     appState.resumePromptDismissed = true;
+    playStoryReplyIfOngoing(appState.session.state, appState.session.last_response);
     window.location.hash = "#/game";
     renderGame();
   }
@@ -1511,8 +1581,12 @@ root.addEventListener("click", (event) => {
   if (button.dataset.action === "regenerate-reply") regenerateReply();
 });
 
+let lastRenderedRoute = null;
+
 function renderRoute() {
   const route = window.location.hash || "#home";
+  lastRenderedRoute = route;
+  applyBackground(route);
   if (route === "#/intro") renderRoleIntro();
   else if (route === "#/stories") renderStoryDirectory();
   else if (route === "#/game") {
@@ -1529,7 +1603,12 @@ function renderRoute() {
   }
 }
 
-window.addEventListener("hashchange", renderRoute);
+window.addEventListener("hashchange", () => {
+  const nextRoute = window.location.hash || "#home";
+  const leavingVoiceRoute = (lastRenderedRoute === "#/game" || lastRenderedRoute === "#/chat") && nextRoute !== lastRenderedRoute;
+  if (leavingVoiceRoute) stopVoice(false);
+  renderRoute();
+});
 
 root.addEventListener("input", (event) => {
   if (event.target.matches("[data-player-name]")) {

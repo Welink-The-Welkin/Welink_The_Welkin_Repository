@@ -35,7 +35,7 @@ function storySession({ id = "story-1", finished = false, history = [] } = {}) {
   };
 }
 
-function makeBrowser({ hash = "#home", storage = {}, providerError = false, deferRegenerate = false, regenerateError = false, deleteChatError = false, deferDeleteChat = false, deferChat = false, deferChatDespiteAbort = false, deferChatCancel = false, chatCancelFailures = 0, chatCancelCommitted = false, chatHistory = [], deferStoryTurn = false, deferVoice = false, deferVoiceAfter = 0, deferVoiceStatus = false, deferAudioReady = false, deferAudioStart = false, deferAudioEnd = false, deferStreamReads = false, suppressAudioPlaying = false, audioRequiresGesture = false, voiceEnabled = false, voiceReadyAfter = 0, voiceError = false, streamChat = false, chatStreamChunks = ["第一句。", "第二句！"], chatReply = "我听见了。" } = {}) {
+function makeBrowser({ hash = "#home", storage = {}, providerError = false, deferRegenerate = false, regenerateError = false, deleteChatError = false, deferDeleteChat = false, deferChat = false, deferChatDespiteAbort = false, deferChatCancel = false, chatCancelFailures = 0, chatCancelCommitted = false, chatHistory = [], deferStoryTurn = false, finishStoryTurn = false, deferVoice = false, deferVoiceAfter = 0, deferVoiceStatus = false, deferAudioReady = false, deferAudioStart = false, deferAudioEnd = false, deferStreamReads = false, suppressAudioPlaying = false, audioRequiresGesture = false, voiceEnabled = false, voiceReadyAfter = 0, voiceError = false, streamChat = false, chatStreamChunks = ["第一句。", "第二句！"], chatReply = "我听见了。" } = {}) {
   const listeners = {};
   const calls = [];
   const events = [];
@@ -178,22 +178,24 @@ function makeBrowser({ hash = "#home", storage = {}, providerError = false, defe
       return { ok: true, json: async () => ({ data: storySession({ id: "completed-story", finished: true }) }) };
     }
     if (url === "/api/sessions/story-1/turn" && options.method === "POST") {
+      const nextState = storySession({
+        finished: finishStoryTurn,
+        history: [{ scene_id: "scene_01", player_input: "先听听他的判断", response_summary: "沿着这条线索继续查。" }],
+      }).state;
       const response = {
         ok: true,
         json: async () => ({
           data: {
-            state: storySession({
-              history: [{ scene_id: "scene_01", player_input: "先听听他的判断", response_summary: "沿着这条线索继续查。" }],
-            }).state,
+            state: nextState,
             response: {
               reply: "沿着这条线索继续查。",
               emotion: "guarded",
               state_delta: {},
-              next_scene: { scene_id: "scene_02", options: [{ id: "inspect_records", text: "查阅旧档案" }] },
-              is_ending: false,
-              ending_id: null,
+              next_scene: finishStoryTurn ? null : { scene_id: "scene_02", options: [{ id: "inspect_records", text: "查阅旧档案" }] },
+              is_ending: finishStoryTurn,
+              ending_id: finishStoryTurn ? "evidence_keeper" : null,
             },
-            ending: null,
+            ending: finishStoryTurn ? { ending_id: "evidence_keeper", title: "见证者", summary: "你让真相留在众人面前。" } : null,
           },
         }),
       };
@@ -668,7 +670,7 @@ test("story voice starts preparing before the delayed turn reply is rendered", a
   await settle();
   browser.resolveStoryTurn();
   await settle();
-  await browser.runTimer(1000);
+  await browser.runNextTimer();
   await turning;
 
   const events = browser.events.slice(eventStart);
@@ -728,6 +730,44 @@ test("restored unfinished journey can be declined without deleting progress, or 
   assert.match(refreshedGame.root.innerHTML, /风起异途/);
   assert.doesNotMatch(refreshedGame.root.innerHTML, /互动故事/);
   assert.equal(refreshedGame.values.get("wanderer-session"), "saved-story");
+});
+
+test("resuming an unfinished journey reads the visible character reply", async () => {
+  const browser = makeBrowser({
+    storage: { "wanderer-session": "saved-story" },
+    voiceEnabled: true,
+  });
+  await settle();
+  const eventStart = browser.events.length;
+
+  await browser.click("resume-journey");
+  await settle();
+
+  const events = browser.events.slice(eventStart);
+  assert.match(browser.root.innerHTML, /沿着这条线索继续查/);
+  assert.ok(events.some((event) => event.type === "voice-prepare"));
+  assert.ok(events.some((event) => event.type === "audio-play"));
+});
+
+test("finishing the last story turn does not prepare or play the ending reply", async () => {
+  const browser = makeBrowser({
+    hash: "#/stories",
+    storage: { "wanderer-player-name": "清岚" },
+    voiceEnabled: true,
+    finishStoryTurn: true,
+  });
+  await browser.click("select-story", { replayId: "demo_guarded_path" });
+  const eventStart = browser.events.length;
+
+  const turning = browser.click("option", { option: "accept_burden" });
+  await settle();
+  await browser.runTimer(1000);
+  await turning;
+
+  const events = browser.events.slice(eventStart);
+  assert.match(browser.root.innerHTML, /旅途暂告一段落/);
+  assert.ok(!events.some((event) => event.type === "voice-prepare"));
+  assert.ok(!events.some((event) => event.type === "audio-play"));
 });
 
 test("completed story opens its ending with a home link and without emotion text", async () => {
@@ -1373,6 +1413,60 @@ test("choosing a story option immediately pauses the previous voice playback", a
 
   assert.equal(browser.audioInstances[0].paused, true);
   assert.doesNotMatch(browser.root.innerHTML, /正在整理这段回应/);
+});
+
+test("leaving the story journey stops active voice playback", async () => {
+  const browser = makeBrowser({ hash: "#/stories", storage: { "wanderer-player-name": "清岚" }, voiceEnabled: true });
+  await browser.click("select-story", { replayId: "demo_guarded_path" });
+  await browser.setRoute("#/game");
+  assert.equal(browser.audioInstances.some((audio) => !audio.paused), true);
+
+  await browser.setRoute("#home");
+
+  assert.equal(browser.audioInstances.every((audio) => audio.paused), true);
+});
+
+test("leaving free chat stops active voice playback", async () => {
+  const browser = makeBrowser({
+    hash: "#/chat",
+    storage: { "wanderer-player-name": "清岚" },
+    voiceEnabled: true,
+  });
+  await browser.click("start-chat");
+  await browser.submitChat("你好");
+  assert.equal(browser.audioInstances.some((audio) => !audio.paused), true);
+
+  await browser.setRoute("#/intro");
+
+  assert.equal(browser.audioInstances.every((audio) => audio.paused), true);
+});
+
+test("leaving free chat while a streamed reply is speaking keeps the home route after late chunks", async () => {
+  const browser = makeBrowser({
+    hash: "#/chat",
+    storage: { "wanderer-player-name": "清岚" },
+    voiceEnabled: true,
+    streamChat: true,
+    deferStreamReads: true,
+    deferAudioEnd: true,
+    chatStreamChunks: ["第一句。", "第二句。"],
+  });
+  await browser.click("start-chat");
+
+  browser.submitChatPending("你好");
+  await settle();
+  browser.releaseNextStreamEvent();
+  await settle();
+  assert.equal(browser.audioInstances.some((audio) => !audio.paused), true);
+
+  await browser.setRoute("#home");
+  assert.match(browser.root.innerHTML, /风起异途/);
+
+  browser.releaseNextStreamEvent();
+  await settle();
+  browser.releaseNextStreamEvent();
+  await settle();
+  assert.match(browser.root.innerHTML, /风起异途/);
 });
 
 test("story replies auto-play without voice controls, while chat uses a pause button", async () => {

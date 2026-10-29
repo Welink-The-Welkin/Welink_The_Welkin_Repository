@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 将“风起异途”改成全中文可读、无重复台词、具有状态驱动分支，并接入可配置的 DeepSeek 兼容实时模型。
+**Goal:** 将”风起异途”改成全中文可读、无重复台词、具有状态驱动分支,并接入可配置的 DeepSeek 兼容实时模型。
 
 **Architecture:** 前端负责展示层翻译、历史记录去重和稳定的用户文本；后端保留核心状态机契约，扩展离线回放为状态驱动的长剧情，并将实时模型配置集中到环境变量。模型客户端使用 OpenAI Chat Completions 兼容协议，因此只需替换端点、模型名和密钥即可切换供应商。
 
