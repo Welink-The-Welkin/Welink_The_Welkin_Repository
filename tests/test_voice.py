@@ -24,22 +24,22 @@ def _load_launcher():
     return module
 
 
-def test_tts_config_uses_existing_character_checkpoint_and_cpu_compatible_v2pro():
+def test_tts_config_uses_configured_checkpoint_and_cpu_compatible_v2pro():
     launcher = _load_launcher()
-    root = Path("C:/GPT-SoVITS-v2pro-20250604")
+    root = Path("C:/path/to/GPT-SoVITS")
 
     config = launcher.build_tts_config(root, "cpu")
 
     assert config["custom"]["device"] == "cpu"
     assert config["custom"]["version"] == "v2Pro"
     assert config["custom"]["is_half"] is False
-    assert config["custom"]["t2s_weights_path"] == str(root / "GPT_weights_v2Pro" / "流浪者-e15.ckpt")
+    assert config["custom"]["t2s_weights_path"] == str(root / "GPT_weights_v2Pro" / "model.ckpt")
     assert config["custom"]["vits_weights_path"] == str(root / "GPT_SoVITS" / "pretrained_models" / "v2Pro" / "s2Gv2Pro.pth")
 
 
-def test_default_voice_reference_uses_a_known_training_cut_with_its_transcript(tmp_path, monkeypatch):
+def test_default_voice_reference_uses_a_configurable_placeholder_path(tmp_path, monkeypatch):
     launcher = _load_launcher()
-    reference = tmp_path / "logs" / "wanderer" / "5-wav32k" / "6.1流浪者全语音无音效无背景音乐（自用）.mp3_0000716160_0000856960.wav"
+    reference = tmp_path / "logs" / "wanderer" / "reference.wav"
     reference.parent.mkdir(parents=True)
     reference.write_bytes(WAV_BYTES)
     monkeypatch.delenv("WANDERER_TTS_REFERENCE_AUDIO", raising=False)
@@ -48,7 +48,25 @@ def test_default_voice_reference_uses_a_known_training_cut_with_its_transcript(t
     settings = launcher.voice_config(tmp_path, "cpu")
 
     assert settings["reference_audio"] == reference.resolve()
-    assert settings["prompt_text"] == "可别让我失望.这世上没有纯粹的自由."
+    assert settings["prompt_text"] == ""
+
+
+def test_gpt_sovits_root_uses_a_generic_home_directory_by_default(tmp_path, monkeypatch):
+    launcher = _load_launcher()
+    root = tmp_path / "GPT-SoVITS"
+    for relative in (
+        "api_v2.py",
+        "runtime/python.exe",
+        "GPT_weights_v2Pro/model.ckpt",
+        "GPT_SoVITS/pretrained_models/v2Pro/s2Gv2Pro.pth",
+    ):
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+    monkeypatch.delenv("GPT_SOVITS_ROOT", raising=False)
+    monkeypatch.setattr(launcher.Path, "home", lambda: tmp_path)
+
+    assert launcher.resolve_root() == root.resolve()
 
 
 def test_voice_config_auto_selects_a_usable_cuda_runtime(tmp_path, monkeypatch):

@@ -2,13 +2,9 @@
 
 GitHub 保存代码和运行自动测试；Render 运行游戏，提供队员可以打开的网址。本项目同时包含 Python/FastAPI 后端和前端，请部署为 **Web Service**，不能只使用 GitHub Pages 或 Static Site。
 
-## 一、这次报错与修复
+## 一、发布前检查
 
-截图中的 `FileNotFoundError` 来自 `tests/test_frontend.py`：测试原来读取项目上一级的 `IMPLEMENT_SPEC.md`。你电脑上可能有这个文件，但 GitHub 只下载仓库内的文件，所以出现 225 项通过、1 项失败。
-
-现在测试改为读取仓库内的 `docs/IMPLEMENT_SPEC.md`，文档也补齐为独立规格，不再要求上传项目上一级目录。另外，根目录的 `.python-version` 将 Render 的 Python 版本设为 3.11，与 GitHub Actions 使用的版本系列一致。
-
-这些修改目前在本地。需要按照下一节提交、推送，GitHub 才会检查修复后的版本。旧的失败记录会保留；应查看新提交对应的运行结果。
+只发布项目源代码、测试、部署配置和必要的公开资源。不要把 `.env`、API 密钥、数据库、语音模型、参考音频、训练数据、缓存、个人截图或本机路径加入提交。提交前检查 GitHub Desktop 的差异，并确认 GitHub Actions 对当前提交运行成功。
 
 ## 二、先用 GitHub Desktop 上传这次修复
 
@@ -19,11 +15,7 @@ GitHub 保存代码和运行自动测试；Render 运行游戏，提供队员可
 3. 通过 **Repository → Show in Explorer** 确认打开的是你正在修改的项目目录。
 4. 通过 **Repository → Repository settings → Remote** 查看远程地址，也可用 **Repository → View on GitHub** 打开核对。
 
-本次检查到当前项目的 `origin` 是：
-
-<https://github.com/Kanpeki-Kesshou/Welink-The-Welkin-Repository>
-
-这是 `Kanpeki-Kesshou` 账号下的仓库。名称相同、所有者不同的组织仓库是另一个仓库，**推送当前仓库不会自动更新组织里的另一份仓库**。首次部署先选上述地址对应的仓库；以后若更换地址，也要相应调整 Render 的连接。
+请在 GitHub Desktop 中确认选择的是你实际要维护的目标仓库和分支。不要把个人账号、私有仓库地址、访问令牌或其他凭据写入代码、文档或截图。
 
 ### 2. 提交修改
 
@@ -54,7 +46,7 @@ GitHub 保存代码和运行自动测试；Render 运行游戏，提供队员可
 1. 打开 <https://render.com/>，注册或登录。
 2. 在控制台选择 **New → Web Service**。
 3. 在 Git 提供商区域选择连接 GitHub，完成授权。至少允许 Render 访问上述项目仓库。
-4. 返回 Render，找到 `Kanpeki-Kesshou / Welink-The-Welkin-Repository`，点击 **Connect**。
+4. 返回 Render，找到你实际要部署的目标仓库，点击 **Connect**。
 5. 如果列表中找不到仓库，进入 GitHub 的 Render 应用安装设置，检查授权范围后再刷新。若将来用组织仓库，还需要该组织允许应用访问。
 
 为了后续自动部署，请通过 GitHub 集成连接仓库。仅用“Public Git Repository”输入公开地址创建的服务，不具备同样的自动部署能力。
@@ -89,6 +81,8 @@ GitHub 保存代码和运行自动测试；Render 运行游戏，提供队员可
 | `WANDERER_DATABASE_PATH` | `data/sessions.db` |
 
 先用离线模式验收：剧情和自由对话能运行；自由对话使用预设回复，不会调用实时模型，不需要密钥。
+
+语音不需要上传任何私有模型或参考音频到 Render。Render 无法启动本机 GPT-SoVITS 时，网页会自动改用队员浏览器提供的中文语音；本机配置了 GPT-SoVITS 的 Windows 启动方式仍会优先使用本地角色音色。
 
 在 **Advanced** 或服务设置中找到 **Health Check Path**，填写 `/api/health`。如果创建页没有此字段，创建后到 **Settings** 修改。
 

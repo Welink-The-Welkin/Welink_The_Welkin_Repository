@@ -138,7 +138,7 @@ def _cache_path(text: str) -> Path:
             text,
             _reference_audio(),
             _prompt_text(),
-            os.getenv("WANDERER_TTS_GPT_WEIGHTS", "") or f"{root}/GPT_weights_v2Pro/流浪者-e15.ckpt",
+            os.getenv("WANDERER_TTS_GPT_WEIGHTS", "") or f"{root}/GPT_weights_v2Pro/model.ckpt",
             os.getenv("WANDERER_TTS_SOVITS_WEIGHTS", "") or f"{root}/GPT_SoVITS/pretrained_models/v2Pro/s2Gv2Pro.pth",
             json.dumps(_tts_parameters(), ensure_ascii=False, sort_keys=True, separators=(",", ":")),
         )).encode("utf-8")

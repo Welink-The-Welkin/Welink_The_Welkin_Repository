@@ -167,6 +167,7 @@ const appState = {
   voiceSequence: 0,
   voiceAbortController: null,
   voiceAudio: null,
+  voiceSpeech: null,
   voicePlayer: null,
   voiceUnlocked: false,
   voiceObjectUrl: null,
@@ -323,9 +324,9 @@ function announce(message) {
 }
 
 function voicePauseMarkup(text = "") {
-  if (!appState.voiceAudio || !appState.activeVoiceText) return "";
+  if ((!appState.voiceAudio && !appState.voiceSpeech) || !appState.activeVoiceText) return "";
   if (text && appState.activeVoiceText !== text) return "";
-  const paused = appState.voiceAudio.paused;
+  const paused = appState.voiceAudio ? appState.voiceAudio.paused : Boolean(appState.voiceSpeech?.paused);
   return `<button class="chat-action voice-pause-action" type="button" data-action="pause-voice" aria-pressed="${paused}" title="${paused ? "继续朗读" : "暂停朗读"}">${paused ? "继续朗读" : "暂停朗读"}</button>`;
 }
 
@@ -341,6 +342,11 @@ function stopVoice(shouldRender = true) {
   appState.voiceStopWaiters.clear();
   appState.voiceAbortController?.abort();
   appState.voiceAbortController = null;
+  if (appState.voiceSpeech) {
+    const speech = appState.voiceSpeech;
+    appState.voiceSpeech = null;
+    speech.synth.cancel?.();
+  }
   const audios = new Set(appState.preparedVoiceAudios);
   if (appState.voiceAudio) audios.add(appState.voiceAudio);
   if (appState.voicePlayer?.muted || appState.voicePlayer?.loop) audios.add(appState.voicePlayer);
@@ -363,6 +369,71 @@ function voicePlayer() {
   if (typeof Audio !== "function") return null;
   if (!appState.voicePlayer) appState.voicePlayer = new Audio();
   return appState.voicePlayer;
+}
+
+function browserSpeech() {
+  const synth = window.speechSynthesis;
+  const Utterance = typeof SpeechSynthesisUtterance === "function"
+    ? SpeechSynthesisUtterance
+    : window.SpeechSynthesisUtterance;
+  if (!synth || typeof synth.speak !== "function" || typeof Utterance !== "function") return null;
+  return { synth, Utterance };
+}
+
+function browserSpeechAvailable() {
+  return Boolean(browserSpeech());
+}
+
+function browserUtterance(text, Utterance) {
+  const utterance = new Utterance(text);
+  utterance.lang = "zh-CN";
+  utterance.rate = 0.95;
+  utterance.pitch = 1;
+  return utterance;
+}
+
+function playBrowserVoice(text, { beforePlay = null, shouldRender = true, signal = null } = {}) {
+  const speech = browserSpeech();
+  if (!speech || !text || signal?.aborted) return false;
+  stopVoice(false);
+  const sequence = ++appState.voiceSequence;
+  const utterance = browserUtterance(text, speech.Utterance);
+  const state = { synth: speech.synth, utterance, text, paused: false };
+  appState.voiceSpeech = state;
+  appState.activeVoiceText = text;
+  let startTimeoutId;
+  const finish = () => {
+    if (appState.voiceSpeech !== state) return;
+    window.clearTimeout?.(startTimeoutId);
+    appState.voiceSpeech = null;
+    appState.activeVoiceText = null;
+    if (shouldRender) renderVoiceState();
+  };
+  utterance.onstart = async () => {
+    if (sequence !== appState.voiceSequence || signal?.aborted || appState.voiceSpeech !== state) {
+      speech.synth.cancel?.();
+      return;
+    }
+    if (typeof beforePlay === "function") await beforePlay();
+    if (sequence !== appState.voiceSequence || signal?.aborted || appState.voiceSpeech !== state) return;
+    if (shouldRender) renderVoiceState();
+  };
+  utterance.onend = finish;
+  utterance.onerror = finish;
+  startTimeoutId = window.setTimeout(() => {
+    finish();
+    speech.synth.cancel?.();
+  }, voiceSynthesisTimeout(text));
+  signal?.addEventListener?.("abort", () => {
+    if (appState.voiceSpeech === state) stopVoice(false);
+  }, { once: true });
+  try {
+    speech.synth.speak(utterance);
+    return true;
+  } catch {
+    finish();
+    return false;
+  }
 }
 
 function unlockVoiceFromGesture() {
@@ -437,7 +508,7 @@ function waitForVoicePlayable(audio, signal, timeoutMs = 0) {
 }
 
 async function playVoice(text, { automatic = false, waitUntilPlayable = false, beforePlay = null, shouldRender = true, signal = null } = {}) {
-  if (!text || typeof Audio !== "function") return false;
+  if (!text || (typeof Audio !== "function" && !browserSpeechAvailable())) return false;
   if (appState.activeVoiceText === text && appState.voiceAudio) {
     appState.voiceAudio.currentTime = 0;
     if (typeof beforePlay === "function") await beforePlay();
@@ -447,7 +518,8 @@ async function playVoice(text, { automatic = false, waitUntilPlayable = false, b
   stopVoice(false);
   const sequence = ++appState.voiceSequence;
   const ready = automatic ? await waitForVoiceAvailability(VOICE_STATUS_TIMEOUT_MS) : appState.voiceAvailable;
-  if (sequence !== appState.voiceSequence || !ready) return false;
+  if (sequence !== appState.voiceSequence) return false;
+  if (!ready) return playBrowserVoice(text, { beforePlay, shouldRender, signal });
   let audio = null;
   let timeoutId;
   const timeout = new Promise((resolve) => {
@@ -494,7 +566,7 @@ async function playVoice(text, { automatic = false, waitUntilPlayable = false, b
     stopVoice(false);
     if (!automatic) announce("语音服务暂不可用，文字对话仍可继续。");
     window.setTimeout(loadVoiceStatus, 2000);
-    return false;
+    return playBrowserVoice(text, { beforePlay, shouldRender, signal });
   } finally {
     window.clearTimeout?.(timeoutId);
   }
@@ -516,7 +588,12 @@ function disposePreparedVoice(audio) {
 async function prepareStreamingVoice(text, signal, sequence, availability) {
   let available = appState.voiceAvailable;
   if (!available) available = await availability;
-  if (!available || signal?.aborted || sequence !== appState.voiceSequence || typeof Audio !== "function") return null;
+  if (!available) {
+    return browserSpeechAvailable() && !signal?.aborted && sequence === appState.voiceSequence
+      ? { speech: true, text }
+      : null;
+  }
+  if (signal?.aborted || sequence !== appState.voiceSequence || typeof Audio !== "function") return null;
 
   let audio = voicePlayer();
   if (!audio || appState.preparedVoiceAudios.has(audio) || (appState.voiceAudio === audio && !audio.ended)) {
@@ -541,12 +618,17 @@ async function prepareStreamingVoice(text, signal, sequence, availability) {
 }
 
 function prepareStoryReplyVoice(text) {
-  if (!text || typeof Audio !== "function") return null;
+  if (!text || (typeof Audio !== "function" && !browserSpeechAvailable())) return null;
   const controller = new AbortController();
   const sequence = ++appState.voiceSequence;
   appState.voiceAbortController = controller;
   const availability = waitForVoiceAvailability(VOICE_STATUS_TIMEOUT_MS);
-  const prepared = prepareStreamingVoice(text, controller.signal, sequence, availability);
+  const prepared = (async () => {
+    const available = appState.voiceAvailable || await availability;
+    if (controller.signal.aborted || sequence !== appState.voiceSequence) return null;
+    if (available) return prepareStreamingVoice(text, controller.signal, sequence, Promise.resolve(true));
+    return browserSpeechAvailable() ? { speech: true, text } : null;
+  })();
   return { controller, signal: controller.signal, sequence, prepared };
 }
 
@@ -573,7 +655,85 @@ function playStoryReplyIfOngoing(state, response) {
   if (preparation) void playPreparedStoryReply(preparation);
 }
 
+async function playPreparedBrowserVoiceAndWait(prepared, signal, sequence, releaseText) {
+  const speech = browserSpeech();
+  const text = prepared?.text;
+  if (!speech || !text || signal?.aborted || sequence !== appState.voiceSequence) return false;
+
+  const utterance = browserUtterance(text, speech.Utterance);
+  const state = { synth: speech.synth, utterance, text, paused: false };
+  appState.voiceSpeech = state;
+  appState.activeVoiceText = text;
+  let releasePromise = null;
+  let resolveStarted;
+  let resolveEnded;
+  let settled = false;
+  const started = new Promise((resolve) => { resolveStarted = resolve; });
+  const ended = new Promise((resolve) => { resolveEnded = resolve; });
+  const release = () => {
+    if (!releasePromise) releasePromise = Promise.resolve(typeof releaseText === "function" ? releaseText() : undefined);
+    return releasePromise;
+  };
+  const cleanup = () => {
+    signal?.removeEventListener?.("abort", onAbort);
+    appState.voiceStopWaiters.delete(onAbort);
+    if (appState.voiceSpeech === state) {
+      appState.voiceSpeech = null;
+      appState.activeVoiceText = null;
+      renderVoiceState();
+    }
+  };
+  const finish = (outcome) => {
+    if (settled) return;
+    settled = true;
+    resolveStarted(outcome);
+    resolveEnded();
+  };
+  const onStart = () => {
+    if (signal?.aborted || sequence !== appState.voiceSequence || appState.voiceSpeech !== state) {
+      finish("cancelled");
+      return;
+    }
+    window.clearTimeout?.(startTimeoutId);
+    void release();
+    renderVoiceState();
+    resolveStarted("playing");
+  };
+  const onEnd = () => finish("ended");
+  const onError = () => finish("failed");
+  const onAbort = () => {
+    finish("cancelled");
+    speech.synth.cancel?.();
+  };
+  utterance.onstart = onStart;
+  utterance.onend = onEnd;
+  utterance.onerror = onError;
+  signal?.addEventListener?.("abort", onAbort, { once: true });
+  appState.voiceStopWaiters.add(onAbort);
+  const startTimeoutId = window.setTimeout(() => {
+    finish("failed");
+    speech.synth.cancel?.();
+  }, voiceSynthesisTimeout(text));
+  try {
+    speech.synth.speak(utterance);
+    const outcome = await started;
+    if (outcome !== "playing") {
+      if (outcome === "failed" && !signal?.aborted && sequence === appState.voiceSequence) await release();
+      return false;
+    }
+    await release();
+    await ended;
+    return !signal?.aborted && sequence === appState.voiceSequence;
+  } catch {
+    return false;
+  } finally {
+    window.clearTimeout?.(startTimeoutId);
+    cleanup();
+  }
+}
+
 async function playPreparedVoiceAndWait(prepared, signal, sequence, releaseText) {
+  if (prepared?.speech) return playPreparedBrowserVoiceAndWait(prepared, signal, sequence, releaseText);
   const { audio, text } = prepared;
   if (signal?.aborted || sequence !== appState.voiceSequence) {
     disposePreparedVoice(audio);
@@ -639,7 +799,15 @@ async function playPreparedVoiceAndWait(prepared, signal, sequence, releaseText)
     const outcome = await started;
     window.clearTimeout?.(startTimeoutId);
     if (outcome !== "playing") {
-      if (outcome === "failed" && !signal?.aborted && sequence === appState.voiceSequence) await release();
+      if (outcome === "failed" && !signal?.aborted && sequence === appState.voiceSequence) {
+        appState.voiceAvailable = false;
+        window.setTimeout(loadVoiceStatus, 2000);
+        if (browserSpeechAvailable()) {
+          disposePreparedVoice(audio);
+          return await playPreparedBrowserVoiceAndWait({ speech: true, text }, signal, sequence, releaseText);
+        }
+        await release();
+      }
       return false;
     }
     await release();
@@ -721,10 +889,11 @@ function createStreamingVoiceQueue(signal, releaseText) {
 
       ensureLookahead();
       const item = items[0];
-      const prepared = await waitForSelectedVoice(item);
+      let prepared = await waitForSelectedVoice(item);
       if (isCancelled()) return;
       if (!prepared && !appState.voiceAvailable) {
-        textOnly = true;
+        if (browserSpeechAvailable()) prepared = { speech: true, text: item.text };
+        else textOnly = true;
       }
       if (textOnly) {
         await releaseTextOnlyItems();
@@ -768,6 +937,18 @@ function createStreamingVoiceQueue(signal, releaseText) {
 }
 
 function pauseVoice() {
+  if (appState.voiceSpeech) {
+    const speech = appState.voiceSpeech;
+    if (speech.paused) {
+      speech.synth.resume?.();
+      speech.paused = false;
+    } else {
+      speech.synth.pause?.();
+      speech.paused = true;
+    }
+    renderVoiceState();
+    return;
+  }
   const audio = appState.voiceAudio;
   if (!audio) return;
   if (audio.paused) {

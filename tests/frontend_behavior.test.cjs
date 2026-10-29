@@ -35,11 +35,12 @@ function storySession({ id = "story-1", finished = false, history = [] } = {}) {
   };
 }
 
-function makeBrowser({ hash = "#home", storage = {}, providerError = false, deferRegenerate = false, regenerateError = false, deleteChatError = false, deferDeleteChat = false, deferChat = false, deferChatDespiteAbort = false, deferChatCancel = false, chatCancelFailures = 0, chatCancelCommitted = false, chatHistory = [], deferStoryTurn = false, finishStoryTurn = false, deferVoice = false, deferVoiceAfter = 0, deferVoiceStatus = false, deferAudioReady = false, deferAudioStart = false, deferAudioEnd = false, deferStreamReads = false, suppressAudioPlaying = false, audioRequiresGesture = false, voiceEnabled = false, voiceReadyAfter = 0, voiceError = false, streamChat = false, chatStreamChunks = ["第一句。", "第二句！"], chatReply = "我听见了。" } = {}) {
+function makeBrowser({ hash = "#home", storage = {}, providerError = false, deferRegenerate = false, regenerateError = false, deleteChatError = false, deferDeleteChat = false, deferChat = false, deferChatDespiteAbort = false, deferChatCancel = false, chatCancelFailures = 0, chatCancelCommitted = false, chatHistory = [], deferStoryTurn = false, finishStoryTurn = false, deferVoice = false, deferVoiceAfter = 0, deferVoiceStatus = false, deferAudioReady = false, deferAudioStart = false, deferAudioEnd = false, deferStreamReads = false, suppressAudioPlaying = false, audioRequiresGesture = false, voiceEnabled = false, browserSpeech = false, voiceReadyAfter = 0, voiceError = false, streamChat = false, chatStreamChunks = ["第一句。", "第二句！"], chatReply = "我听见了。" } = {}) {
   const listeners = {};
   const calls = [];
   const events = [];
   const audioPlayback = [];
+  const speechPlayback = [];
   const audioInstances = [];
   const timerDelays = [];
   const values = new Map(Object.entries(storage));
@@ -424,6 +425,46 @@ function makeBrowser({ hash = "#home", storage = {}, providerError = false, defe
     }
     pause() { this.paused = true; }
   }
+  class FakeSpeechSynthesisUtterance {
+    constructor(text) {
+      this.text = text;
+      this.lang = "";
+      this.rate = 1;
+      this.pitch = 1;
+      this.onstart = null;
+      this.onend = null;
+      this.onerror = null;
+    }
+  }
+  const speechSynthesis = {
+    speaking: false,
+    paused: false,
+    current: null,
+    speak(utterance) {
+      this.current = utterance;
+      this.speaking = true;
+      this.paused = false;
+      speechPlayback.push(utterance.text);
+      utterance.onstart?.();
+    },
+    cancel() {
+      if (!this.current) return;
+      this.current.onerror?.({ error: "canceled" });
+      this.current = null;
+      this.speaking = false;
+      this.paused = false;
+    },
+    pause() { this.paused = true; },
+    resume() { this.paused = false; },
+    finish() {
+      const utterance = this.current;
+      if (!utterance) return;
+      this.current = null;
+      this.speaking = false;
+      this.paused = false;
+      utterance.onend?.();
+    },
+  };
   const context = {
     document,
     window,
@@ -435,7 +476,9 @@ function makeBrowser({ hash = "#home", storage = {}, providerError = false, defe
     TextDecoder,
     URL: { createObjectURL: () => "blob:voice-response", revokeObjectURL() {} },
     AbortController: FakeAbortController,
+    SpeechSynthesisUtterance: browserSpeech ? FakeSpeechSynthesisUtterance : undefined,
   };
+  if (browserSpeech) context.window.speechSynthesis = speechSynthesis;
   vm.runInNewContext(source, context, { filename: "frontend/app.js" });
 
   return {
@@ -445,11 +488,14 @@ function makeBrowser({ hash = "#home", storage = {}, providerError = false, defe
     values,
     clipboardWrites,
     audioPlayback,
+    speechPlayback,
     audioInstances,
     timerDelays,
     get chatInputDisabled() { return chatInputControl.disabled; },
     get currentChatDeleteDisabled() { return deleteChatControl.disabled; },
     get streamReaderCancelled() { return streamReaderCancelled; },
+    get speechPaused() { return Boolean(speechSynthesis.paused); },
+    get speechSpeaking() { return Boolean(speechSynthesis.speaking); },
     get serverChatMessages() { return serverChatMessages.map((message) => ({ ...message })); },
     async runNextTimer() {
       const timer = timers.shift();
@@ -560,6 +606,7 @@ function makeBrowser({ hash = "#home", storage = {}, providerError = false, defe
     resolveAudioEnd() {
       [...audioInstances].reverse().find((audio) => !audio.paused && !audio.ended)?.finish();
     },
+    resolveSpeechEnd() { speechSynthesis.finish(); },
     releaseNextStreamEvent() {
       const release = resolveStreamRead;
       resolveStreamRead = undefined;
@@ -1401,6 +1448,83 @@ test("free chat reply offers copy and regenerate shortcuts", async () => {
 
   await browser.click("copy-reply", { index: "0" });
   assert.deepEqual(browser.clipboardWrites, ["我听见了。"]);
+});
+
+test("story replies use browser Chinese speech when the local voice service is unavailable", async () => {
+  const browser = makeBrowser({
+    hash: "#/stories",
+    storage: { "wanderer-player-name": "清岚" },
+    browserSpeech: true,
+  });
+
+  await browser.click("select-story", { replayId: "demo_guarded_path" });
+
+  assert.deepEqual(browser.speechPlayback, ["沿着这条线索继续查。"]);
+  assert.equal(browser.audioPlayback.length, 0);
+});
+
+test("story replies fall back to browser speech when configured TTS audio cannot play", async () => {
+  const browser = makeBrowser({
+    hash: "#/stories",
+    storage: { "wanderer-player-name": "清岚" },
+    browserSpeech: true,
+    voiceEnabled: true,
+    voiceError: true,
+  });
+
+  await browser.click("select-story", { replayId: "demo_guarded_path" });
+
+  assert.deepEqual(browser.speechPlayback, ["沿着这条线索继续查。"]);
+});
+
+test("free chat uses pausable browser Chinese speech when the local voice service is unavailable", async () => {
+  const browser = makeBrowser({
+    hash: "#/chat",
+    storage: { "wanderer-player-name": "清岚" },
+    browserSpeech: true,
+  });
+  await browser.click("start-chat");
+  await browser.submitChat("你好");
+
+  assert.deepEqual(browser.speechPlayback, ["我听见了。"]);
+  assert.equal(browser.speechSpeaking, true);
+  assert.match(browser.root.innerHTML, /data-action="pause-voice"/);
+
+  await browser.click("pause-voice");
+  assert.equal(browser.speechPaused, true);
+  assert.match(browser.root.innerHTML, /继续朗读/);
+  await browser.click("pause-voice");
+  assert.equal(browser.speechPaused, false);
+
+  await browser.setRoute("#home");
+  assert.equal(browser.speechSpeaking, false);
+});
+
+test("streamed chat speaks each reply chunk in order when the local voice service is unavailable", async () => {
+  const browser = makeBrowser({
+    hash: "#/chat",
+    storage: { "wanderer-player-name": "清岚" },
+    browserSpeech: true,
+    streamChat: true,
+    chatStreamChunks: ["第一句。", "第二句！"],
+  });
+  await browser.click("start-chat");
+  browser.submitChatPending("你好");
+  await settle();
+
+  assert.deepEqual(browser.speechPlayback, ["第一句。"]);
+  assert.match(browser.root.innerHTML, /第一句/);
+  assert.doesNotMatch(browser.root.innerHTML, /第二句/);
+
+  browser.resolveSpeechEnd();
+  await settle();
+
+  assert.deepEqual(browser.speechPlayback, ["第一句。", "第二句！"]);
+  assert.match(browser.root.innerHTML, /第二句/);
+
+  browser.resolveSpeechEnd();
+  await settle();
+  assert.match(browser.root.innerHTML, /第一句。第二句！/);
 });
 
 test("choosing a story option immediately pauses the previous voice playback", async () => {
