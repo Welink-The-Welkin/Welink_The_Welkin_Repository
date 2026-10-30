@@ -64,8 +64,13 @@ if (-not (Test-Path ".venv\Scripts\python.exe")) {
 $pythonPath = Join-Path $projectRoot ".venv\Scripts\python.exe"
 if (-not (Test-PythonImports -PythonPath $pythonPath -ImportStatement "import fastapi, uvicorn")) {
     Write-Host "未检测到项目依赖，首次启动需要联网安装。"
-    & $pythonPath -m pip install -r requirements.txt
-    if ($LASTEXITCODE -ne 0) { throw "依赖安装失败；请检查 Python 和网络后重试。" }
+    $fallbackIndexUrl = $env:WANDERER_PIP_FALLBACK_INDEX_URL
+    if ([string]::IsNullOrWhiteSpace($fallbackIndexUrl)) {
+        $fallbackIndexUrl = "https://pypi.tuna.tsinghua.edu.cn/simple"
+    }
+    if (-not (Install-WandererDependencies -PythonPath $pythonPath -RequirementsPath (Join-Path $projectRoot "requirements.txt") -FallbackIndexUrl $fallbackIndexUrl)) {
+        throw "依赖安装失败；请检查 Python、网络或备用 pip 镜像后重试。"
+    }
 }
 
 # Voice is optional. The launcher reads WANDERER_TTS_* from the project .env,
