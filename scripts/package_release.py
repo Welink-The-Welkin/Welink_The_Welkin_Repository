@@ -36,7 +36,6 @@ EXCLUDED_DIRS = {
     "dist",
     "node_modules",
     ".idea",
-    "superpowers",
 }
 EXCLUDED_PREFIXES = (
     ".pytest-basetemp",
@@ -50,12 +49,7 @@ EXCLUDED_PREFIXES = (
     "wanderer-integration-",
 )
 EXCLUDED_SUFFIXES = (".pyc", ".pyo", ".db", ".db-shm", ".db-wal", ".log")
-EXCLUDED_NAMES = {
-    ".browser-flow.html",
-    "HANDOFF.md",
-    "IMPLEMENTATION_PLAN.md",
-    "codearts-handoff.md",
-}
+EXCLUDED_NAMES = {".browser-flow.html"}
 
 
 def _is_excluded(relative: Path, output: Path) -> bool:

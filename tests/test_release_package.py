@@ -79,29 +79,6 @@ def test_upload_package_includes_app_but_excludes_local_secrets_and_history(tmp_
         assert all("PRIVATE_TEST_VALUE" not in archive.read(name).decode("utf-8") for name in names)
 
 
-def test_upload_package_excludes_internal_workflow_documents(tmp_path):
-    project = make_project(tmp_path)
-    internal_files = {
-        "HANDOFF.md": "PRIVATE_WORKFLOW_NOTE",
-        "IMPLEMENTATION_PLAN.md": "PRIVATE_WORKFLOW_NOTE",
-        "docs/codearts-handoff.md": "PRIVATE_WORKFLOW_NOTE",
-        "docs/superpowers/plans/private-plan.md": "PRIVATE_WORKFLOW_NOTE",
-        "docs/superpowers/specs/private-spec.md": "PRIVATE_WORKFLOW_NOTE",
-    }
-    for relative, content in internal_files.items():
-        target = project / relative
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8")
-    output = tmp_path / "upload.zip"
-
-    result = run_packager(project, output)
-
-    assert result.returncode == 0, result.stderr
-    with ZipFile(output) as archive:
-        names = set(archive.namelist())
-        assert not any(name.endswith(relative) for relative in internal_files for name in names)
-
-
 def test_incomplete_project_fails_without_replacing_an_existing_archive(tmp_path):
     project = make_project(tmp_path)
     (project / "frontend/app.js").unlink()

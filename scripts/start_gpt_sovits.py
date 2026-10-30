@@ -1,4 +1,4 @@
-"""Start a local GPT-SoVITS v2Pro server when voice is enabled."""
+"""Start the user's local GPT-SoVITS v2Pro server when voice is enabled."""
 
 from __future__ import annotations
 
@@ -16,8 +16,8 @@ from urllib.request import urlopen
 
 
 DEFAULT_PORT = 9880
-DEFAULT_VOICE_REFERENCE = Path("logs/wanderer/reference.wav")
-DEFAULT_VOICE_PROMPT = ""
+DEFAULT_VOICE_REFERENCE = Path("logs/wanderer/5-wav32k/6.1流浪者全语音无音效无背景音乐（自用）.mp3_0000716160_0000856960.wav")
+DEFAULT_VOICE_PROMPT = "可别让我失望.这世上没有纯粹的自由."
 
 
 def _runtime_has_usable_cuda(root: Path) -> bool:
@@ -59,7 +59,7 @@ def build_tts_config(root: Path, device: str = "cpu") -> dict:
             "device": device,
             "is_half": device == "cuda",
             "version": "v2Pro",
-            "t2s_weights_path": os.getenv("WANDERER_TTS_GPT_WEIGHTS", "").strip() or str(root / "GPT_weights_v2Pro" / "model.ckpt"),
+            "t2s_weights_path": os.getenv("WANDERER_TTS_GPT_WEIGHTS", "").strip() or str(root / "GPT_weights_v2Pro" / "流浪者-e15.ckpt"),
             "vits_weights_path": os.getenv("WANDERER_TTS_SOVITS_WEIGHTS", "").strip() or str(root / "GPT_SoVITS" / "pretrained_models" / "v2Pro" / "s2Gv2Pro.pth"),
             "bert_base_path": str(root / "GPT_SoVITS" / "pretrained_models" / "chinese-roberta-wwm-ext-large"),
             "cnhuhbert_base_path": str(root / "GPT_SoVITS" / "pretrained_models" / "chinese-hubert-base"),
@@ -69,12 +69,12 @@ def build_tts_config(root: Path, device: str = "cpu") -> dict:
 
 def resolve_root() -> Path:
     configured = os.getenv("GPT_SOVITS_ROOT", "").strip()
-    root = Path(configured).expanduser() if configured else Path.home() / "GPT-SoVITS"
+    root = Path(configured).expanduser() if configured else Path.home() / "Desktop" / "GPT-SoVITS-v2pro-20250604"
     root = root.resolve()
     required = (
         root / "api_v2.py",
         root / "runtime" / "python.exe",
-        root / "GPT_weights_v2Pro" / "model.ckpt",
+        root / "GPT_weights_v2Pro" / "流浪者-e15.ckpt",
         root / "GPT_SoVITS" / "pretrained_models" / "v2Pro" / "s2Gv2Pro.pth",
     )
     missing = [str(path) for path in required if not path.is_file()]

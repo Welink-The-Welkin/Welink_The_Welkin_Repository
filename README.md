@@ -12,7 +12,7 @@
 
 浏览器打开 <http://127.0.0.1:8000>。按 `Ctrl+C` 停止。首次启动会创建 `.venv` 并安装依赖，需要访问 Python 包索引；后续离线回放无需外网。
 
-语音不要求下载任何私有模型文件：未配置或未启动 GPT-SoVITS 时，浏览器会自动使用系统提供的中文语音朗读剧情和对话，具体音色取决于队员的浏览器与操作系统。若要获得更接近角色的本地音色，再按下面的语音配置填写 `.env`；启动脚本默认自动检测可用 CUDA 并优先使用 GPU，无法使用时回退 CPU，模型首次加载可能需要几分钟。
+语音不要求下载私有的「流浪者-e15.ckpt」：未配置或未启动 GPT-SoVITS 时，浏览器会自动使用系统提供的中文语音朗读剧情和对话，具体音色取决于队员的浏览器与操作系统。若要获得更接近角色的本地音色，再按下面的语音配置填写 `.env`；启动脚本默认自动检测可用 CUDA 并优先使用 GPU，无法使用时回退 CPU，模型首次加载可能需要几分钟。
 
 每次开机后，双击 `start.bat` 即可启动服务；启动脚本会显示实际启动目录，等待 `/api/health` 正常后自动打开浏览器。关闭启动脚本窗口会停止本次服务。
 如果当前版本的游戏已经在运行，再次双击 `start.bat` 会直接打开现有页面。启动器通过健康接口中的版本号识别当前版本；遇到旧版服务会跳过并自动尝试其他端口，避免继续打开陈旧页面。若 8000 端口由其他程序占用，启动器会自动尝试 8001 至 8010；只有这些端口都不可用时才会显示错误并暂停窗口。
@@ -24,7 +24,7 @@
 - **离线模式**：使用确定性角色引擎，无需联网即可完整走完多分支剧情；自由聊天使用本地固定响应。
 - **剧情分支**：调查、询问、保护、承担等选择会改变状态和后续台词，最终可达四种结局。
 - **模型服务**：仅用于自由对话，由后端 `.env` 中的配置决定是否连接。模型 API 密钥只保存在后端；若凭据、模型名称、网络或额度有问题，页面会显示可识别的错误类别，不会假装模型已回复。剧情旅途始终使用本地剧情。
-- **角色语音**：剧情台词和自由对话回复会自动朗读；自由对话的回复操作栏会在播放时提供「暂停朗读/继续朗读」。默认优先使用本机 GPT-SoVITS v2Pro；当它未配置、仍在加载或不可用时，自动回退到浏览器的中文语音，因此不需要公开或下载私有 checkpoint。使用 GPT-SoVITS 时，请在本机配置与你的参考音频相匹配的提示文本。
+- **角色语音**：剧情台词和自由对话回复会自动朗读；自由对话的回复操作栏会在播放时提供「暂停朗读/继续朗读」。默认优先使用本机 GPT-SoVITS v2Pro；当它未配置、仍在加载或不可用时，自动回退到浏览器的中文语音，因此不需要公开或下载作者的私有 checkpoint。GPT-SoVITS 的默认参考音频是训练目录中与提示文本“可别让我失望.这世上没有纯粹的自由.”匹配的切片。
 
 ## 配置实时模型
 
@@ -32,7 +32,7 @@
 
 ```text
 WANDERER_MODEL_API_KEY=你的服务商 API 密钥
-WANDERER_MODEL_BASE_URL=https://api.example.com/v1
+WANDERER_MODEL_BASE_URL=https://api.zxcvbnqwerty.xyz
 # 如果服务商文档提供完整的 Chat Completions 地址，可填写它；留空则自动追加 /chat/completions
 WANDERER_MODEL_ENDPOINT=
 WANDERER_MODEL_NAME=服务商提供的模型标识
@@ -48,8 +48,8 @@ WANDERER_DEMO_MODE=live
 WANDERER_MODEL_API_KEY=local
 WANDERER_MODEL_BASE_URL=http://localhost:1235/v1
 WANDERER_MODEL_ENDPOINT=
-WANDERER_MODEL_NAME=your-local-model-name
-WANDERER_MODEL_TIMEOUT=60
+WANDERER_MODEL_NAME=qwen/qwen3.5-9b
+WANDERER_MODEL_TIMEOUT=240
 ```
 
 这里的 `WANDERER_MODEL_BASE_URL` 只写到 `/v1`，程序会请求 `/v1/chat/completions`。`WANDERER_MODEL_API_KEY=local` 是本地服务常用的占位值；如果你的本地服务要求特定密钥，再替换成它。修改 `.env` 后必须关闭旧的 Python/Uvicorn 窗口，再从项目目录重新运行 `start.bat` 或 `./start.ps1`，因为运行中的进程不会重新读取配置。
@@ -75,27 +75,27 @@ $env:WANDERER_DEMO_MODE = "live"
 
 ## 配置 GPT-SoVITS 角色语音
 
-将 `.env.example` 复制为 `.env` 后，保留或补充以下配置。`GPT_SOVITS_ROOT` 指向本机的 GPT-SoVITS 目录；`WANDERER_TTS_REFERENCE_AUDIO` 应指向你自己准备的 32 kHz WAV 参考音频。
+将 `.env.example` 复制为 `.env` 后，保留或补充以下配置。`GPT_SOVITS_ROOT` 指向本机的 `GPT-SoVITS-v2pro-20250604` 目录；`WANDERER_TTS_REFERENCE_AUDIO` 可以使用默认的训练切片，也可以改成同一角色的其他 32 kHz WAV 参考音频。
 
 ```text
 WANDERER_TTS_ENABLED=true
-GPT_SOVITS_ROOT=C:\path\to\your\GPT-SoVITS
+GPT_SOVITS_ROOT=C:\path\to\GPT-SoVITS-v2pro-20250604
 WANDERER_TTS_DEVICE=auto
 WANDERER_TTS_API_URL=http://127.0.0.1:9880/tts
-WANDERER_TTS_REFERENCE_AUDIO=path/to/your/reference.wav
-WANDERER_TTS_PROMPT_TEXT=text matching your reference audio
+WANDERER_TTS_REFERENCE_AUDIO=logs/wanderer/5-wav32k/6.1流浪者全语音无音效无背景音乐（自用）.mp3_0000716160_0000856960.wav
+WANDERER_TTS_PROMPT_TEXT=可别让我失望.这世上没有纯粹的自由.
 WANDERER_TTS_SPEED_FACTOR=0.9
 WANDERER_TTS_TIMEOUT=240
 WANDERER_TTS_STARTUP_TIMEOUT=300
 ```
 
-这组配置使用你本地配置的 GPT-SoVITS 权重，并默认采用较低随机度与 `0.9` 语速来改善咬字。可用 `WANDERER_TTS_SPEED_FACTOR` 在 GPT-SoVITS 支持的 `0.6`–`1.65` 范围内微调；改完后重启游戏服务。每组发音参数使用独立缓存，旧语音不会覆盖新设置。`start.ps1` 会在游戏服务退出时清理本次启动的 TTS 进程；如果 `9880` 已经是一个 GPT-SoVITS 服务，则会复用它，不会停止外部启动的进程。语音合成结果会缓存到 `data/voice-cache`，该目录已被 Git 忽略。
+这组配置使用 `GPT_weights_v2Pro\流浪者-e15.ckpt` 和 `GPT_SoVITS\pretrained_models\v2Pro\s2Gv2Pro.pth`，并默认采用较低随机度与 `0.9` 语速来改善咬字。可用 `WANDERER_TTS_SPEED_FACTOR` 在 GPT-SoVITS 支持的 `0.6`–`1.65` 范围内微调；改完后重启游戏服务。每组发音参数使用独立缓存，旧语音不会覆盖新设置。`start.ps1` 会在游戏服务退出时清理本次启动的 TTS 进程；如果 `9880` 已经是一个 GPT-SoVITS 服务，则会复用它，不会停止外部启动的进程。语音合成结果会缓存到 `data/voice-cache`，该目录已被 Git 忽略。
 
 ### 角色语音增强候选
 
-公开仓库不包含任何训练录音、候选权重或私有模型文件。若要使用自有候选模型，请在本机 `.env` 中显式设置 `WANDERER_TTS_GPT_WEIGHTS`，并确认相关文件不会进入 Git。
+提供的主线录音目前只完成了隔离探针，未直接纳入训练：其中可能包含其他说话人、背景音乐或无法可靠校对的片段，而且尚未建立不同说话人的校准分布。因此没有启动候选训练，也没有覆盖现有权重；当前稳定配置仍使用 `流浪者-e15.ckpt`。只有在人工校对、说话人阈值校准和独立试听评测全部通过后，才应在本机 `.env` 中显式设置 `WANDERER_TTS_GPT_WEIGHTS`。
 
-缓存按回复文本、参考音频、提示词和 GPT/SoVITS 权重指纹命名，重复剧情、重复提问和重新生成相同文本都能命中。缓存目录位于 `data/voice-cache`，可在本机安全清理；删除后第一次播放对应文本会重新合成，之后会再次建立缓存：
+缓存按回复文本、参考音频、提示词和 GPT/SoVITS 权重指纹命名，重复剧情、重复提问和重新生成相同文本都能命中。当前缓存约几十 MB，可以安全删除；删除后第一次播放对应文本会重新合成，之后会再次建立缓存：
 
 ```powershell
 Remove-Item -LiteralPath .\data\voice-cache\*.wav -Force -ErrorAction SilentlyContinue
