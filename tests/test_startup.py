@@ -1,4 +1,7 @@
 from pathlib import Path
+import shutil
+import subprocess
+import sys
 
 
 ROOT = Path(__file__).parents[1]
@@ -30,6 +33,47 @@ def test_start_script_reuses_the_existing_wanderer_game_service():
 
     assert "/api/health" in powershell
     assert "游戏服务已在运行" in powershell
+
+
+def test_dependency_probe_handles_missing_imports_without_terminating_powershell(tmp_path):
+    powershell = shutil.which("powershell.exe") or shutil.which("pwsh") or shutil.which("powershell")
+    if powershell is None:
+        import pytest
+
+        pytest.skip("PowerShell is required for the native-command integration test")
+
+    helper = ROOT / "scripts" / "python_import_check.ps1"
+    helper_path = str(helper).replace("'", "''")
+    python_path = sys.executable.replace("'", "''")
+    probe = tmp_path / "dependency_probe.ps1"
+    probe.write_text(
+        "\n".join(
+            (
+                "$ErrorActionPreference = 'Stop'",
+                f". '{helper_path}'",
+                f"$python = '{python_path}'",
+                "if (-not (Test-PythonImports -PythonPath $python -ImportStatement 'import sys')) { throw 'valid imports were rejected' }",
+                "if ($ErrorActionPreference -ne 'Stop') { throw 'error preference was not restored after success' }",
+                "if (Test-PythonImports -PythonPath $python -ImportStatement 'import wanderer_missing_test_dependency') { throw 'missing import was accepted' }",
+                "if ($ErrorActionPreference -ne 'Stop') { throw 'error preference was not restored after failure' }",
+                "Write-Output 'dependency probe recovered from missing import'",
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [powershell, "-NoProfile", "-File", str(probe)],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "dependency probe recovered from missing import" in result.stdout
+
+    launcher = (ROOT / "start.ps1").read_text(encoding="utf-8")
+    assert 'Test-PythonImports -PythonPath $pythonPath -ImportStatement "import fastapi, uvicorn"' in launcher
 
 
 def test_start_script_warns_and_avoids_reusing_an_old_game_version():

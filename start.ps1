@@ -6,6 +6,7 @@ param(
 $ErrorActionPreference = "Stop"
 $projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $projectRoot
+. (Join-Path $projectRoot "scripts\python_import_check.ps1")
 
 $voiceLauncher = $null
 $voiceSessionFile = Join-Path $env:TEMP ("wanderer-game-voice-" + [guid]::NewGuid().ToString("N") + ".json")
@@ -61,8 +62,7 @@ if (-not (Test-Path ".venv\Scripts\python.exe")) {
 }
 
 $pythonPath = Join-Path $projectRoot ".venv\Scripts\python.exe"
-& $pythonPath -c "import fastapi, uvicorn" 2>$null
-if ($LASTEXITCODE -ne 0) {
+if (-not (Test-PythonImports -PythonPath $pythonPath -ImportStatement "import fastapi, uvicorn")) {
     Write-Host "未检测到项目依赖，首次启动需要联网安装。"
     & $pythonPath -m pip install -r requirements.txt
     if ($LASTEXITCODE -ne 0) { throw "依赖安装失败；请检查 Python 和网络后重试。" }
