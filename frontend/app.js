@@ -7,6 +7,12 @@ const STORY_REPLY_PLACEHOLDER_MS = 1000;
 const VOICE_STATUS_TIMEOUT_MS = 15000;
 const VOICE_SYNTHESIS_TIMEOUT_MAX_MS = 240000;
 const VOICE_UNLOCK_WAV = "data:audio/wav;base64,UklGRiYAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YQIAAAAAAA==";
+let modelSettingsChannel = null;
+try {
+  if (typeof BroadcastChannel === "function") modelSettingsChannel = new BroadcastChannel("wanderer-model-settings");
+} catch {
+  modelSettingsChannel = null;
+}
 
 // 背景图片路径映射
 const BACKGROUND_IMAGES = {
@@ -148,6 +154,17 @@ const appState = {
   pausedChat: null,
   chatDraft: "",
   chatAbortController: null,
+  modelSettings: null,
+  modelSettingsRemembered: false,
+  modelProviders: [],
+  modelProvidersLoading: false,
+  modelProvidersLoaded: false,
+  modelTestAbortController: null,
+  modelOperationAbortController: null,
+  modelSettingsTestError: null,
+  actionableRetry: null,
+  retryWaitTimer: null,
+  retryAfterSeconds: null,
   chatCancellation: null,
   chatRequestToken: 0,
   regeneratingChat: false,
@@ -159,6 +176,10 @@ const appState = {
   resumePromptDismissed: false,
   busy: false,
   pendingTurn: null,
+  voiceMode: "text",
+  voiceModeSelected: false,
+  compatibilityVoiceAvailable: false,
+  voiceDiagnostics: [],
   voiceAvailable: false,
   voiceConfigured: false,
   voiceStatusChecked: false,
@@ -174,6 +195,274 @@ const appState = {
   preparedVoiceAudios: new Set(),
   voiceStopWaiters: new Set(),
 };
+
+const MODEL_SETTINGS_STORAGE_KEY = "wanderer-model-settings-v1";
+const MODEL_CLEAR_SIGNAL_KEY = "wanderer-model-settings-clear-v1";
+const LEGACY_MODEL_STORAGE_KEYS = ["wanderer-model-settings", "wanderer-model-api-key", "wanderer-api-key"];
+const VOICE_SETTINGS_STORAGE_KEY = "wanderer-voice-settings-v1";
+
+function loadVoiceModeSettings() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(VOICE_SETTINGS_STORAGE_KEY) || "null");
+    if (saved && ["trained", "compatibility", "text"].includes(saved.mode)) return saved.mode;
+  } catch {
+    // A malformed optional saved record is treated as absent.
+  }
+  return "text";
+}
+
+function saveVoiceModeSettings() {
+  localStorage.setItem(VOICE_SETTINGS_STORAGE_KEY, JSON.stringify({ mode: appState.voiceMode }));
+  appState.voiceModeSelected = true;
+}
+
+function defaultModelSettings() {
+  return { provider: "", endpoint: "", model: "", api_key: "" };
+}
+
+function loadModelSettings() {
+  const defaults = defaultModelSettings();
+  try {
+    const saved = JSON.parse(localStorage.getItem(MODEL_SETTINGS_STORAGE_KEY) || "null");
+    if (saved && saved.remembered === true
+      && typeof saved.endpoint === "string"
+      && typeof saved.model === "string"
+      && typeof saved.api_key === "string") {
+      appState.modelSettingsRemembered = true;
+      return {
+        provider: typeof saved.provider === "string" ? saved.provider : "",
+        endpoint: saved.endpoint,
+        model: saved.model,
+        api_key: saved.api_key,
+      };
+    }
+  } catch {
+    // A malformed optional saved record is treated as absent.
+  }
+  appState.modelSettingsRemembered = false;
+  return defaults;
+}
+
+function saveModelSettings(remember = appState.modelSettingsRemembered) {
+  appState.modelSettingsRemembered = Boolean(remember);
+  if (appState.modelSettingsRemembered) {
+    const settings = appState.modelSettings || defaultModelSettings();
+    localStorage.setItem(MODEL_SETTINGS_STORAGE_KEY, JSON.stringify({ ...settings, remembered: true }));
+  } else {
+    localStorage.removeItem(MODEL_SETTINGS_STORAGE_KEY);
+  }
+}
+
+function modelRequestPayload() {
+  const settings = appState.modelSettings || defaultModelSettings();
+  if (!settings.endpoint?.trim() || !settings.model?.trim() || !settings.api_key?.trim()) return null;
+  return { endpoint: settings.endpoint, model: settings.model, api_key: settings.api_key };
+}
+
+function syncModelSettingsFromForm() {
+  if (window.location.hash !== "#/settings/model") return;
+  const read = (name) => root.querySelector(`[name="${name}"]`)?.value;
+  const endpoint = read("endpoint");
+  const model = read("model");
+  const apiKey = read("api_key");
+  if (endpoint === undefined && model === undefined && apiKey === undefined) return;
+  appState.modelSettings = {
+    ...(appState.modelSettings || defaultModelSettings()),
+    endpoint: String(endpoint || ""),
+    model: String(model || ""),
+    api_key: String(apiKey || ""),
+  };
+}
+
+function clearModelSettings({ broadcast = true } = {}) {
+  appState.modelTestAbortController?.abort();
+  appState.modelTestAbortController = null;
+  appState.modelOperationAbortController?.abort();
+  appState.modelOperationAbortController = null;
+  appState.chatRequestToken += 1;
+  appState.chatAbortController?.abort();
+  appState.chatAbortController = null;
+  appState.chatCancellation?.controller?.abort();
+  appState.chatDraft = appState.chatDraft || appState.pendingChat?.message || appState.pausedChat?.draft || "";
+  appState.pendingChat = null;
+  appState.pausedChat = null;
+  appState.chatCancellation = null;
+  appState.regeneratingChat = false;
+  appState.actionableRetry = null;
+  if (appState.retryWaitTimer !== null) window.clearTimeout(appState.retryWaitTimer);
+  appState.retryWaitTimer = null;
+  appState.retryAfterSeconds = null;
+  appState.modelSettings = defaultModelSettings();
+  appState.modelSettingsRemembered = false;
+  appState.modelSettingsTestError = null;
+  stopVoice(false);
+  appState.busy = false;
+  localStorage.removeItem(MODEL_SETTINGS_STORAGE_KEY);
+  localStorage.removeItem(MODEL_CLEAR_SIGNAL_KEY);
+  for (const key of LEGACY_MODEL_STORAGE_KEYS) {
+    localStorage.removeItem(key);
+    sessionStorage.removeItem(key);
+  }
+  sessionStorage.removeItem(MODEL_SETTINGS_STORAGE_KEY);
+  sessionStorage.removeItem(MODEL_CLEAR_SIGNAL_KEY);
+  if (broadcast) broadcastModelClear();
+  if (window.location.hash === "#/settings/model") renderModelSettings();
+  else if (window.location.hash === "#/chat") renderChat();
+  root.querySelectorAll("button,input").forEach((control) => { control.disabled = false; });
+}
+
+function broadcastModelClear() {
+  modelSettingsChannel?.postMessage({ type: "clear" });
+  try {
+    localStorage.setItem(MODEL_CLEAR_SIGNAL_KEY, String(Date.now()));
+    localStorage.removeItem(MODEL_CLEAR_SIGNAL_KEY);
+  } catch {
+    // BroadcastChannel remains available when local storage is restricted.
+  }
+}
+
+function modelSettingsWereCleared(event) {
+  if (event?.key === MODEL_CLEAR_SIGNAL_KEY) {
+    clearModelSettings({ broadcast: false });
+    return;
+  }
+  if (event?.key && event.key !== MODEL_SETTINGS_STORAGE_KEY && !LEGACY_MODEL_STORAGE_KEYS.includes(event.key)) return;
+  if (event?.key && event.newValue !== null) return;
+  clearModelSettings({ broadcast: false });
+}
+
+function renderModelSettings() {
+  if (window.location.hash !== "#/settings/model") return;
+  const settings = appState.modelSettings || defaultModelSettings();
+  const presets = appState.modelProviders.map((provider) => `<option value="${escapeHtml(provider.id)}" ${settings.provider === provider.id ? "selected" : ""}>${escapeHtml(provider.label)}</option>`).join("");
+  root.innerHTML = `
+    <section class="model-settings">
+      <a class="back-link" href="#/chat">← 返回自由对话</a>
+      <div class="eyebrow">自由对话</div>
+      <h1>模型设置</h1>
+      <p class="model-settings-copy">设置仅用于自由对话。API Key 会经本站后端发送给你选择的服务商，网站运营者可能接触到它；服务商用量与费用由你自行承担。Key 默认只保存在当前页面内存中，可选择仅在此设备记住。</p>
+      <div data-model-settings-error></div>
+      <form class="model-settings-form" data-form="model-settings" autocomplete="off">
+        <label for="model-provider">服务商预设</label>
+        <select id="model-provider" name="provider" data-model-preset><option value="">自定义接口</option>${presets}</select>
+        <label for="model-endpoint">接口地址</label>
+        <input id="model-endpoint" name="endpoint" autocomplete="off" value="${escapeHtml(settings.endpoint)}" placeholder="https://example.com/v1">
+        <label for="model-name">模型 ID</label>
+        <input id="model-name" name="model" autocomplete="off" value="${escapeHtml(settings.model)}" placeholder="model-name">
+        <label for="model-key">API Key</label>
+        <input id="model-key" name="api_key" type="password" autocomplete="new-password" placeholder="输入 API Key">
+        <label class="model-remember"><input name="remember" type="checkbox" ${appState.modelSettingsRemembered ? "checked" : ""}> 在此设备记住设置（包含 Key）</label>
+        <div class="model-settings-actions"><button class="primary-btn" type="submit">保存设置</button><button class="primary-btn" type="button" data-action="test-model">测试连接</button><button class="secondary-btn" type="button" data-action="clear-model-settings">清除全部模型设置</button></div>
+      </form>
+      <div data-error></div>
+    </section>`;
+  const keyField = root.querySelector('[name="api_key"]');
+  if (keyField) keyField.value = settings.api_key;
+  if (!appState.modelProvidersLoaded && !appState.modelProvidersLoading) loadModelProviders();
+}
+
+function voiceSettingsDiagnosticMarkup() {
+  const diagnostics = {
+    TTS_NOT_ENABLED: "角色语音未启用，请联系部署者检查 WANDERER_TTS_ENABLED。",
+    TTS_REFERENCE_AUDIO_MISSING: "参考音频不可用，请联系部署者检查 WANDERER_TTS_REFERENCE_AUDIO。",
+    TTS_PROMPT_TEXT_MISSING: "语音提示文本未配置，请联系部署者检查 WANDERER_TTS_PROMPT_TEXT。",
+    TTS_ROOT_MISSING: "语音运行环境不完整，请联系部署者检查 GPT_SOVITS_ROOT。",
+    TTS_WEIGHTS_MISSING: "语音权重不可用，请联系部署者检查 WANDERER_TTS_GPT_WEIGHTS 和 WANDERER_TTS_SOVITS_WEIGHTS。",
+    TTS_API_INVALID: "语音服务地址无效，请联系部署者检查 WANDERER_TTS_API_URL。",
+    TTS_API_UNREACHABLE: "语音服务尚未就绪，请联系部署者启动服务并检查 WANDERER_TTS_API_URL。",
+  };
+  const messages = [...new Set(appState.voiceDiagnostics.map((code) => diagnostics[code]).filter(Boolean))];
+  if (!appState.voiceAvailable && appState.voiceStatusChecked && !messages.length) messages.push("角色语音暂不可用，可保存为文字模式或稍后重试。");
+  if (!messages.length) return "";
+  return `<p class="voice-diagnostic">${messages.map(escapeHtml).join("<br>")}</p>`;
+}
+
+function voiceSettingsButton(mode, label) {
+  const available = mode === "trained"
+    ? appState.voiceAvailable
+    : mode === "compatibility"
+      ? appState.compatibilityVoiceAvailable && browserSpeechAvailable()
+      : true;
+  const selected = appState.voiceMode === mode;
+  const disabled = !available || appState.busy ? " disabled" : "";
+  return `<button class="chat-action voice-setting-btn${selected ? " active" : ""}" type="button" data-action="set-voice-mode" data-voice-mode="${mode}" aria-pressed="${selected}"${disabled}>${label}</button>`;
+}
+
+function renderVoiceSettings() {
+  if (window.location.hash !== "#/settings/voice") return;
+  const retryStatusButton = !appState.voiceAvailable && appState.voiceStatusChecked
+    ? '<button class="secondary-btn" type="button" data-action="retry-voice-status">重试语音状态</button>'
+    : "";
+  root.innerHTML = `
+    <section class="model-settings voice-settings">
+      <a class="back-link" href="#/chat">← 返回自由对话</a>
+      <div class="eyebrow">自由对话</div>
+      <h1>语音设置</h1>
+      <p class="model-settings-copy">选择自由对话和剧情旅途的朗读方式。训练音色不可用时不会静默改用系统音色；请主动选择兼容音色或仅显示文字。</p>
+      <form class="model-settings-form voice-settings-form" data-form="voice-settings" autocomplete="off">
+        <label>朗读方式</label>
+        <div class="voice-settings-options" role="group" aria-label="朗读方式">
+          ${voiceSettingsButton("trained", "角色音色")}
+          ${voiceSettingsButton("compatibility", "使用系统兼容音色")}
+          ${voiceSettingsButton("text", "仅显示文字")}
+        </div>
+        ${voiceSettingsDiagnosticMarkup()}
+        <div class="model-settings-actions"><button class="primary-btn" type="submit">保存设置</button>${retryStatusButton}</div>
+      </form>
+    </section>`;
+}
+
+async function loadModelProviders() {
+  appState.modelProvidersLoading = true;
+  try {
+    const response = await fetch("/api/model/providers", { cache: "no-store" });
+    const body = await response.json();
+    if (!response.ok) throw await responseError(response);
+    appState.modelProviders = Array.isArray(body.data) ? body.data
+      .filter((item) => item && typeof item.id === "string" && typeof item.label === "string")
+      .map((item) => ({ id: item.id, label: item.label, endpoint: String(item.endpoint || ""), default_model: String(item.default_model || "") })) : [];
+    renderModelSettings();
+  } catch {
+    appState.modelProviders = [];
+  } finally {
+    appState.modelProvidersLoading = false;
+    appState.modelProvidersLoaded = true;
+    if (window.location.hash === "#/settings/model") renderModelSettings();
+  }
+}
+
+async function testModelConnection() {
+  syncModelSettingsFromForm();
+  appState.modelSettingsTestError = null;
+  const controller = new AbortController();
+  appState.modelTestAbortController?.abort();
+  appState.modelTestAbortController = controller;
+  setBusy(true);
+  try {
+    const result = await request("/api/model/test", { method: "POST", body: JSON.stringify(modelRequestPayload()), signal: controller.signal, cache: "no-store" });
+    if (appState.modelTestAbortController !== controller) return;
+    const node = root.querySelector("[data-model-settings-error]");
+    if (node) node.innerHTML = `<p class="model-test-success" role="status">连接成功：${escapeHtml(result.model || appState.modelSettings.model)}</p>`;
+  } catch (error) {
+    if (controller.signal.aborted || error?.name === "AbortError") return;
+    const publicError = error instanceof ApiError
+      ? error
+      : new ApiError({
+        code: "MODEL_TEST_UNREACHABLE",
+        message: "无法连接模型测试服务。请检查当前页面网络、HTTPS 站点和后端部署状态后重试。",
+      });
+    appState.modelSettingsTestError = publicError;
+    showActionableError(publicError, () => testModelConnection(), { target: "model" });
+  } finally {
+    if (appState.modelTestAbortController === controller) {
+      appState.modelTestAbortController = null;
+      appState.busy = false;
+      root.querySelectorAll("button,input").forEach((control) => { control.disabled = false; });
+    }
+  }
+}
+
+appState.modelSettings = loadModelSettings();
 
 function readChatHistory() {
   try {
@@ -216,24 +505,57 @@ function createChatStreamId(sessionId, requestSequence) {
 const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]);
 const normalizePlayerName = (value) => Array.from(String(value ?? "").trim()).slice(0, 20).join("");
 
+class ApiError extends Error {
+  constructor({ code = "REQUEST_FAILED", message = "请求失败，请稍后重试。", details = {}, requestId = "" } = {}) {
+    super(message);
+    this.name = "ApiError";
+    this.code = code;
+    this.details = details && typeof details === "object" ? details : {};
+    this.requestId = requestId || "";
+  }
+}
+
+function apiErrorFromBody(body, fallback = "请求失败，请稍后重试。") {
+  const error = body?.error || {};
+  return new ApiError({
+    code: error.code || "REQUEST_FAILED",
+    message: error.message || fallback,
+    details: error.details || {},
+    requestId: body?.request_id || "",
+  });
+}
+
+function safeErrorDetails(error) {
+  const details = error?.details || {};
+  const lines = [error?.requestId ? `本地请求编号：${error.requestId}` : ""];
+  if (details.provider_status) lines.push(`上游状态：HTTP ${details.provider_status}`);
+  if (details.provider_code) lines.push(`服务商错误码：${details.provider_code}`);
+  if (typeof details.model === "string" && /^[A-Za-z0-9_.:-]{1,128}$/.test(details.model)) lines.push(`模型：${details.model}`);
+  if (details.provider_request_id) lines.push(`服务商请求编号：${details.provider_request_id}`);
+  // Endpoint paths are useful diagnostics, but query strings and credentials are never shown.
+  if (details.endpoint) {
+    try {
+      const endpoint = String(details.endpoint).replace(/[?#].*$/, "").replace(/^(https?:\/\/)([^/@]+):[^/@]*@/i, "$1");
+      if (/^https?:\/\/[^\s]+$/i.test(endpoint)) lines.push(`接口地址：${endpoint}`);
+    } catch {
+      // Ignore malformed/untrusted endpoint details.
+    }
+  }
+  return lines.filter(Boolean);
+}
+
+function redactModelSecret(value) {
+  const secret = appState.modelSettings?.api_key;
+  return secret ? String(value).split(secret).join("[Key 已隐藏]") : String(value);
+}
+
 async function request(path, options = {}) {
   const response = await fetch(path, {
     headers: { "Content-Type": "application/json", ...(options.headers || {}) },
     ...options,
   });
   const body = await response.json();
-  if (!response.ok) {
-    const details = body.error?.details || {};
-    const diagnosticLines = [
-      body.request_id ? `本地请求编号：${body.request_id}` : "",
-      details.provider_status ? `上游状态：HTTP ${details.provider_status}` : "",
-      details.provider_code ? `服务商错误码：${details.provider_code}` : "",
-      details.model ? `模型：${details.model}` : "",
-      details.endpoint ? `请求地址：${details.endpoint}` : "",
-      details.provider_request_id ? `服务商请求编号：${details.provider_request_id}` : "",
-    ].filter(Boolean);
-    throw new Error([body.error?.message || "请求失败，请稍后重试。", ...diagnosticLines].join("\n"));
-  }
+  if (!response.ok) throw apiErrorFromBody(body);
   return body.data;
 }
 
@@ -242,18 +564,9 @@ async function responseError(response) {
   try {
     body = await response.json();
   } catch {
-    return new Error("请求失败，请稍后重试。");
+    return new ApiError({ message: "请求失败，请稍后重试。" });
   }
-  const details = body.error?.details || {};
-  const diagnosticLines = [
-    body.request_id ? `本地请求编号：${body.request_id}` : "",
-    details.provider_status ? `上游状态：HTTP ${details.provider_status}` : "",
-    details.provider_code ? `服务商错误码：${details.provider_code}` : "",
-    details.model ? `模型：${details.model}` : "",
-    details.endpoint ? `请求地址：${details.endpoint}` : "",
-    details.provider_request_id ? `服务商请求编号：${details.provider_request_id}` : "",
-  ].filter(Boolean);
-  return new Error([body.error?.message || "请求失败，请稍后重试。", ...diagnosticLines].join("\n"));
+  return apiErrorFromBody(body);
 }
 
 function parseSseFrame(frame) {
@@ -305,7 +618,7 @@ async function requestChatReply(path, message, signal, streamId) {
       "Accept": "text/event-stream",
       "X-Chat-Stream-ID": streamId,
     },
-    body: JSON.stringify({ message }),
+    body: JSON.stringify({ message, model: modelRequestPayload() }),
     signal,
   });
   if (!response.ok) throw await responseError(response);
@@ -330,10 +643,30 @@ function voicePauseMarkup(text = "") {
   return `<button class="chat-action voice-pause-action" type="button" data-action="pause-voice" aria-pressed="${paused}" title="${paused ? "继续朗读" : "暂停朗读"}">${paused ? "继续朗读" : "暂停朗读"}</button>`;
 }
 
+function setVoiceMode(mode) {
+  if (appState.busy || appState.pendingChat) return;
+  if (mode === "trained" && !appState.voiceAvailable) return;
+  if (mode === "compatibility" && (!appState.compatibilityVoiceAvailable || !browserSpeechAvailable())) return;
+  if (!["trained", "compatibility", "text"].includes(mode)) return;
+  stopVoice(false);
+  appState.voiceMode = mode;
+  appState.voiceModeSelected = true;
+  if (mode === "trained") unlockVoiceFromGesture();
+  renderVoiceState();
+}
+
+function markVoiceUnavailable() {
+  appState.voiceAvailable = false;
+  if (!appState.voiceModeSelected && appState.voiceMode === "trained") appState.voiceMode = "text";
+  appState.voiceDiagnostics = [];
+  renderVoiceState();
+}
+
 function renderVoiceState() {
   if (appState.pendingChat?.streaming) return;
   if (window.location.hash === "#/chat") renderChat();
   else if (window.location.hash === "#/game" && appState.session) renderRoute();
+  else if (window.location.hash === "#/settings/voice") renderVoiceSettings();
 }
 
 function stopVoice(shouldRender = true) {
@@ -393,6 +726,7 @@ function browserUtterance(text, Utterance) {
 }
 
 function playBrowserVoice(text, { beforePlay = null, shouldRender = true, signal = null } = {}) {
+  if (appState.voiceMode !== "compatibility" || !appState.compatibilityVoiceAvailable) return false;
   const speech = browserSpeech();
   if (!speech || !text || signal?.aborted) return false;
   stopVoice(false);
@@ -457,6 +791,7 @@ function resolveVoiceStatusWaiters(available) {
 }
 
 function waitForVoiceAvailability(timeoutMs = VOICE_STATUS_TIMEOUT_MS) {
+  if (appState.voiceMode === "compatibility" || (appState.voiceModeSelected && appState.voiceMode === "text")) return Promise.resolve(false);
   if (appState.voiceAvailable) return Promise.resolve(true);
   if (appState.voiceStatusChecked && !appState.voiceConfigured) return Promise.resolve(false);
   return new Promise((resolve) => {
@@ -509,6 +844,8 @@ function waitForVoicePlayable(audio, signal, timeoutMs = 0) {
 
 async function playVoice(text, { automatic = false, waitUntilPlayable = false, beforePlay = null, shouldRender = true, signal = null } = {}) {
   if (!text || (typeof Audio !== "function" && !browserSpeechAvailable())) return false;
+  if (appState.voiceMode === "compatibility") return playBrowserVoice(text, { beforePlay, shouldRender, signal });
+  if (appState.voiceModeSelected && appState.voiceMode === "text") return false;
   if (appState.activeVoiceText === text && appState.voiceAudio) {
     appState.voiceAudio.currentTime = 0;
     if (typeof beforePlay === "function") await beforePlay();
@@ -519,12 +856,12 @@ async function playVoice(text, { automatic = false, waitUntilPlayable = false, b
   const sequence = ++appState.voiceSequence;
   const ready = automatic ? await waitForVoiceAvailability(VOICE_STATUS_TIMEOUT_MS) : appState.voiceAvailable;
   if (sequence !== appState.voiceSequence) return false;
-  if (!ready) return playBrowserVoice(text, { beforePlay, shouldRender, signal });
+  if (!ready || appState.voiceMode !== "trained") return false;
   let audio = null;
   let timeoutId;
   const timeout = new Promise((resolve) => {
     timeoutId = window.setTimeout(() => {
-      appState.voiceAvailable = false;
+      markVoiceUnavailable();
       stopVoice(false);
       window.setTimeout(loadVoiceStatus, 2000);
       resolve(false);
@@ -562,11 +899,12 @@ async function playVoice(text, { automatic = false, waitUntilPlayable = false, b
     return started;
   } catch (error) {
     if (sequence !== appState.voiceSequence) return false;
-    appState.voiceAvailable = false;
+    markVoiceUnavailable();
     stopVoice(false);
     if (!automatic) announce("语音服务暂不可用，文字对话仍可继续。");
     window.setTimeout(loadVoiceStatus, 2000);
-    return playBrowserVoice(text, { beforePlay, shouldRender, signal });
+    renderVoiceState();
+    return false;
   } finally {
     window.clearTimeout?.(timeoutId);
   }
@@ -586,13 +924,15 @@ function disposePreparedVoice(audio) {
 }
 
 async function prepareStreamingVoice(text, signal, sequence, availability) {
-  let available = appState.voiceAvailable;
-  if (!available) available = await availability;
-  if (!available) {
-    return browserSpeechAvailable() && !signal?.aborted && sequence === appState.voiceSequence
+  if (appState.voiceMode === "compatibility") {
+    return appState.compatibilityVoiceAvailable && browserSpeechAvailable() && !signal?.aborted && sequence === appState.voiceSequence
       ? { speech: true, text }
       : null;
   }
+  if (appState.voiceModeSelected && appState.voiceMode === "text") return null;
+  let available = appState.voiceAvailable;
+  if (!available) available = await availability;
+  if (!available || appState.voiceMode !== "trained") return null;
   if (signal?.aborted || sequence !== appState.voiceSequence || typeof Audio !== "function") return null;
 
   let audio = voicePlayer();
@@ -612,6 +952,7 @@ async function prepareStreamingVoice(text, signal, sequence, availability) {
   const ready = await playable;
   if (!ready || signal?.aborted || sequence !== appState.voiceSequence) {
     disposePreparedVoice(audio);
+    if (!ready && !signal?.aborted && sequence === appState.voiceSequence) markVoiceUnavailable();
     return null;
   }
   return { audio, text };
@@ -619,16 +960,12 @@ async function prepareStreamingVoice(text, signal, sequence, availability) {
 
 function prepareStoryReplyVoice(text) {
   if (!text || (typeof Audio !== "function" && !browserSpeechAvailable())) return null;
+  if (appState.voiceModeSelected && appState.voiceMode === "text") return null;
   const controller = new AbortController();
   const sequence = ++appState.voiceSequence;
   appState.voiceAbortController = controller;
   const availability = waitForVoiceAvailability(VOICE_STATUS_TIMEOUT_MS);
-  const prepared = (async () => {
-    const available = appState.voiceAvailable || await availability;
-    if (controller.signal.aborted || sequence !== appState.voiceSequence) return null;
-    if (available) return prepareStreamingVoice(text, controller.signal, sequence, Promise.resolve(true));
-    return browserSpeechAvailable() ? { speech: true, text } : null;
-  })();
+  const prepared = prepareStreamingVoice(text, controller.signal, sequence, availability);
   return { controller, signal: controller.signal, sequence, prepared };
 }
 
@@ -656,6 +993,7 @@ function playStoryReplyIfOngoing(state, response) {
 }
 
 async function playPreparedBrowserVoiceAndWait(prepared, signal, sequence, releaseText) {
+  if (appState.voiceMode !== "compatibility" || !appState.compatibilityVoiceAvailable) return false;
   const speech = browserSpeech();
   const text = prepared?.text;
   if (!speech || !text || signal?.aborted || sequence !== appState.voiceSequence) return false;
@@ -725,6 +1063,7 @@ async function playPreparedBrowserVoiceAndWait(prepared, signal, sequence, relea
     await ended;
     return !signal?.aborted && sequence === appState.voiceSequence;
   } catch {
+    try { await release(); } catch { /* release is best effort after speech failure */ }
     return false;
   } finally {
     window.clearTimeout?.(startTimeoutId);
@@ -800,12 +1139,8 @@ async function playPreparedVoiceAndWait(prepared, signal, sequence, releaseText)
     window.clearTimeout?.(startTimeoutId);
     if (outcome !== "playing") {
       if (outcome === "failed" && !signal?.aborted && sequence === appState.voiceSequence) {
-        appState.voiceAvailable = false;
+        markVoiceUnavailable();
         window.setTimeout(loadVoiceStatus, 2000);
-        if (browserSpeechAvailable()) {
-          disposePreparedVoice(audio);
-          return await playPreparedBrowserVoiceAndWait({ speech: true, text }, signal, sequence, releaseText);
-        }
         await release();
       }
       return false;
@@ -860,7 +1195,7 @@ function createStreamingVoiceQueue(signal, releaseText) {
     return Promise.race([item.prepared, timeout]).then((prepared) => {
       window.clearTimeout?.(timeoutId);
       if (prepared || !timedOut) return prepared;
-      appState.voiceAvailable = false;
+      markVoiceUnavailable();
       window.setTimeout(loadVoiceStatus, 2000);
       item.prepared.then((latePrepared) => {
         if (latePrepared) disposePreparedVoice(latePrepared.audio);
@@ -892,7 +1227,7 @@ function createStreamingVoiceQueue(signal, releaseText) {
       let prepared = await waitForSelectedVoice(item);
       if (isCancelled()) return;
       if (!prepared && !appState.voiceAvailable) {
-        if (browserSpeechAvailable()) prepared = { speech: true, text: item.text };
+        if (appState.voiceMode === "compatibility" && appState.compatibilityVoiceAvailable && browserSpeechAvailable()) prepared = { speech: true, text: item.text };
         else textOnly = true;
       }
       if (textOnly) {
@@ -963,12 +1298,16 @@ function pauseVoice() {
 
 async function loadVoiceStatus() {
   try {
-    const result = await request("/api/voice/status");
+    const result = await request("/api/voice/status", { cache: "no-store" });
+    const wasTrained = appState.voiceMode === "trained";
     appState.voiceConfigured = Boolean(result.configured || result.enabled);
     appState.voiceAvailable = Boolean(result.enabled);
+    appState.compatibilityVoiceAvailable = result.compatibility_voice_available === true;
+    appState.voiceDiagnostics = Array.isArray(result.diagnostics) ? result.diagnostics.map((item) => item?.code) : [];
     appState.voiceStatusChecked = true;
+    if (!appState.voiceModeSelected) appState.voiceMode = appState.voiceAvailable ? "trained" : "text";
     if (!appState.voiceAvailable) {
-      if (appState.voiceAudio || appState.voiceAbortController) {
+      if (wasTrained && (appState.voiceAudio || appState.voiceAbortController)) {
         stopVoice(false);
         renderVoiceState();
       }
@@ -977,14 +1316,18 @@ async function loadVoiceStatus() {
       } else {
         resolveVoiceStatusWaiters(false);
       }
+      renderVoiceState();
       return;
     }
     resolveVoiceStatusWaiters(true);
+    renderVoiceState();
   } catch {
-    appState.voiceAvailable = false;
+    markVoiceUnavailable();
     appState.voiceConfigured = false;
+    appState.compatibilityVoiceAvailable = false;
     appState.voiceStatusChecked = true;
     resolveVoiceStatusWaiters(false);
+    renderVoiceState();
   }
 }
 
@@ -997,6 +1340,35 @@ function setBusy(value) {
       && control.dataset.chatSession === appState.chatSessionId;
     control.disabled = value && control.dataset.action !== "pause-chat" && !keepChatInput && !keepCurrentChatDelete;
   });
+}
+
+function actionableErrorAction(error) {
+  const code = error?.code || "";
+  const status = Number(error?.details?.provider_status);
+  if (code === "MODEL_NOT_CONFIGURED") return { action: "open-model-settings", label: "打开模型设置" };
+  if (code === "MODEL_CONFIGURATION_ERROR" || status === 400 || status === 404) return { action: "edit-model-settings", label: "编辑模型设置" };
+  if (status === 401 || status === 403) return { action: "test-model", label: "检查 Key/权限" };
+  if (code === "MODEL_TIMEOUT") return { action: "edit-model-settings", label: "编辑模型设置" };
+  if (status === 429 || error?.details?.retry_after != null) return { action: "wait-retry", label: "等待后重试" };
+  if (code === "INVALID_AI_RESPONSE" || code === "MODEL_PROVIDER_ERROR") return { action: "retry-chat", label: "重试" };
+  return { action: "retry-chat", label: "重试" };
+}
+
+function showActionableError(error, retry = null, { target = "chat" } = {}) {
+  const resolved = error instanceof Error ? error : new ApiError({ message: String(error || "请求失败，请稍后重试。") });
+  const details = safeErrorDetails(resolved);
+  const action = actionableErrorAction(resolved);
+  if (retry) appState.actionableRetry = retry;
+  appState.retryAfterSeconds = Number(resolved.details?.retry_after) || 0;
+  const message = String(resolved.message || "请求失败，请稍后重试。");
+  const publicMessage = redactModelSecret(message);
+  const lines = [publicMessage.replace(/(https?:\/\/[^\s?#]+)[?#][^\s]*/gi, "$1"), ...details.map(redactModelSecret)];
+  const actionMarkup = action.action === "wait-retry" && resolved.details?.retry_after != null
+    ? `<button class="chat-action" type="button" data-action="wait-retry">${action.label}（${escapeHtml(resolved.details.retry_after)} 秒）</button>`
+    : `<button class="chat-action" type="button" data-action="${action.action}">${action.label}</button>`;
+  const node = root.querySelector(target === "model" ? "[data-model-settings-error]" : "[data-error], [data-chat-error]");
+  if (node) node.innerHTML = `<div class="error-box" role="alert">${escapeHtml(lines.join("\n"))}<div class="error-actions">${actionMarkup}</div></div>`;
+  else announce(resolved.message);
 }
 
 function showError(message) {
@@ -1171,7 +1543,7 @@ function renderChat() {
         <div class="chat-history-list">${chatHistoryMarkup()}</div>
       </aside>
       <section class="chat-panel" aria-label="自由对话">
-        <div class="scene-head"><div><div class="eyebrow">自由对话</div><h1 class="chat-title">与${CHARACTER_NAME}交谈</h1></div></div>
+        <div class="scene-head"><div><div class="eyebrow">自由对话</div><h1 class="chat-title">与${CHARACTER_NAME}交谈</h1></div><div class="scene-head-actions"><a class="secondary-btn model-settings-link" href="#/settings/model">模型设置</a><a class="secondary-btn voice-settings-link" href="#/settings/voice">语音设置</a></div></div>
         <p class="chat-disclaimer">自由对话不改变剧情模式的状态与结局。</p>
         <div class="chat-messages" aria-live="polite">${messageMarkup}</div>
         <div data-chat-error></div>
@@ -1453,7 +1825,7 @@ async function consumeChatEvents(events, { message, signal, requestToken, sessio
         appState.pendingChat.bufferedReply = "";
         releaseText("");
       } else if (event?.type === "error") {
-        throw new Error(event.message || "模型服务暂时无法完成回复，请稍后重试。");
+        throw new ApiError({ code: event.code || "MODEL_PROVIDER_ERROR", message: event.message || "模型服务暂时无法完成回复，请稍后重试。", details: event.details || {} });
       } else if (event?.type === "done") {
         completed = event;
         break;
@@ -1500,7 +1872,7 @@ async function submitChat(message) {
   const requestToken = ++appState.chatRequestToken;
   stopVoice(false);
   unlockVoiceFromGesture();
-  appState.chatDraft = "";
+    appState.chatDraft = "";
   const streamId = createChatStreamId(sessionId, requestToken);
   appState.pendingChat = {
     message,
@@ -1543,8 +1915,9 @@ async function submitChat(message) {
       return;
     }
     appState.pendingChat = null;
+    appState.chatDraft = message;
     renderChat();
-    showError(error.message);
+    showActionableError(error, () => submitChat(message));
   } finally {
     if (requestToken === appState.chatRequestToken) {
       appState.chatAbortController = null;
@@ -1576,6 +1949,7 @@ function pauseChat() {
     streamId: pending.streamId,
     message: pending.message,
     previousMessageCount: pending.previousMessageCount || 0,
+    controller: new AbortController(),
     promise: null,
   };
   const requestCancellation = () => {
@@ -1586,6 +1960,7 @@ function pauseChat() {
           method: "POST",
           headers: { "X-Chat-Stream-ID": pending.streamId },
           keepalive: true,
+          signal: cancellation.controller.signal,
         });
         if (!response.ok) throw await responseError(response);
         const body = await response.json();
@@ -1594,7 +1969,7 @@ function pauseChat() {
         // A false result can mean the server committed just before pause won
         // the network race. Preserve that completed turn, but never resend
         // until the authoritative session confirms it is in history.
-        const completedSession = await request(`/api/chat/sessions/${sessionId}`);
+        const completedSession = await request(`/api/chat/sessions/${sessionId}`, { signal: cancellation.controller.signal });
         const newMessages = completedSession.messages?.slice(cancellation.previousMessageCount) || [];
         const committed = newMessages.some((item) => item.message === cancellation.message);
         if (committed) return { confirmed: true, completedSession };
@@ -1707,10 +2082,14 @@ async function regenerateReply() {
   stopVoice(false);
   unlockVoiceFromGesture();
   appState.regeneratingChat = true;
+  const controller = new AbortController();
+  appState.modelOperationAbortController?.abort();
+  appState.modelOperationAbortController = controller;
   renderChat();
   setBusy(true);
   try {
-    const result = await request(`/api/chat/sessions/${appState.chatSessionId}/regenerate`, { method: "POST" });
+    const result = await request(`/api/chat/sessions/${appState.chatSessionId}/regenerate`, { method: "POST", body: JSON.stringify({ model: modelRequestPayload() }), signal: controller.signal });
+    if (appState.modelOperationAbortController !== controller) return;
     const nextChatSession = { ...appState.chatSession, ...result, session_id: result.session_id || appState.chatSessionId };
     appState.chatSession = nextChatSession;
     appState.regeneratingChat = false;
@@ -1719,12 +2098,16 @@ async function regenerateReply() {
     if (result.response?.reply) void playVoice(result.response.reply, { automatic: true });
     window.setTimeout(() => { appState.revealChatReply = false; }, 700);
   } catch (error) {
+    if (controller.signal.aborted || error?.name === "AbortError") return;
     appState.regeneratingChat = false;
     renderChat();
-    showError(error.message);
+    showActionableError(error, () => regenerateReply());
   } finally {
-    appState.busy = false;
-    root.querySelectorAll("button,input").forEach((control) => { control.disabled = false; });
+    if (appState.modelOperationAbortController === controller) {
+      appState.modelOperationAbortController = null;
+      appState.busy = false;
+      root.querySelectorAll("button,input").forEach((control) => { control.disabled = false; });
+    }
   }
 }
 
@@ -1743,7 +2126,16 @@ root.addEventListener("click", (event) => {
     deleteChatSession(button.dataset.chatSession);
     return;
   }
+  if (button.dataset.action === "clear-model-settings") {
+    clearModelSettings();
+    return;
+  }
+  if (button.dataset.action === "set-voice-mode") {
+    setVoiceMode(button.dataset.voiceMode);
+    return;
+  }
   if (appState.busy) return;
+  if (button.dataset.action === "retry-voice-status") void loadVoiceStatus();
   if (button.dataset.action === "start") startSession();
   if (button.dataset.action === "select-story") selectStory(button.dataset.replayId);
   if (button.dataset.action === "resume-journey" && appState.session && !appState.session.state?.is_finished) {
@@ -1760,6 +2152,29 @@ root.addEventListener("click", (event) => {
   if (button.dataset.action === "restore-chat") restoreChatSession(button.dataset.chatSession);
   if (button.dataset.action === "copy-reply") copyReply(Number(button.dataset.index));
   if (button.dataset.action === "regenerate-reply") regenerateReply();
+  if (button.dataset.action === "test-model") {
+    if (window.location.hash !== "#/settings/model") {
+      window.location.hash = "#/settings/model";
+      renderRoute();
+    }
+    testModelConnection();
+  }
+  if (button.dataset.action === "open-model-settings" || button.dataset.action === "edit-model-settings") {
+    window.location.hash = "#/settings/model";
+    renderRoute();
+  }
+  if (button.dataset.action === "retry-chat" && appState.actionableRetry) appState.actionableRetry();
+  if (button.dataset.action === "wait-retry") {
+    const wait = Number(appState.retryAfterSeconds || 0);
+    if (wait > 0) {
+      appState.retryAfterSeconds = wait;
+      appState.retryWaitTimer = window.setTimeout(() => {
+        appState.retryWaitTimer = null;
+        appState.retryAfterSeconds = null;
+        if (appState.actionableRetry) appState.actionableRetry();
+    }, Math.min(wait * 1000, 86400000));
+    } else if (appState.actionableRetry) appState.actionableRetry();
+  }
 });
 
 let lastRenderedRoute = null;
@@ -1778,6 +2193,8 @@ function renderRoute() {
     renderChat();
     if (!appState.chatSession && appState.chatSessionId) restoreChatSession();
   }
+  else if (route === "#/settings/model") renderModelSettings();
+  else if (route === "#/settings/voice") renderVoiceSettings();
   else renderHome();
   if (appState.resumePromptRequired && appState.session && !appState.session.state?.is_finished && !appState.resumePromptDismissed) {
     root.innerHTML += showResumeDialog();
@@ -1800,6 +2217,23 @@ root.addEventListener("input", (event) => {
   if (event.target.matches("[data-chat-input]")) {
     appState.chatDraft = String(event.target.value || "").slice(0, 1000);
   }
+  if (event.target.matches("[name=endpoint], [name=model], [name=api_key]")) {
+    appState.modelSettings = { ...(appState.modelSettings || defaultModelSettings()), [event.target.name]: String(event.target.value || "") };
+    if (appState.modelSettingsRemembered) saveModelSettings(true);
+  }
+});
+
+root.addEventListener("change", (event) => {
+  if (event.target.matches("[data-model-preset]")) {
+    const preset = appState.modelProviders.find((item) => item.id === event.target.value);
+    if (!preset) return;
+    appState.modelSettings = { ...(appState.modelSettings || defaultModelSettings()), provider: preset.id, endpoint: preset.endpoint, model: preset.default_model };
+    renderModelSettings();
+  }
+  if (event.target.matches('[name="remember"]')) {
+    appState.modelSettingsRemembered = Boolean(event.target.checked);
+    saveModelSettings(appState.modelSettingsRemembered);
+  }
 });
 
 root.addEventListener("submit", (event) => {
@@ -1814,6 +2248,26 @@ root.addEventListener("submit", (event) => {
     else startSession(event.target.dataset.replayId || appState.selectedReplayId);
     return;
   }
+  if (event.target.matches('[data-form="model-settings"]')) {
+    event.preventDefault();
+    const endpoint = event.target.querySelector('[name="endpoint"]')?.value || "";
+    const model = event.target.querySelector('[name="model"]')?.value || "";
+    const apiKey = event.target.querySelector('[name="api_key"]')?.value || "";
+    const provider = event.target.querySelector('[name="provider"]')?.value || "";
+    const remember = Boolean(event.target.querySelector('[name="remember"]')?.checked);
+    appState.modelSettings = { provider, endpoint, model, api_key: apiKey };
+    saveModelSettings(remember);
+    renderModelSettings();
+    announce("模型设置已保存");
+    return;
+  }
+  if (event.target.matches('[data-form="voice-settings"]')) {
+    event.preventDefault();
+    saveVoiceModeSettings();
+    renderVoiceSettings();
+    announce("语音设置已保存");
+    return;
+  }
   if (!event.target.matches('[data-form="chat"]')) return;
   event.preventDefault();
   const input = event.target.querySelector("input");
@@ -1821,6 +2275,13 @@ root.addEventListener("submit", (event) => {
   submitChat(input.value.trim());
 });
 
+window.addEventListener("storage", (event) => modelSettingsWereCleared(event));
+if (modelSettingsChannel) modelSettingsChannel.onmessage = (event) => {
+  if (event?.data?.type === "clear") modelSettingsWereCleared();
+};
+
+appState.voiceMode = loadVoiceModeSettings();
+appState.voiceModeSelected = localStorage.getItem(VOICE_SETTINGS_STORAGE_KEY) !== null;
 renderRoute();
 restoreSession();
 loadVoiceStatus();

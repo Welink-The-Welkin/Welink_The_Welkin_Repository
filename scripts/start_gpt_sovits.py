@@ -10,14 +10,47 @@ import subprocess
 import sys
 import tempfile
 from time import monotonic, sleep
-from urllib.error import URLError
 from urllib.parse import urlsplit
-from urllib.request import urlopen
+
+import httpx
 
 
-DEFAULT_PORT = 9880
-DEFAULT_VOICE_REFERENCE = Path("logs/wanderer/5-wav32k/6.1流浪者全语音无音效无背景音乐（自用）.mp3_0000716160_0000856960.wav")
-DEFAULT_VOICE_PROMPT = "可别让我失望.这世上没有纯粹的自由."
+# Direct script execution puts scripts/, rather than the project, on sys.path.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from backend.app.core.voice_config import (  # noqa: E402
+    DEFAULT_VOICE_REFERENCE, VoiceDiagnostic, VoiceSettings, validate_api_url,
+)
+
+
+class VoiceSetupError(ValueError):
+    """Carry an actionable diagnostic without exposing configured values."""
+
+    def __init__(self, diagnostic: VoiceDiagnostic):
+        self.diagnostic = diagnostic
+        super().__init__(f"{diagnostic.code}: {diagnostic.message} {diagnostic.action}")
+
+
+def _settings() -> VoiceSettings:
+    try:
+        return VoiceSettings.from_env()
+    except ValueError:
+        raise VoiceSetupError(VoiceDiagnostic(
+            "TTS_API_INVALID", "语音 API 地址无效。", ("WANDERER_TTS_API_URL",),
+            "api_url", "设置 WANDERER_TTS_API_URL 为有效的本机 loopback HTTP /tts 地址。",
+        )) from None
+
+
+def _require_settings(settings: VoiceSettings, checks: set[str]) -> None:
+    for diagnostic in settings.diagnostics():
+        if diagnostic.check in checks:
+            raise VoiceSetupError(diagnostic)
+
+
+def _api_unreachable() -> VoiceSetupError:
+    return VoiceSetupError(VoiceDiagnostic(
+        "TTS_API_UNREACHABLE", "GPT-SoVITS API 未能就绪。", ("WANDERER_TTS_API_URL",),
+        "api_ready", "检查 WANDERER_TTS_API_URL 的端口、/openapi.json 的 POST /tts 接口及语音运行环境后重试。",
+    ))
 
 
 def _runtime_has_usable_cuda(root: Path) -> bool:
@@ -51,16 +84,20 @@ def _runtime_has_usable_cuda(root: Path) -> bool:
 
 def build_tts_config(root: Path, device: str = "cpu") -> dict:
     root = Path(root).expanduser().resolve()
+    settings = _settings()
     if device not in {"cpu", "cuda"}:
-        raise ValueError("GPT-SoVITS device must be cpu or cuda")
+        raise VoiceSetupError(VoiceDiagnostic(
+            "TTS_DEVICE_INVALID", "语音计算设备无效。", ("WANDERER_TTS_DEVICE",),
+            "device", "设置 WANDERER_TTS_DEVICE 为 auto、cpu 或 cuda。",
+        ))
 
     return {
         "custom": {
             "device": device,
             "is_half": device == "cuda",
             "version": "v2Pro",
-            "t2s_weights_path": os.getenv("WANDERER_TTS_GPT_WEIGHTS", "").strip() or str(root / "GPT_weights_v2Pro" / "流浪者-e15.ckpt"),
-            "vits_weights_path": os.getenv("WANDERER_TTS_SOVITS_WEIGHTS", "").strip() or str(root / "GPT_SoVITS" / "pretrained_models" / "v2Pro" / "s2Gv2Pro.pth"),
+            "t2s_weights_path": str(settings.gpt_weights.resolve()),
+            "vits_weights_path": str(settings.sovits_weights.resolve()),
             "bert_base_path": str(root / "GPT_SoVITS" / "pretrained_models" / "chinese-roberta-wwm-ext-large"),
             "cnhuhbert_base_path": str(root / "GPT_SoVITS" / "pretrained_models" / "chinese-hubert-base"),
         }
@@ -68,44 +105,41 @@ def build_tts_config(root: Path, device: str = "cpu") -> dict:
 
 
 def resolve_root() -> Path:
-    configured = os.getenv("GPT_SOVITS_ROOT", "").strip()
-    root = Path(configured).expanduser() if configured else Path.home() / "Desktop" / "GPT-SoVITS-v2pro-20250604"
-    root = root.resolve()
-    required = (
-        root / "api_v2.py",
-        root / "runtime" / "python.exe",
-        root / "GPT_weights_v2Pro" / "流浪者-e15.ckpt",
-        root / "GPT_SoVITS" / "pretrained_models" / "v2Pro" / "s2Gv2Pro.pth",
-    )
-    missing = [str(path) for path in required if not path.is_file()]
-    if missing:
-        raise FileNotFoundError("GPT-SoVITS files not found: " + ", ".join(missing))
-    return root
+    settings = _settings()
+    _require_settings(settings, {"enabled", "runtime", "weights"})
+    return settings.root.resolve()
 
 
 def tts_endpoint() -> tuple[str, int]:
-    parsed = urlsplit(os.getenv("WANDERER_TTS_API_URL", f"http://127.0.0.1:{DEFAULT_PORT}/tts"))
-    if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost"} or parsed.path not in {"", "/", "/tts"}:
-        raise ValueError("The GPT-SoVITS API must use the local HTTP server on 127.0.0.1")
-    return parsed.hostname, parsed.port or DEFAULT_PORT
+    try:
+        parsed = urlsplit(validate_api_url(_settings().api_url, mode="local"))
+    except ValueError:
+        raise VoiceSetupError(VoiceDiagnostic(
+            "TTS_API_INVALID", "本机启动器需要 loopback HTTP API 地址。", ("WANDERER_TTS_API_URL",),
+            "api_url", "设置 WANDERER_TTS_API_URL 为本机 loopback HTTP /tts 地址。",
+        )) from None
+    return parsed.hostname, parsed.port or 80
 
 
 def voice_config(root: Path, device: str | None = None) -> dict:
+    voice_settings = _settings()
+    root = Path(root).expanduser().resolve()
+    if voice_settings.root is None or root != voice_settings.root.resolve():
+        raise VoiceSetupError(VoiceDiagnostic(
+            "TTS_ROOT_MISSING", "启动目录与明确配置不一致。", ("GPT_SOVITS_ROOT",),
+            "runtime", "设置 GPT_SOVITS_ROOT 为要使用的唯一安装目录。",
+        ))
+    _require_settings(voice_settings, {"enabled", "runtime", "weights", "reference_audio"})
     selected_device = device or os.getenv("WANDERER_TTS_DEVICE", "").strip().lower() or "auto"
     if selected_device == "auto":
         selected_device = "cuda" if _runtime_has_usable_cuda(root) else "cpu"
     settings = build_tts_config(root, selected_device)
-    reference = Path(os.getenv("WANDERER_TTS_REFERENCE_AUDIO", "").strip() or root / DEFAULT_VOICE_REFERENCE)
-    if not reference.is_absolute():
-        reference = root / reference
-    if not reference.is_file():
-        raise FileNotFoundError(f"GPT-SoVITS voice reference audio not found: {reference}")
     return {
         "root": root,
         "device": settings["custom"]["device"],
         "config": settings,
-        "reference_audio": reference.resolve(),
-        "prompt_text": os.getenv("WANDERER_TTS_PROMPT_TEXT", DEFAULT_VOICE_PROMPT).strip(),
+        "reference_audio": voice_settings.reference_audio.resolve(),
+        "prompt_text": voice_settings.prompt_text,
     }
 
 
@@ -124,12 +158,15 @@ def voice_session_path() -> Path:
 
 def _is_ready(host: str, port: int) -> bool:
     try:
-        with urlopen(f"http://{host}:{port}/openapi.json", timeout=1) as response:
-            if response.status != 200:
-                return False
-            schema = json.loads(response.read())
-            return "/tts" in schema.get("paths", {})
-    except (OSError, URLError, ValueError):
+        authority = f"[{host}]" if ":" in host else host
+        response = httpx.get(f"http://{authority}:{port}/openapi.json", timeout=1, follow_redirects=False, trust_env=False)
+        if response.status_code != 200:
+            return False
+        schema = response.json()
+        paths = schema.get("paths", {}) if isinstance(schema, dict) else {}
+        operation = paths.get("/tts", {}) if isinstance(paths, dict) else {}
+        return isinstance(operation, dict) and isinstance(operation.get("post"), dict)
+    except (OSError, httpx.HTTPError, ValueError):
         return False
 
 
@@ -149,19 +186,25 @@ def ensure_tts_server(session_file: Path | None = None) -> bool:
     """Reuse the local GPT-SoVITS API or start the selected voice checkpoint."""
     game_root = Path(__file__).resolve().parents[1]
     _load_game_env(game_root)
-    if _as_bool(os.getenv("WANDERER_TTS_ENABLED")) is False:
+    if not _settings().enabled:
         return False
 
     host, port = tts_endpoint()
     root = resolve_root()
     requested_device = os.getenv("WANDERER_TTS_DEVICE", "").strip().lower() or "auto"
-    settings = voice_config(root)
     session_file = session_file or voice_session_path()
-    if not settings["reference_audio"].is_file():
-        return False
+    _require_settings(_settings(), {"reference_audio"})
     if _is_ready(host, port):
         _write_session_state(session_file, owns_server=False, pid=None, port=port)
         return True
+    settings = voice_config(root)
+    try:
+        startup_timeout = max(30, int(os.getenv("WANDERER_TTS_STARTUP_TIMEOUT", "").strip() or "240"))
+    except ValueError:
+        raise VoiceSetupError(VoiceDiagnostic(
+            "TTS_STARTUP_TIMEOUT_INVALID", "语音启动等待时间无效。", ("WANDERER_TTS_STARTUP_TIMEOUT",),
+            "startup_timeout", "设置 WANDERER_TTS_STARTUP_TIMEOUT 为整数秒数，默认 240 秒。",
+        )) from None
 
     config_path = tts_config_path()
     config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -181,7 +224,7 @@ def ensure_tts_server(session_file: Path | None = None) -> bool:
             "-I",
             "api_v2.py",
             "-a",
-            "127.0.0.1",
+            host,
             "-p",
             str(port),
             "-c",
@@ -199,7 +242,7 @@ def ensure_tts_server(session_file: Path | None = None) -> bool:
             session_file.unlink(missing_ok=True)
             stop_marker.unlink(missing_ok=True)
             return False
-        deadline = monotonic() + max(30, int(os.getenv("WANDERER_TTS_STARTUP_TIMEOUT", "240")))
+        deadline = monotonic() + startup_timeout
         while monotonic() < deadline:
             if stop_marker.is_file():
                 _terminate_process(process.pid)
@@ -210,13 +253,13 @@ def ensure_tts_server(session_file: Path | None = None) -> bool:
                 session_file.unlink(missing_ok=True)
                 if attempt + 1 < len(settings_to_try):
                     break
-                return False
+                raise _api_unreachable()
             if _is_ready(host, port):
                 return True
             sleep(1)
         else:
             stop_tts_server(session_file)
-            return False
+            raise _api_unreachable()
 
     return False
 
@@ -261,29 +304,29 @@ def stop_tts_server(session_file: Path | None = None) -> None:
         session_file.unlink(missing_ok=True)
 
 
-def _as_bool(value: str | None) -> bool:
-    return (value or "").strip().lower() in {"1", "true", "yes", "on"}
-
-
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Start or stop the local GPT-SoVITS voice service")
     parser.add_argument("--stop", action="store_true", help="stop only the GPT-SoVITS process started for this game run")
     parser.add_argument("--state-file", type=Path, default=None, help="per-run TTS process ownership file")
     args = parser.parse_args(argv)
-    _load_game_env(Path(__file__).resolve().parents[1])
     if args.stop:
+        if args.state_file is None:
+            _load_game_env(Path(__file__).resolve().parents[1])
         stop_tts_server(args.state_file)
         return 0
     try:
         if ensure_tts_server(args.state_file):
             print("GPT-SoVITS 语音服务已就绪。")
-        else:
-            print("语音服务未启动；游戏仍可使用文字对话。", file=sys.stderr)
-            return 1
-    except (FileNotFoundError, ValueError, OSError) as exc:
-        print(f"GPT-SoVITS 语音服务启动失败：{exc}", file=sys.stderr)
-        return 1
-    return 0
+            return 0
+        diagnostics = _settings().diagnostics()
+        diagnostic = diagnostics[0] if diagnostics else _api_unreachable().diagnostic
+    except VoiceSetupError as exc:
+        diagnostic = exc.diagnostic
+    except (ValueError, OSError):
+        # OS errors can contain private paths; never print raw exception values.
+        diagnostic = _api_unreachable().diagnostic
+    print(f"{diagnostic.code}: {diagnostic.message} [{', '.join(diagnostic.variables)}; {diagnostic.check}] {diagnostic.action} 游戏仍可使用文字对话。", file=sys.stderr)
+    return 1
 
 
 if __name__ == "__main__":

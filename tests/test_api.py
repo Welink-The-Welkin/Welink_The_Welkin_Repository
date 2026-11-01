@@ -1,6 +1,7 @@
 # 本文件由 codex 辅助生成（外围模块）
 from fastapi.testclient import TestClient
 
+from backend.app.core.errors import ModelProviderError
 from backend.app.errors import AppError
 from backend.app.main import create_app
 
@@ -150,6 +151,86 @@ def test_model_provider_error_uses_public_error_envelope(tmp_path):
 
     assert response.status_code == 502
     assert response.json()["error"]["code"] == "MODEL_PROVIDER_ERROR"
+
+
+def test_free_chat_without_model_config_returns_explicit_configuration_error(tmp_path):
+    client = TestClient(create_app(database_path_override=tmp_path / "chat-no-model-config.db", demo_mode_override="offline"))
+    chat_id = client.post("/api/chat/sessions", json={"mode": "offline"}).json()["data"]["chat_session_id"]
+
+    response = client.post(f"/api/chat/sessions/{chat_id}/messages", json={"message": "请回答"})
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "MODEL_NOT_CONFIGURED"
+    assert "api_key" not in response.text.lower()
+    assert client.get(f"/api/chat/sessions/{chat_id}").json()["data"]["messages"] == []
+
+
+def test_free_chat_regenerate_without_model_config_returns_explicit_configuration_error(tmp_path):
+    client = TestClient(create_app(database_path_override=tmp_path / "chat-regen-no-model-config.db", demo_mode_override="offline"))
+    chat_id = client.post("/api/chat/sessions", json={"mode": "offline"}).json()["data"]["chat_session_id"]
+
+    response = client.post(f"/api/chat/sessions/{chat_id}/regenerate", json={})
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "MODEL_NOT_CONFIGURED"
+    assert "api_key" not in response.text.lower()
+
+
+def test_live_chat_provider_error_never_echoes_submitted_key_or_persists_fixture_reply(tmp_path, monkeypatch):
+    app = create_app(database_path_override=tmp_path / "chat-provider-key.db", demo_mode_override="offline")
+    client = TestClient(app)
+    chat_id = client.post("/api/chat/sessions", json={"mode": "offline"}).json()["data"]["chat_session_id"]
+    submitted_key = "must-not-appear-in-error-body"
+
+    class FailingClient:
+        def __init__(self, config):
+            self.config = config
+            self.model_name = config.model
+            self.diagnostic_endpoint = config.diagnostic_endpoint
+
+        def generate_chat(self, *, request):
+            raise ModelProviderError(
+                f"private provider response: {submitted_key}",
+                status_code=403,
+                user_message=f"provider rejected {submitted_key}",
+                provider_code=submitted_key,
+                provider_request_id=submitted_key,
+            )
+
+    monkeypatch.setattr("backend.app.services.session_service.LiveModelClient", FailingClient)
+    response = client.post(
+        f"/api/chat/sessions/{chat_id}/messages",
+        json={
+            "message": "请回答",
+            "model": {
+                "endpoint": "https://provider.example/v1",
+                "model": "request-model",
+                "api_key": submitted_key,
+            },
+        },
+    )
+
+    assert response.status_code == 502
+    assert response.json()["error"]["code"] == "MODEL_PROVIDER_ERROR"
+    assert submitted_key not in response.text
+    assert client.get(f"/api/chat/sessions/{chat_id}").json()["data"]["messages"] == []
+
+
+def test_story_turn_stays_deterministic_and_does_not_construct_chat_model(tmp_path, monkeypatch):
+    app = create_app(database_path_override=tmp_path / "story-without-model-config.db", demo_mode_override="offline")
+    client = TestClient(app)
+
+    def unexpected_live_client(*_args, **_kwargs):
+        raise AssertionError("story turn must not construct a free-chat model client")
+
+    monkeypatch.setattr("backend.app.services.session_service.LiveModelClient", unexpected_live_client)
+    session_id = client.post("/api/sessions", json={"mode": "live"}).json()["data"]["session_id"]
+
+    first = client.post(f"/api/sessions/{session_id}/turn", json={"option_id": "listen"})
+
+    assert first.status_code == 200
+    assert first.json()["data"]["state"]["turn_count"] == 1
+    assert first.json()["data"]["response"]["reply"]
 
 
 def _play_story(client, options):

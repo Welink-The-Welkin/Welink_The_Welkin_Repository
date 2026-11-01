@@ -5,6 +5,10 @@
 """
 from __future__ import annotations
 
+import math
+from email.utils import parsedate_to_datetime
+from datetime import datetime, timezone
+
 
 class CoreError(RuntimeError):
     """所有核心错误的基类。"""
@@ -49,9 +53,46 @@ class ModelProviderError(CoreError):
         user_message: str | None = None,
         provider_code: str | None = None,
         provider_request_id: str | None = None,
+        retry_after: str | float | int | None = None,
+        configuration_error: bool = False,
     ):
         super().__init__(message)
         self.status_code = status_code
-        self.user_message = user_message or "模型服务暂时不可用，请检查实时接口配置后重试。"
+        self.public_message = user_message or self._public_message_for_status(status_code)
+        self.user_message = self.public_message
         self.provider_code = provider_code
         self.provider_request_id = provider_request_id
+        self.retry_after = self._parse_retry_after(retry_after)
+        self.configuration_error = bool(configuration_error)
+
+    @staticmethod
+    def _public_message_for_status(status_code: int | None) -> str:
+        if status_code in {401, 403}:
+            return f"模型服务拒绝了请求（HTTP {status_code}）。请检查 API Key、账户权限和服务商设置。"
+        if status_code in {400, 404}:
+            return f"模型服务无法识别请求（HTTP {status_code}）。请检查模型 ID 和接口地址。"
+        if status_code == 429:
+            return "模型服务当前限流或账户额度不足（HTTP 429）。请稍后重试，或检查服务商账户额度。"
+        if status_code is not None and 500 <= status_code <= 599:
+            return f"模型服务暂时发生故障（HTTP {status_code}）。请稍后重试。"
+        return "模型服务暂时不可用，请检查实时接口配置后重试。"
+
+    @staticmethod
+    def _parse_retry_after(value: str | float | int | None) -> float | None:
+        if isinstance(value, bool) or value is None:
+            return None
+        try:
+            seconds = float(value)
+        except (TypeError, ValueError):
+            if not isinstance(value, str):
+                return None
+            try:
+                target = parsedate_to_datetime(value)
+                if target.tzinfo is None:
+                    target = target.replace(tzinfo=timezone.utc)
+                seconds = (target - datetime.now(timezone.utc)).total_seconds()
+            except (TypeError, ValueError, OverflowError):
+                return None
+        if not math.isfinite(seconds) or seconds < 0 or seconds > 86400:
+            return None
+        return seconds

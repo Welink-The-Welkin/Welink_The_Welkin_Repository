@@ -28,6 +28,7 @@
 - Create: `backend/app/contracts/model.py`
 - Create: `backend/app/core/model_transport.py`
 - Modify: `backend/app/core/errors.py`
+- Modify: `backend/app/core/model_client.py`
 - Test: `tests/test_model_transport.py`
 
 **Interfaces:**
@@ -88,7 +89,7 @@ Expected: PASS with URL validation, Key redaction, and SSE framing covered.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add backend/app/contracts/model.py backend/app/core/model_transport.py backend/app/core/errors.py tests/test_model_transport.py
+git add backend/app/contracts/model.py backend/app/core/model_transport.py backend/app/core/errors.py backend/app/core/model_client.py tests/test_model_transport.py
 git commit -m "feat: add shared model transport contracts"
 ```
 

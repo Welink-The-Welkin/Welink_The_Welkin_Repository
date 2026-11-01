@@ -68,16 +68,6 @@ class ChatResponse(BaseModel):
     reply: str = Field(min_length=1, max_length=1000)
     title: str | None = Field(default=None, max_length=30)
     emotion: Emotion
-    state_delta: dict[str, int] = Field(default_factory=dict)
-    next_scene: None = None
-    is_ending: bool = False
-    ending_id: None = None
-
-    @model_validator(mode="after")
-    def free_chat_shape(self) -> "ChatResponse":
-        if self.state_delta:
-            raise ValueError("free chat state_delta must be empty")
-        return self
 
 
 class CoreTurnResult(BaseModel):

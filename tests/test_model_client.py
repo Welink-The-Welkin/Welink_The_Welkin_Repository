@@ -1,15 +1,32 @@
 # 本文件由 codex 辅助生成（外围模块）
 import json
+import ast
 import io
+from pathlib import Path
 import urllib.error
 from uuid import uuid4
 
 import pytest
 
 from backend.app.contracts.game import initial_state
+from backend.app.contracts.model import ModelConfig
 from backend.app.core.character_profile import DEFAULT_CHARACTER_PROFILE
 from backend.app.core.model_client import ChatModelRequest, LiveModelClient, ModelRequest
 from backend.app.core.errors import ModelProviderError
+
+
+def test_backend_has_one_provider_sse_parser_and_no_replay_parser():
+    app_root = Path(__file__).resolve().parents[1] / "backend" / "app"
+    definitions = []
+    for source_path in app_root.rglob("*.py"):
+        tree = ast.parse(source_path.read_text(encoding="utf-8-sig"))
+        definitions.extend(
+            source_path.relative_to(app_root).as_posix()
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "iter_sse_data"
+        )
+    assert definitions == ["core/model_transport.py"]
 
 
 def test_live_client_defaults_to_deepseek_flash_and_normalizes_endpoint(monkeypatch):
@@ -22,6 +39,281 @@ def test_live_client_defaults_to_deepseek_flash_and_normalizes_endpoint(monkeypa
     assert client.model_name == "deepseek-v4.1-flash"
     assert client.base_url == "https://api.deepseek.com"
     assert client.endpoint == "https://api.deepseek.com/chat/completions"
+
+
+def test_live_client_accepts_request_scoped_model_config_without_environment(monkeypatch):
+    monkeypatch.delenv("WANDERER_MODEL_API_KEY", raising=False)
+    monkeypatch.delenv("WANDERER_MODEL_BASE_URL", raising=False)
+    monkeypatch.delenv("WANDERER_MODEL_ENDPOINT", raising=False)
+    config = ModelConfig(
+        endpoint="https://provider.example/v1",
+        model="ephemeral-model",
+        api_key="request-only-key",
+        timeout=17,
+    )
+
+    client = LiveModelClient(config)
+
+    assert client.available is True
+    assert client.endpoint == "https://provider.example/v1/chat/completions"
+    assert client.diagnostic_endpoint == "https://provider.example/v1/chat/completions"
+    assert client.model_name == "ephemeral-model"
+    assert client._timeout == 17
+    assert "request-only-key" not in repr(client)
+
+
+def test_request_scoped_root_endpoint_defaults_to_openai_v1_path():
+    config = ModelConfig(
+        endpoint="https://provider.example",
+        model="ephemeral-model",
+        api_key="request-only-key",
+    )
+
+    assert config.endpoint == "https://provider.example/v1/chat/completions"
+    assert config.diagnostic_endpoint == "https://provider.example/v1/chat/completions"
+
+
+def test_live_client_request_uses_shared_opener_and_only_requested_authority(monkeypatch):
+    config = ModelConfig(
+        endpoint="https://provider.example/v1",
+        model="ephemeral-model",
+        api_key="request-only-key",
+    )
+    client = LiveModelClient(config)
+    captured = {}
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return json.dumps({"reply": "收到。", "emotion": "calm", "state_delta": {}, "next_scene": None, "is_ending": False, "ending_id": None}).encode()
+
+    def open_request(request, timeout):
+        captured["request"] = request
+        captured["timeout"] = timeout
+        return Response()
+
+    monkeypatch.setattr("backend.app.core.model_client.open_model_request", open_request)
+
+    result = client._request_json({"model": "ephemeral-model"})
+
+    assert result["reply"] == "收到。"
+    assert captured["request"].full_url == "https://provider.example/v1/chat/completions"
+    assert captured["request"].get_header("Authorization") == "Bearer request-only-key"
+    assert captured["timeout"] == 30.0
+
+
+def test_live_client_connection_probe_accepts_successful_plain_text_response(monkeypatch):
+    config = ModelConfig(
+        endpoint="https://provider.example/v1",
+        model="ephemeral-model",
+        api_key="request-only-key",
+    )
+    client = LiveModelClient(config)
+    captured = {}
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            raise AssertionError("a successful connection probe must not consume the response body")
+
+    def open_request(request, timeout):
+        captured["request"] = request
+        captured["timeout"] = timeout
+        return Response()
+
+    monkeypatch.setattr("backend.app.core.model_client.open_model_request", open_request)
+
+    assert client.test_connection() is None
+    assert captured["request"].full_url == "https://provider.example/v1/chat/completions"
+    assert captured["request"].get_header("Authorization") == "Bearer request-only-key"
+    payload = json.loads(captured["request"].data.decode("utf-8"))
+    assert payload["model"] == "ephemeral-model"
+    assert payload["max_tokens"] == 1
+    assert "response_format" not in payload
+
+
+def test_live_chat_still_classifies_non_json_provider_responses(monkeypatch):
+    client = LiveModelClient(ModelConfig(
+        endpoint="https://provider.example/v1",
+        model="ephemeral-model",
+        api_key="request-only-key",
+    ))
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return b"not-json"
+
+    monkeypatch.setattr("backend.app.core.model_client.open_model_request", lambda request, timeout: Response())
+
+    with pytest.raises(ModelProviderError) as error:
+        client.generate_chat(request=ChatModelRequest(character_profile=DEFAULT_CHARACTER_PROFILE, message="你好"))
+
+    assert "无法解析" in error.value.user_message
+
+
+def test_live_client_stream_parses_frames_only_through_shared_sse_parser(monkeypatch):
+    config = ModelConfig(
+        endpoint="https://provider.example/v1",
+        model="ephemeral-model",
+        api_key="request-only-key",
+    )
+    client = LiveModelClient(config)
+    calls = []
+
+    class Response:
+        headers = {"content-type": "text/event-stream"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def __iter__(self):
+            raise AssertionError("client must delegate frame parsing to iter_sse_data")
+
+    def open_request(request, timeout):
+        return Response()
+
+    def parse_frames(response):
+        calls.append(response)
+        yield json.dumps({"choices": [{"delta": {"content": '{"reply":"收到。","emotion":"calm","state_delta":{},"next_scene":null,"is_ending":false,"ending_id":null}'}}]})
+        yield "[DONE]"
+
+    monkeypatch.setattr("backend.app.core.model_client.open_model_request", open_request)
+    monkeypatch.setattr("backend.app.core.model_client.iter_sse_data", parse_frames)
+
+    events = list(client.generate_chat_stream(
+        request=ChatModelRequest(character_profile=DEFAULT_CHARACTER_PROFILE, message="你好")
+    ))
+
+    assert len(calls) == 1
+    assert events[-1]["type"] == "done"
+    assert events[-1]["response"]["reply"] == "收到。"
+
+
+@pytest.mark.parametrize(
+    "status_code, marker",
+    [
+        (400, "请求"),
+        (401, "API 密钥"),
+        (403, "权限"),
+        (404, "接口地址"),
+        (429, "限流"),
+        (500, "暂时异常"),
+        (503, "暂时异常"),
+    ],
+)
+def test_live_client_maps_provider_statuses_without_leaking_key(monkeypatch, status_code, marker):
+    config = ModelConfig(
+        endpoint="https://provider.example/v1",
+        model="ephemeral-model",
+        api_key="request-only-key",
+    )
+    client = LiveModelClient(config)
+
+    def open_request(request, timeout):
+        raise urllib.error.HTTPError(
+            request.full_url,
+            status_code,
+            "provider failure",
+            {"x-request-id": "safe-request-id"},
+            io.BytesIO(b'{"error":{"message":"request-only-key"}}'),
+        )
+
+    monkeypatch.setattr("backend.app.core.model_client.open_model_request", open_request)
+
+    with pytest.raises(ModelProviderError) as error:
+        client._request_json({"model": "ephemeral-model"})
+
+    assert error.value.status_code == status_code
+    assert marker in error.value.public_message
+    assert "request-only-key" not in str(error.value)
+    assert "request-only-key" not in error.value.public_message
+
+
+def test_live_client_propagates_numeric_retry_after(monkeypatch):
+    config = ModelConfig(endpoint="https://provider.example/v1", model="ephemeral-model", api_key="request-only-key")
+    client = LiveModelClient(config)
+
+    def open_request(request, timeout):
+        raise urllib.error.HTTPError(request.full_url, 429, "provider failure", {"Retry-After": "17"}, io.BytesIO(b"{}"))
+
+    monkeypatch.setattr("backend.app.core.model_client.open_model_request", open_request)
+    with pytest.raises(ModelProviderError) as error:
+        client._request_json({"model": "ephemeral-model"})
+    assert error.value.retry_after == 17
+
+
+def test_live_client_classifies_unsafe_resolver_failure_as_model_configuration(monkeypatch):
+    config = ModelConfig(endpoint="https://private.example/v1", model="ephemeral-model", api_key="request-only-key")
+    client = LiveModelClient(config)
+
+    def open_request(request, timeout):
+        raise ValueError("model endpoint resolved to a local or reserved address")
+
+    monkeypatch.setattr("backend.app.core.model_client.open_model_request", open_request)
+    with pytest.raises(ModelProviderError) as error:
+        client._request_json({"model": "ephemeral-model"})
+    assert getattr(error.value, "configuration_error", False) is True
+    assert "private.example" not in str(error.value)
+
+
+def test_live_client_stream_classifies_endpoint_parse_failure_as_model_configuration():
+    config = ModelConfig(endpoint="https://provider.example/v1", model="ephemeral-model", api_key="request-only-key")
+    client = LiveModelClient(config)
+    client._configured_endpoint = "https://[invalid"
+
+    with pytest.raises(ModelProviderError) as error:
+        list(client.generate_chat_stream(
+            request=ChatModelRequest(character_profile=DEFAULT_CHARACTER_PROFILE, message="你好")
+        ))
+
+    assert getattr(error.value, "configuration_error", False) is True
+    assert "provider.example" not in str(error.value)
+    assert "request-only-key" not in str(error.value)
+
+
+def test_live_client_rejects_redirects_without_following_or_leaking_key(monkeypatch):
+    config = ModelConfig(
+        endpoint="https://provider.example/v1",
+        model="ephemeral-model",
+        api_key="request-only-key",
+    )
+    client = LiveModelClient(config)
+
+    def open_request(request, timeout):
+        raise urllib.error.HTTPError(
+            request.full_url,
+            302,
+            "redirect refused",
+            {"Location": "https://attacker.example/collect?key=request-only-key"},
+            io.BytesIO(b"request-only-key"),
+        )
+
+    monkeypatch.setattr("backend.app.core.model_client.open_model_request", open_request)
+
+    with pytest.raises(ModelProviderError) as error:
+        client._request_json({"model": "ephemeral-model"})
+
+    assert error.value.status_code == 302
+    assert "request-only-key" not in str(error.value)
 
 
 def test_live_client_accepts_provider_endpoint_with_chat_path(monkeypatch):
@@ -126,7 +418,7 @@ def test_live_client_stream_request_sends_stream_true_and_extracts_reply_deltas(
         captured["payload"] = json.loads(request.data.decode())
         return Response()
 
-    monkeypatch.setattr("urllib.request.urlopen", capture)
+    monkeypatch.setattr("backend.app.core.model_client.open_model_request", capture)
     events = list(client.generate_chat_stream(
         request=ChatModelRequest(character_profile=DEFAULT_CHARACTER_PROFILE, message="你好")
     ))
@@ -159,7 +451,7 @@ def test_live_client_stream_ignores_nested_reply_keys_and_uses_only_the_top_leve
             yield f"data: {json.dumps({'choices': [{'delta': {'content': content}}]}, ensure_ascii=False)}\n\n".encode()
             yield b"data: [DONE]\n\n"
 
-    monkeypatch.setattr("urllib.request.urlopen", lambda *args, **kwargs: Response())
+    monkeypatch.setattr("backend.app.core.model_client.open_model_request", lambda *args, **kwargs: Response())
 
     events = list(client.generate_chat_stream(
         request=ChatModelRequest(character_profile=DEFAULT_CHARACTER_PROFILE, message="你好")
@@ -181,7 +473,7 @@ def test_live_client_stream_rejects_duplicate_top_level_reply_keys(monkeypatch):
         def __iter__(self):
             yield f"data: {json.dumps({'choices': [{'delta': {'content': content}}]}, ensure_ascii=False)}\n\n".encode()
 
-    monkeypatch.setattr("urllib.request.urlopen", lambda *args, **kwargs: Response())
+    monkeypatch.setattr("backend.app.core.model_client.open_model_request", lambda *args, **kwargs: Response())
 
     with pytest.raises(ValueError, match="duplicate top-level reply"):
         list(client.generate_chat_stream(
@@ -208,7 +500,7 @@ def test_live_client_stream_never_emits_text_beyond_the_chat_reply_limit(monkeyp
         def __iter__(self):
             yield f"data: {json.dumps({'choices': [{'delta': {'content': content}}]}, ensure_ascii=False)}\n\n".encode()
 
-    monkeypatch.setattr("urllib.request.urlopen", lambda *args, **kwargs: Response())
+    monkeypatch.setattr("backend.app.core.model_client.open_model_request", lambda *args, **kwargs: Response())
     stream = iter(client.generate_chat_stream(
         request=ChatModelRequest(character_profile=DEFAULT_CHARACTER_PROFILE, message="你好")
     ))
@@ -238,7 +530,7 @@ def test_live_client_uses_safe_cloudflare_request_id_for_provider_diagnostics(mo
             io.BytesIO(b"Access denied"),
         )
 
-    monkeypatch.setattr("urllib.request.urlopen", forbidden)
+    monkeypatch.setattr("backend.app.core.model_client.open_model_request", forbidden)
 
     try:
         client._request_json({"model": "test"})
@@ -270,7 +562,7 @@ def test_live_client_sends_a_provider_compatible_user_agent(monkeypatch):
         captured["request"] = request
         return Response()
 
-    monkeypatch.setattr("urllib.request.urlopen", capture)
+    monkeypatch.setattr("backend.app.core.model_client.open_model_request", capture)
     client._request_json({"model": "test"})
 
     assert captured["request"].get_header("User-agent") == "wanderer-game/0.2.0"
@@ -306,7 +598,7 @@ def test_live_client_parses_json_object_wrapped_in_openai_content(monkeypatch):
                 "choices": [{"message": {"content": '{"reply":"收到。","emotion":"calm","state_delta":{},"next_scene":null,"is_ending":false,"ending_id":null}'}}]
             }).encode("utf-8")
 
-    monkeypatch.setattr("urllib.request.urlopen", lambda request, timeout: Response())
+    monkeypatch.setattr("backend.app.core.model_client.open_model_request", lambda request, timeout: Response())
 
     result = client.generate_chat(
         request=ChatModelRequest(character_profile=DEFAULT_CHARACTER_PROFILE, message="你好")
@@ -332,7 +624,7 @@ def test_live_client_maps_provider_emotion_alias_to_supported_contract_value(mon
                 "choices": [{"message": {"content": '{"reply":"你好。","emotion":"friendly","state_delta":{},"next_scene":null,"is_ending":false,"ending_id":null}'}}]
             }).encode("utf-8")
 
-    monkeypatch.setattr("urllib.request.urlopen", lambda request, timeout: Response())
+    monkeypatch.setattr("backend.app.core.model_client.open_model_request", lambda request, timeout: Response())
 
     result = client.generate_chat(
         request=ChatModelRequest(character_profile=DEFAULT_CHARACTER_PROFILE, message="你好")
@@ -356,7 +648,7 @@ def test_live_client_rejects_success_payload_without_openai_choices(monkeypatch)
         def read(self):
             return b'{"message":"upstream returned an unsupported shape"}'
 
-    monkeypatch.setattr("urllib.request.urlopen", lambda *args, **kwargs: Response())
+    monkeypatch.setattr("backend.app.core.model_client.open_model_request", lambda *args, **kwargs: Response())
 
     try:
         client._request_json({"model": "test"})
@@ -412,7 +704,7 @@ def test_live_client_classifies_http_401_without_exposing_response_body(monkeypa
     def unauthorized(*args, **kwargs):
         raise urllib.error.HTTPError("https://example.test/chat/completions", 401, "Unauthorized", {}, io.BytesIO(provider_body))
 
-    monkeypatch.setattr("urllib.request.urlopen", unauthorized)
+    monkeypatch.setattr("backend.app.core.model_client.open_model_request", unauthorized)
 
     try:
         client._request_json({"model": "test"})
@@ -438,13 +730,14 @@ def test_live_client_classifies_http_403_as_access_permission_not_bad_key(monkey
     def forbidden(*args, **kwargs):
         raise urllib.error.HTTPError("https://example.test/chat/completions", 403, "Forbidden", {}, io.BytesIO(provider_body))
 
-    monkeypatch.setattr("urllib.request.urlopen", forbidden)
+    monkeypatch.setattr("backend.app.core.model_client.open_model_request", forbidden)
 
     try:
         client._request_json({"model": "test"})
     except ModelProviderError as exc:
         message = exc.user_message
         assert "权限" in message
+        assert "额度" in message
         assert "HTTP 403" in message
         assert "不一定表示密钥错误" in message
         assert "API 密钥" not in message
@@ -470,7 +763,7 @@ def test_live_client_preserves_only_safe_diagnostics_from_http_403(monkeypatch):
             io.BytesIO(provider_body),
         )
 
-    monkeypatch.setattr("urllib.request.urlopen", forbidden)
+    monkeypatch.setattr("backend.app.core.model_client.open_model_request", forbidden)
 
     try:
         client._request_json({"model": "test"})

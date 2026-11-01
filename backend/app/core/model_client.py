@@ -17,6 +17,7 @@ from typing import Iterable, Mapping, Protocol
 from urllib.parse import urlsplit, urlunsplit
 
 from backend.app.contracts.game import GameState
+from backend.app.contracts.model import ModelConfig
 from backend.app.core.character_profile import CharacterProfile
 from backend.app.core.pronoun_guard import CHARACTER_SELF_NAMES
 from backend.app.core.errors import (
@@ -24,6 +25,7 @@ from backend.app.core.errors import (
     ModelProviderError,
     ModelTimeoutError,
 )
+from backend.app.core.model_transport import iter_sse_data, open_model_request
 
 _FALLBACK = {
     "reply": "有什么想说的就说，别指望我先替你表态。",
@@ -546,22 +548,6 @@ def _decode_json_string_prefix(raw: str) -> str:
     return "".join(decoded)
 
 
-def _chat_sse_data(response) -> Iterable[str]:
-    data_lines: list[str] = []
-    for raw_line in response:
-        line = raw_line.decode("utf-8", errors="replace") if isinstance(raw_line, bytes) else str(raw_line)
-        for part in line.splitlines() or [line]:
-            if not part:
-                if data_lines:
-                    yield "\n".join(data_lines)
-                    data_lines.clear()
-                continue
-            if part.startswith("data:"):
-                data_lines.append(part[5:].lstrip())
-    if data_lines:
-        yield "\n".join(data_lines)
-
-
 def _provider_chat_messages(request: ChatModelRequest) -> list[dict[str, str]]:
     messages = [{"role": "system", "content": LiveModelClient._system_prompt(request.character_profile, gameplay=False, player_name=request.player_name)}]
     for player, reply in request.history[-12:]:
@@ -691,12 +677,20 @@ class DeterministicModelClient:
 
 
 class LiveModelClient:
-    """真实供应商客户端：密钥仅从后端环境配置读取，缺失即不可用。"""
+    """真实供应商客户端：支持请求级配置并保留环境兼容构造。"""
 
     DEFAULT_BASE_URL = "https://api.deepseek.com"
     DEFAULT_MODEL_NAME = "deepseek-v4.1-flash"
 
-    def __init__(self, *, timeout: float | None = None) -> None:
+    def __init__(self, config: ModelConfig | None = None, *, timeout: float | None = None) -> None:
+        if config is not None:
+            self._api_key = config.api_key
+            self._base_url = config.endpoint.rstrip("/")
+            self._configured_endpoint = config.endpoint.rstrip("/")
+            self._model_name = config.model
+            self._timeout = float(timeout) if timeout is not None else config.timeout
+            return
+
         self._api_key = os.environ.get("WANDERER_MODEL_API_KEY")
         self._base_url = os.environ.get("WANDERER_MODEL_BASE_URL", self.DEFAULT_BASE_URL).rstrip("/")
         self._configured_endpoint = os.environ.get("WANDERER_MODEL_ENDPOINT", "").strip().rstrip("/")
@@ -744,7 +738,7 @@ class LiveModelClient:
         if not self.available:
             raise ModelProviderError(
                 "live model client is not configured",
-                user_message="没有读取到模型 API 密钥。请在项目根目录 .env 配置密钥并重启游戏。",
+                user_message="尚未配置实时模型。请打开模型设置填写接口地址、模型 ID 和 API Key。",
             )
         messages = [{"role": "system", "content": self._system_prompt(request.character_profile, gameplay=True, state=request.state_snapshot)}]
         for item in request.state_snapshot.history[-12:]:
@@ -766,15 +760,29 @@ class LiveModelClient:
         if not self.available:
             raise ModelProviderError(
                 "live model client is not configured",
-                user_message="没有读取到模型 API 密钥。请在项目根目录 .env 配置密钥并重启游戏。",
+                user_message="尚未配置实时模型。请打开模型设置填写接口地址、模型 ID 和 API Key。",
             )
         return self._normalize_response_payload(self._request_json(self._payload(messages=_provider_chat_messages(request))))
+
+    def test_connection(self) -> None:
+        """Probe transport and provider authentication without requiring a game JSON reply."""
+        if not self.available:
+            raise ModelProviderError(
+                "live model client is not configured",
+                user_message="尚未配置实时模型。请打开模型设置填写接口地址、模型 ID 和 API Key。",
+            )
+        payload = {
+            "model": self._model_name,
+            "messages": [{"role": "user", "content": "Reply with a brief connection confirmation."}],
+            "max_tokens": 1,
+        }
+        self._request_bytes(payload, read_body=False)
 
     def generate_chat_stream(self, *, request: ChatModelRequest) -> ChatReplyEventStream:
         if not self.available:
             raise ModelProviderError(
                 "live model client is not configured",
-                user_message="没有读取到模型 API 密钥。请在项目根目录 .env 配置密钥并重启游戏。",
+                user_message="尚未配置实时模型。请打开模型设置填写接口地址、模型 ID 和 API Key。",
             )
         payload = self._payload(messages=_provider_chat_messages(request))
         payload["stream"] = True
@@ -789,8 +797,16 @@ class LiveModelClient:
             extractor = _IncrementalReplyExtractor()
             chunker = _ReplyTextChunker()
             try:
+                try:
+                    endpoint = self.endpoint
+                except ValueError:
+                    raise ModelProviderError(
+                        "model endpoint is invalid or unsafe",
+                        user_message="模型接口地址无效或无法安全连接，请编辑模型设置。",
+                        configuration_error=True,
+                    ) from None
                 http_request = urllib.request.Request(
-                    self.endpoint,
+                    endpoint,
                     data=json.dumps(payload).encode("utf-8"),
                     headers={
                         "Content-Type": "application/json",
@@ -800,7 +816,15 @@ class LiveModelClient:
                     },
                     method="POST",
                 )
-                with urllib.request.urlopen(http_request, timeout=self._timeout) as response:
+                try:
+                    response_context = open_model_request(http_request, timeout=self._timeout)
+                except ValueError:
+                    raise ModelProviderError(
+                        "model endpoint is invalid or unsafe",
+                        user_message="模型接口地址无效或无法安全连接，请编辑模型设置。",
+                        configuration_error=True,
+                    ) from None
+                with response_context as response:
                     active_responses.append(response)
                     content_type = response.headers.get("content-type", "") if getattr(response, "headers", None) else ""
                     if "text/event-stream" not in content_type.lower():
@@ -811,7 +835,7 @@ class LiveModelClient:
                         yield {"type": "done", "response": normalized}
                         return
 
-                    for data in _chat_sse_data(response):
+                    for data in iter_sse_data(response):
                         if data == "[DONE]":
                             break
                         try:
@@ -848,37 +872,18 @@ class LiveModelClient:
             except TimeoutError as exc:
                 raise ModelTimeoutError("model request timed out") from exc
             except urllib.error.HTTPError as exc:
-                message = self._http_error_message(exc.code)
-                provider_code = None
-                try:
-                    body = json.loads(exc.read().decode("utf-8"))
-                    error = body.get("error", body) if isinstance(body, dict) else {}
-                    if isinstance(error, dict):
-                        candidate = error.get("code") or error.get("type")
-                        if isinstance(candidate, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", candidate):
-                            if not (self._api_key and self._api_key in candidate):
-                                provider_code = candidate
-                except (AttributeError, UnicodeDecodeError, json.JSONDecodeError):
-                    pass
-                headers = exc.headers or {}
-                request_id = headers.get("x-request-id") or headers.get("request-id") or headers.get("cf-ray")
-                if not isinstance(request_id, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,120}", request_id):
-                    request_id = None
-                if request_id and self._api_key and self._api_key in request_id:
-                    request_id = None
-                raise ModelProviderError(
-                    f"model provider returned HTTP {exc.code}",
-                    status_code=exc.code,
-                    user_message=message,
-                    provider_code=provider_code,
-                    provider_request_id=request_id,
-                ) from exc
+                raise self._provider_error_from_http(exc) from exc
             except urllib.error.URLError as exc:
                 if isinstance(exc.reason, TimeoutError):
                     raise ModelTimeoutError("model request timed out") from exc
                 raise ModelProviderError(
                     "model provider is unreachable",
                     user_message="无法连接模型服务。请检查网络、服务商地址和代理设置。",
+                ) from exc
+            except json.JSONDecodeError as exc:
+                raise ModelProviderError(
+                    "model provider returned invalid JSON",
+                    user_message="模型服务返回了无法解析的数据，请检查服务商接口是否兼容。",
                 ) from exc
 
         return ChatReplyEventStream(events(), cancel=cancel_request)
@@ -930,6 +935,16 @@ class LiveModelClient:
         return "\n".join(sections)
 
     def _request_json(self, payload: dict[str, object]) -> Mapping[str, object]:
+        try:
+            body = json.loads(self._request_bytes(payload).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ModelProviderError(
+                "model provider returned invalid JSON",
+                user_message="模型服务返回了无法解析的数据，请检查服务商接口是否兼容。",
+            ) from exc
+        return self._normalize_response_payload(body, strict=True)
+
+    def _request_bytes(self, payload: dict[str, object], *, read_body: bool = True) -> bytes:
         http_request = urllib.request.Request(
             self.endpoint,
             data=json.dumps(payload).encode("utf-8"),
@@ -941,41 +956,12 @@ class LiveModelClient:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(http_request, timeout=self._timeout) as response:
-                body = json.loads(response.read().decode("utf-8"))
+            with open_model_request(http_request, timeout=self._timeout) as response:
+                return response.read() if read_body else b""
         except TimeoutError as exc:
             raise ModelTimeoutError("model request timed out") from exc
         except urllib.error.HTTPError as exc:
-            message = self._http_error_message(exc.code)
-            provider_code = None
-            try:
-                body = json.loads(exc.read().decode("utf-8"))
-                error = body.get("error", body) if isinstance(body, dict) else {}
-                if isinstance(error, dict):
-                    candidate = error.get("code") or error.get("type")
-                    if isinstance(candidate, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", candidate):
-                        if self._api_key and self._api_key in candidate:
-                            candidate = None
-                        provider_code = candidate
-            except (AttributeError, UnicodeDecodeError, json.JSONDecodeError):
-                pass
-            headers = exc.headers or {}
-            request_id = (
-                headers.get("x-request-id")
-                or headers.get("request-id")
-                or headers.get("cf-ray")
-            )
-            if not isinstance(request_id, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,120}", request_id):
-                request_id = None
-            if request_id and self._api_key and self._api_key in request_id:
-                request_id = None
-            raise ModelProviderError(
-                f"model provider returned HTTP {exc.code}",
-                status_code=exc.code,
-                user_message=message,
-                provider_code=provider_code,
-                provider_request_id=request_id,
-            ) from exc
+            raise self._provider_error_from_http(exc) from exc
         except urllib.error.URLError as exc:
             if isinstance(exc.reason, TimeoutError):
                 raise ModelTimeoutError("model request timed out") from exc
@@ -983,12 +969,12 @@ class LiveModelClient:
                 "model provider is unreachable",
                 user_message="无法连接模型服务。请检查网络、服务商地址和代理设置。",
             ) from exc
-        except json.JSONDecodeError as exc:
+        except ValueError:
             raise ModelProviderError(
-                "model provider returned invalid JSON",
-                user_message="模型服务返回了无法解析的数据，请检查服务商接口是否兼容。",
-            ) from exc
-        return self._normalize_response_payload(body, strict=True)
+                "model endpoint is invalid or unsafe",
+                user_message="模型接口地址无效或无法安全连接，请编辑模型设置。",
+                configuration_error=True,
+            ) from None
 
     @staticmethod
     def _normalize_response_payload(body: object, *, strict: bool = False) -> Mapping[str, object]:
@@ -1044,7 +1030,7 @@ class LiveModelClient:
         if status_code == 401:
             return "模型服务无法验证当前 API 密钥（HTTP 401）。请确认密钥来自这个 API 地址对应的服务商、仍然有效，并且服务商支持 Bearer 鉴权。"
         if status_code == 403:
-            return "模型服务禁止访问（HTTP 403）。请在服务商检查账号或密钥权限、模型访问权限、IP 白名单及接口访问策略；HTTP 403 不一定表示密钥错误。"
+            return "模型服务禁止访问（HTTP 403）。请在服务商检查账号或密钥权限、账户余额或额度、模型访问权限、IP 白名单及接口访问策略；HTTP 403 不一定表示密钥错误。"
         if status_code in {400, 404}:
             return f"模型服务拒绝了请求（HTTP {status_code}）。请核对模型名称和服务商接口地址。"
         if status_code == 429:
@@ -1052,3 +1038,37 @@ class LiveModelClient:
         if 500 <= status_code <= 599:
             return f"模型服务暂时异常（HTTP {status_code}）。请稍后重试。"
         return f"模型服务返回 HTTP {status_code}。请检查实时接口配置后重试。"
+
+    def _provider_error_from_http(self, exc: urllib.error.HTTPError) -> ModelProviderError:
+        provider_code = None
+        try:
+            body = json.loads(exc.read().decode("utf-8"))
+            error = body.get("error", body) if isinstance(body, dict) else {}
+            if isinstance(error, dict):
+                candidate = error.get("code") or error.get("type")
+                if (
+                    isinstance(candidate, str)
+                    and re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", candidate)
+                    and not (self._api_key and self._api_key in candidate)
+                ):
+                    provider_code = candidate
+        except (AttributeError, UnicodeDecodeError, json.JSONDecodeError):
+            pass
+
+        headers = exc.headers or {}
+        retry_after = next((value for name, value in headers.items() if str(name).lower() == "retry-after"), None)
+        request_id = headers.get("x-request-id") or headers.get("request-id") or headers.get("cf-ray")
+        if (
+            not isinstance(request_id, str)
+            or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,120}", request_id)
+            or (self._api_key and self._api_key in request_id)
+        ):
+            request_id = None
+        return ModelProviderError(
+            f"model provider returned HTTP {exc.code}",
+            status_code=exc.code,
+            user_message=self._http_error_message(exc.code),
+            provider_code=provider_code,
+            provider_request_id=request_id,
+            retry_after=retry_after,
+        )

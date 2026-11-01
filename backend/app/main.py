@@ -6,7 +6,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from backend.app.api.routes import background, chat, health, sessions, voice
+from backend.app.api.routes import background, chat, health, model, sessions, voice
 from backend.app.config import database_path, demo_mode
 from backend.app.errors import AppError
 from backend.app.services.session_service import SessionService
@@ -34,9 +34,11 @@ def create_app(database_path_override=None, demo_mode_override: str | None = Non
 
     @app.exception_handler(AppError)
     async def app_error_handler(request: Request, exc: AppError):
+        headers = {"Cache-Control": "no-store"} if request.url.path == "/api/model/test" else None
         return JSONResponse(
             status_code=exc.status_code,
             content={"error": {"code": exc.code, "message": exc.message, "details": exc.details}, "request_id": request.state.request_id},
+            headers=headers,
         )
 
     @app.get("/api/openapi.json")
@@ -46,6 +48,7 @@ def create_app(database_path_override=None, demo_mode_override: str | None = Non
     app.include_router(health.router, prefix="/api")
     app.include_router(sessions.router, prefix="/api")
     app.include_router(chat.router, prefix="/api")
+    app.include_router(model.router, prefix="/api")
     app.include_router(voice.router, prefix="/api")
     app.include_router(background.router)
 

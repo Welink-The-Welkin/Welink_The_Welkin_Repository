@@ -111,7 +111,7 @@ Expected: PASS, with no hidden fallback to browser speech at the launcher level.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add scripts/start_gpt_sovits.py start.ps1 start.bat tests/test_startup.py tests/test_voice.py
+git add scripts/start_gpt_sovits.py start.ps1 tests/test_startup.py tests/test_voice.py
 git commit -m "fix: diagnose local GPT-SoVITS setup explicitly"
 ```
 

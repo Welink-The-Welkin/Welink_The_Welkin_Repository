@@ -7,6 +7,7 @@ from uuid import UUID, uuid4
 from backend.app.config import demo_mode
 from backend.app.contracts.ai import AIResponse, ChatResponse, Emotion
 from backend.app.contracts.game import GameState
+from backend.app.contracts.model import ModelConfig
 from backend.app.errors import AppError
 from backend.app.storage.session_repository import SessionRepository
 from backend.app.core.character_profile import DEFAULT_CHARACTER_PROFILE
@@ -15,9 +16,7 @@ from backend.app.core.language_guard import guard_language
 from backend.app.core.output_sanitizer import sanitize_character_reply
 from backend.app.core.pronoun_guard import (
     FALLBACK_REPLIES,
-    INTRO_FALLBACK_REPLIES,
     guard_chat_reply,
-    is_self_introduction,
     sanitize_history_pair,
     sanitize_visible_pair,
     sanitize_visible_reply,
@@ -120,20 +119,11 @@ def _present_chat_messages(items: list[dict]) -> list[dict]:
     ]
 
 
-def _fallback_chat_response(message: str) -> ChatResponse:
-    """守门不可修复时的安全兜底：按场景分流，零名号、零元素表述、零病态模式。"""
-    pool = INTRO_FALLBACK_REPLIES if is_self_introduction(message) else FALLBACK_REPLIES
-    reply = pool[len(message) % len(pool)]
-    emotion = "guarded" if len(message) % 2 == 0 else "reluctant"
-    return ChatResponse(reply=reply, title=None, emotion=emotion, state_delta={})
-
-
 def _coerce_chat_response(raw: Mapping[str, object] | ChatResponse) -> ChatResponse:
     """Keep harmless provider omissions and metadata from breaking free chat.
 
-    Chat replies do not drive the game state, so fields that are meaningful for
-    the story contract can safely use their free-chat defaults. Provider
-    metadata is deliberately dropped before Pydantic validation.
+    Chat replies do not drive the game state. Story fields and provider
+    metadata are deliberately dropped before Pydantic validation.
     """
     if isinstance(raw, ChatResponse):
         response = raw
@@ -143,19 +133,11 @@ def _coerce_chat_response(raw: Mapping[str, object] | ChatResponse) -> ChatRespo
 
         payload = {key: raw[key] for key in ChatResponse.model_fields if key in raw}
         payload.setdefault("emotion", Emotion.CALM.value)
-        payload.setdefault("state_delta", {})
-        payload.setdefault("next_scene", None)
-        payload.setdefault("is_ending", False)
-        payload.setdefault("ending_id", None)
         if payload.get("emotion") not in {item.value for item in Emotion}:
             payload["emotion"] = Emotion.CALM.value
-        payload["state_delta"] = {}
         title = payload.get("title")
         if not isinstance(title, str) or not 1 <= len(title) <= 30:
             payload["title"] = None
-        payload["next_scene"] = None
-        payload["is_ending"] = False
-        payload["ending_id"] = None
         response = ChatResponse.model_validate(payload)
 
     safe_reply = sanitize_character_reply(response.reply)
@@ -175,8 +157,9 @@ class SessionService:
         self._chat_clients: dict[str, object] = {}
         self._chat_streams: dict[str, _ChatStreamControl] = {}
         self._chat_streams_lock = Lock()
-        self.engine = self._engine_for_mode(self.default_mode)
-        self.chat_model_client = self._chat_client_for_mode(self.default_mode)
+        # Story sessions are deterministic offline replays; never load the
+        # environment-backed live client into the free-chat service object.
+        self.engine = self._engine_for_mode("offline")
 
     def _new_model_client(self, mode: str):
         if self._model_client_override is not None:
@@ -189,11 +172,6 @@ class SessionService:
         if mode not in self._engines:
             self._engines[mode] = RoleplayEngineImpl(model_client=self._new_model_client(mode))
         return self._engines[mode]
-
-    def _chat_client_for_mode(self, mode: str):
-        if mode not in self._chat_clients:
-            self._chat_clients[mode] = self._new_model_client(mode)
-        return self._chat_clients[mode]
 
     @staticmethod
     def _history_input(last_response, player_message: str | None, option_id: str | None) -> str:
@@ -308,33 +286,83 @@ class SessionService:
         mode, messages, player_name, title = self._get_chat_record(chat_id)
         return mode, _present_chat_messages(messages), player_name, title
 
-    def _request_chat_response(self, mode: str, request: ChatModelRequest) -> ChatResponse:
+    @staticmethod
+    def _chat_client_for_config(model_config: ModelConfig | None):
+        if model_config is None:
+            raise AppError("MODEL_NOT_CONFIGURED", "请先配置模型服务后再开始自由对话。", 400)
+        return LiveModelClient(model_config)
+
+    def _request_chat_response(
+        self,
+        model_config: ModelConfig | None,
+        request: ChatModelRequest,
+        *,
+        client=None,
+    ) -> ChatResponse:
+        client = client or self._chat_client_for_config(model_config)
         try:
-            raw = self._chat_client_for_mode(mode).generate_chat(request=request)
+            raw = client.generate_chat(request=request)
             return _coerce_chat_response(raw)
+        except AppError:
+            raise
         except ModelTimeoutError as exc:
             raise AppError("MODEL_TIMEOUT", "模型服务响应超时", 504) from exc
         except ModelProviderError as exc:
-            client = self._chat_clients.get(mode)
+            self._raise_chat_error(exc, client, model_config)
+        except (ValueError, TypeError) as exc:
+            raise AppError("INVALID_AI_RESPONSE", "模型返回内容不符合协议，请检查服务商的 JSON 输出兼容性。", 502) from exc
+        except Exception as exc:
+            raise AppError("MODEL_PROVIDER_ERROR", "模型服务暂时无法完成回复，请稍后重试。", 502) from exc
+
+    @staticmethod
+    def _raise_chat_error(exc, client=None, model_config: ModelConfig | None = None):
+        if isinstance(exc, AppError):
+            raise exc
+        if isinstance(exc, ModelTimeoutError):
+            raise AppError("MODEL_TIMEOUT", "模型服务响应超时", 504) from exc
+        if isinstance(exc, InvalidAIResponseError):
+            raise AppError("INVALID_AI_RESPONSE", "模型返回内容不符合对话要求。", 502) from exc
+        if isinstance(exc, ModelProviderError):
+            if getattr(exc, "configuration_error", False) or exc.status_code in {400, 404}:
+                raise AppError("MODEL_CONFIGURATION_ERROR", "模型接口地址无效或无法安全连接，请编辑模型设置。", 400) from exc
+            if str(exc) in {
+                "model provider returned invalid JSON",
+                "model provider returned an unexpected payload",
+                "model provider returned invalid streaming JSON",
+                "model provider returned an incomplete streamed response",
+            }:
+                raise AppError("INVALID_AI_RESPONSE", "模型返回内容不符合协议，请检查服务商的 JSON 输出兼容性。", 502) from exc
             details = {"provider_status": exc.status_code} if exc.status_code is not None else {}
-            if exc.provider_code:
+            if exc.retry_after is not None:
+                details["retry_after"] = exc.retry_after
+            api_key = model_config.api_key if model_config is not None else None
+            if exc.provider_code and (not api_key or api_key not in exc.provider_code):
                 details["provider_code"] = exc.provider_code
-            if exc.provider_request_id:
+            if exc.provider_request_id and (not api_key or api_key not in exc.provider_request_id):
                 details["provider_request_id"] = exc.provider_request_id
             model_name = getattr(client, "model_name", None)
             endpoint = getattr(client, "diagnostic_endpoint", None)
-            if isinstance(model_name, str):
+            if not isinstance(model_name, str) and model_config is not None:
+                model_name = model_config.model
+            if not isinstance(endpoint, str) and model_config is not None:
+                endpoint = model_config.diagnostic_endpoint
+            if isinstance(model_name, str) and (not api_key or api_key not in model_name):
                 details["model"] = model_name
-            if isinstance(endpoint, str):
+            if isinstance(endpoint, str) and (not api_key or api_key not in endpoint):
                 details["endpoint"] = endpoint
-            raise AppError("MODEL_PROVIDER_ERROR", exc.user_message, 502, details=details or None) from exc
-        except (ValueError, TypeError) as exc:
-            raise AppError("INVALID_AI_RESPONSE", "模型返回内容不符合协议，请检查服务商的 JSON 输出兼容性。", 502) from exc
+            message = exc.user_message
+            if api_key and api_key in message:
+                message = "模型服务暂时不可用，请检查实时接口配置后重试。"
+            raise AppError("MODEL_PROVIDER_ERROR", message, 502, details=details or None) from exc
+        if isinstance(exc, (ValueError, TypeError)):
+            raise AppError("INVALID_AI_RESPONSE", "模型返回内容不符合对话要求。", 502) from exc
+        raise AppError("MODEL_PROVIDER_ERROR", "模型服务暂时无法完成回复，请稍后重试。", 502) from exc
 
-    def _generate_chat(self, mode: str, request: ChatModelRequest) -> ChatResponse:
-        """模型生成 → 契约校验 → 人称/语言守门；不可修复时重试，耗尽后安全兜底。"""
+    def _generate_chat(self, model_config: ModelConfig | None, request: ChatModelRequest, *, client=None) -> ChatResponse:
+        """Generate and guard a live reply; never substitute fixture text after failure."""
+        client = client or self._chat_client_for_config(model_config)
         for attempt in range(1, _GUARD_MAX_ATTEMPTS + 1):
-            response = self._request_chat_response(mode, request)
+            response = self._request_chat_response(model_config, request, client=client)
             normalized_reply = normalize_chat_reply_layout(response.reply)
             if not normalized_reply.strip():
                 logger.warning(
@@ -346,9 +374,9 @@ class SessionService:
             response = response.model_copy(update={"reply": normalized_reply})
             try:
                 result = guard_chat_reply(request.message, response.reply)
-            except Exception:
-                logger.exception("pronoun guard raised unexpectedly; using fallback reply")
-                return _fallback_chat_response(request.message)
+            except Exception as exc:
+                logger.warning("pronoun guard raised unexpectedly")
+                raise AppError("INVALID_AI_RESPONSE", "模型返回内容不符合对话要求。", 502) from exc
             if result.status != "unrepairable":
                 language_result = guard_language(result.text)
                 if language_result.status != "unrepairable":
@@ -366,14 +394,14 @@ class SessionService:
                 _GUARD_MAX_ATTEMPTS,
                 result.status,
             )
-        logger.warning("pronoun guard retries exhausted; using fallback reply")
-        return _fallback_chat_response(request.message)
+        logger.warning("chat reply guard retries exhausted")
+        raise AppError("INVALID_AI_RESPONSE", "模型回复连续未通过内容校验，请调整提示或模型设置后重试。", 502)
 
-    def chat_message(self, chat_id: UUID, message: str):
+    def chat_message(self, chat_id: UUID, message: str, *, model_config: ModelConfig | None = None):
         mode, messages, player_name, title = self._get_chat_record(chat_id)
         history = _clean_history_pairs(messages)
         request = ChatModelRequest(character_profile=DEFAULT_CHARACTER_PROFILE, message=message, history=history, player_name=player_name)
-        response = self._generate_chat(mode, request)
+        response = self._generate_chat(model_config, request)
         conversation_title = title
         if conversation_title == "新对话":
             conversation_title = response.title or summarize_chat_title(message, response.reply)
@@ -382,7 +410,14 @@ class SessionService:
         self.repository.save_chat_messages(chat_id, messages, conversation_title)
         return response, _present_chat_messages(messages)
 
-    def stream_chat_message(self, chat_id: UUID, message: str, *, stream_id: str | None = None):
+    def stream_chat_message(
+        self,
+        chat_id: UUID,
+        message: str,
+        *,
+        stream_id: str | None = None,
+        model_config: ModelConfig | None = None,
+    ):
         control = None
         if stream_id:
             with self._chat_streams_lock:
@@ -433,10 +468,11 @@ class SessionService:
                     history=_clean_history_pairs(messages),
                     player_name=player_name,
                 )
-                client = self._chat_client_for_mode(mode)
+                client = self._chat_client_for_config(model_config)
                 raw_response = None
                 stream_failure = None
-                if hasattr(client, "generate_chat_stream"):
+                streamed = hasattr(client, "generate_chat_stream")
+                if streamed:
                     try:
                         stream = client.generate_chat_stream(request=request)
                         if control:
@@ -458,13 +494,17 @@ class SessionService:
                             if callable(close):
                                 close()
 
-                try:
-                    if stream_failure or raw_response is None:
-                        response = self._generate_chat(mode, request)
-                    else:
+                if stream_failure is not None:
+                    self._raise_chat_error(stream_failure, client, model_config)
+                if streamed and raw_response is None:
+                    raise AppError("INVALID_AI_RESPONSE", "模型服务没有返回完整的回复。", 502)
+                if not streamed:
+                    response = self._generate_chat(model_config, request, client=client)
+                else:
+                    try:
                         response = prepare_response(raw_response)
-                except (AppError, InvalidAIResponseError, ValueError, TypeError):
-                    response = _fallback_chat_response(message)
+                    except (InvalidAIResponseError, ValueError, TypeError) as exc:
+                        raise AppError("INVALID_AI_RESPONSE", "模型返回内容不符合对话要求。", 502) from exc
 
                 if control and control.cancelled:
                     return
@@ -493,10 +533,19 @@ class SessionService:
                     "title": conversation_title,
                 }
             except AppError as exc:
-                yield {"type": "error", "message": exc.message, "code": exc.code}
+                yield {"type": "error", "message": exc.message, "code": exc.code, "details": exc.details}
             except (ModelProviderError, ModelTimeoutError, ValueError, TypeError) as exc:
-                logger.exception("free chat stream failed")
-                yield {"type": "error", "message": "模型服务暂时无法完成回复，请稍后重试。"}
+                logger.warning("free chat stream failed")
+                try:
+                    self._raise_chat_error(exc, locals().get("client"), model_config)
+                except AppError as app_error:
+                    yield {"type": "error", "message": app_error.message, "code": app_error.code, "details": app_error.details}
+            except Exception as exc:
+                logger.warning("free chat stream failed unexpectedly")
+                try:
+                    self._raise_chat_error(exc, locals().get("client"), model_config)
+                except AppError as app_error:
+                    yield {"type": "error", "message": app_error.message, "code": app_error.code, "details": app_error.details}
             finally:
                 close = getattr(stream, "close", None)
                 if callable(close):
@@ -528,7 +577,7 @@ class SessionService:
                     self._chat_streams.pop(stale_before_start.pop(0), None)
         return control.cancel()
 
-    def regenerate_chat(self, chat_id: UUID):
+    def regenerate_chat(self, chat_id: UUID, *, model_config: ModelConfig | None = None):
         """按上一条玩家输入重新生成回复；新版本替换原展示位置，失败不改动原回复。"""
         mode, messages, player_name, title = self._get_chat_record(chat_id)
         if not messages:
@@ -536,7 +585,7 @@ class SessionService:
         last = messages[-1]
         history = _clean_history_pairs(messages[:-1])
         request = ChatModelRequest(character_profile=DEFAULT_CHARACTER_PROFILE, message=last["message"], history=history, player_name=player_name)
-        response = self._generate_chat(mode, request)
+        response = self._generate_chat(model_config, request)
         response = response.model_copy(update={"title": title})
         updated = {**last, "reply": response.reply, "emotion": response.emotion.value}
         messages = [*messages[:-1], updated]

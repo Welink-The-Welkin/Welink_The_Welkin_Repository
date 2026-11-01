@@ -8,7 +8,6 @@ $projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $projectRoot
 . (Join-Path $projectRoot "scripts\python_import_check.ps1")
 
-$voiceLauncher = $null
 $voiceSessionFile = Join-Path $env:TEMP ("wanderer-game-voice-" + [guid]::NewGuid().ToString("N") + ".json")
 
 $gamePort = $null
@@ -73,20 +72,32 @@ if (-not (Test-PythonImports -PythonPath $pythonPath -ImportStatement "import fa
     }
 }
 
-# Voice is optional. The launcher reads WANDERER_TTS_* from the project .env,
-# starts the user's local GPT-SoVITS API on 127.0.0.1:9880, and exits quietly
-# when voice is disabled. The launcher auto-selects a usable CUDA runtime and
-# falls back to CPU when CUDA is unavailable. Model loading may take a few minutes.
-$voiceLauncher = Start-Process -FilePath $pythonPath -ArgumentList @(
-    "scripts\start_gpt_sovits.py", "--state-file", $voiceSessionFile
-) -WorkingDirectory $projectRoot -PassThru -WindowStyle Hidden
-Write-Host "GPT-SoVITS 语音服务正在后台准备（若已关闭语音则会自动跳过）。"
-
-$server = Start-Process -FilePath $pythonPath -ArgumentList @(
-    "-m", "uvicorn", "backend.app.main:app", "--host", "127.0.0.1", "--port", "$gamePort"
-) -WorkingDirectory $projectRoot -PassThru -NoNewWindow
-
+$server = $null
 try {
+    # Voice is optional. The launcher reads WANDERER_TTS_* from the project .env,
+    # checks the configured local API, and reports actionable setup diagnostics.
+    # Wait for its result before starting the web app. Native stderr must not abort
+    # Windows PowerShell when voice is unavailable. Model loading can take minutes.
+    Write-Host "正在检查 GPT-SoVITS 语音服务。"
+    $voiceErrorPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        $voiceOutput = & $pythonPath "scripts\start_gpt_sovits.py" --state-file $voiceSessionFile 2>&1
+        $voiceExitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $voiceErrorPreference
+    }
+    foreach ($voiceLine in $voiceOutput) {
+        Write-Host "$voiceLine"
+    }
+    if ($voiceExitCode -ne 0) {
+        Write-Host "语音暂不可用；继续启动文字对话。请按上方变量提示检查配置。" -ForegroundColor Yellow
+    }
+
+    $server = Start-Process -FilePath $pythonPath -ArgumentList @(
+        "-m", "uvicorn", "backend.app.main:app", "--host", "127.0.0.1", "--port", "$gamePort"
+    ) -WorkingDirectory $projectRoot -PassThru -NoNewWindow
+
     $ready = $false
     for ($attempt = 0; $attempt -lt 40; $attempt++) {
         Start-Sleep -Milliseconds 250
@@ -115,11 +126,5 @@ try {
     }
     if (Test-Path $pythonPath) {
         & $pythonPath "scripts\start_gpt_sovits.py" --stop --state-file $voiceSessionFile 2>$null
-    }
-    if ($null -ne $voiceLauncher) {
-        $voiceLauncher.Refresh()
-        if (-not $voiceLauncher.HasExited) {
-            Stop-Process -Id $voiceLauncher.Id -Force
-        }
     }
 }

@@ -6,6 +6,8 @@ const test = require("node:test");
 const vm = require("node:vm");
 
 const source = fs.readFileSync(path.join(__dirname, "..", "frontend", "app.js"), "utf8");
+const index = fs.readFileSync(path.join(__dirname, "..", "frontend", "index.html"), "utf8");
+const styles = fs.readFileSync(path.join(__dirname, "..", "frontend", "styles.css"), "utf8");
 
 function storySession({ id = "story-1", finished = false, history = [] } = {}) {
   return {
@@ -35,7 +37,7 @@ function storySession({ id = "story-1", finished = false, history = [] } = {}) {
   };
 }
 
-function makeBrowser({ hash = "#home", storage = {}, providerError = false, deferRegenerate = false, regenerateError = false, deleteChatError = false, deferDeleteChat = false, deferChat = false, deferChatDespiteAbort = false, deferChatCancel = false, chatCancelFailures = 0, chatCancelCommitted = false, chatHistory = [], deferStoryTurn = false, finishStoryTurn = false, deferVoice = false, deferVoiceAfter = 0, deferVoiceStatus = false, deferAudioReady = false, deferAudioStart = false, deferAudioEnd = false, deferStreamReads = false, suppressAudioPlaying = false, audioRequiresGesture = false, voiceEnabled = false, browserSpeech = false, voiceReadyAfter = 0, voiceError = false, streamChat = false, chatStreamChunks = ["第一句。", "第二句！"], chatReply = "我听见了。" } = {}) {
+function makeBrowser({ hash = "#home", storage = {}, sharedValues = null, channelBus = null, modelTestError = null, modelTestNetworkError = false, deferModelTest = false, chatApiError = null, deferRetryChat = false, providerError = false, deferRegenerate = false, regenerateError = false, deleteChatError = false, deferDeleteChat = false, deferChat = false, deferChatDespiteAbort = false, deferChatCancel = false, chatCancelFailures = 0, chatCancelCommitted = false, chatHistory = [], deferStoryTurn = false, finishStoryTurn = false, deferVoice = false, deferVoiceAfter = 0, deferVoiceStatus = false, deferAudioReady = false, deferAudioStart = false, deferAudioEnd = false, deferStreamReads = false, suppressAudioPlaying = false, audioRequiresGesture = false, voiceEnabled = false, browserSpeech = false, speechThrow = false, compatibilityVoiceAvailable = true, voiceDiagnostics = [], voiceStatusError = false, voiceReadyAfter = 0, voiceError = false, streamChat = false, chatStreamChunks = ["第一句。", "第二句！"], chatReply = "我听见了。" } = {}) {
   const listeners = {};
   const calls = [];
   const events = [];
@@ -43,18 +45,29 @@ function makeBrowser({ hash = "#home", storage = {}, providerError = false, defe
   const speechPlayback = [];
   const audioInstances = [];
   const timerDelays = [];
-  const values = new Map(Object.entries(storage));
+  const values = sharedValues || new Map(Object.entries(storage));
+  const sessionValues = new Map();
   let markup = "";
   let errorMarkup = "";
+  const modelControls = {
+    provider: { name: "provider", value: "", matches: (selector) => selector === "[data-model-preset]" },
+    endpoint: { name: "endpoint", value: "" },
+    model: { name: "model", value: "" },
+    api_key: { name: "api_key", value: "", type: "password", autocomplete: "new-password" },
+    remember: { name: "remember", checked: false },
+  };
   let resolveRegenerate;
   let resolveChat;
   let resolveChatCancel;
   let chatPostRequestCount = 0;
+  let chatErrorReturned = false;
   let chatCancelRequestCount = 0;
   let resolveDeleteChat;
   let resolveStoryTurn;
   let resolveVoice;
   let resolveVoiceStatus;
+  let resolveModelTest;
+  let modelTestRequestCount = 0;
   const pendingAudioReady = [];
   let resolveAudioStart;
   let resolveStreamRead;
@@ -73,6 +86,8 @@ function makeBrowser({ hash = "#home", storage = {}, providerError = false, defe
       return [chatInputControl, deleteChatControl];
     },
     querySelector(selector) {
+      const modelField = selector.match(/\[name="(provider|endpoint|model|api_key|remember)"\]/)?.[1];
+      if (modelField) return modelControls[modelField];
       if (selector === "[data-player-name]") return null;
       if (selector === "[data-streaming-reply]" && markup.includes("data-streaming-reply")) {
         return {
@@ -83,7 +98,7 @@ function makeBrowser({ hash = "#home", storage = {}, providerError = false, defe
           },
         };
       }
-      if (selector.includes("data-error") || selector.includes("data-chat-error")) {
+      if (selector.includes("data-error") || selector.includes("data-chat-error") || selector.includes("data-model-settings-error")) {
         return { set innerHTML(value) { errorMarkup = value; }, get innerHTML() { return errorMarkup; } };
       }
       return null;
@@ -97,9 +112,19 @@ function makeBrowser({ hash = "#home", storage = {}, providerError = false, defe
     setItem(key, value) { values.set(key, String(value)); },
     removeItem(key) { values.delete(key); },
   };
+  const sessionStorage = {
+    getItem(key) { return sessionValues.has(key) ? sessionValues.get(key) : null; },
+    setItem(key, value) { sessionValues.set(key, String(value)); },
+    removeItem(key) { sessionValues.delete(key); },
+  };
+  const storageEventListeners = new Set();
+  const storageListener = (listener) => storageEventListeners.add(listener);
   const window = {
     location: { hash },
-    addEventListener(type, listener) { listeners[`window:${type}`] = listener; },
+    addEventListener(type, listener) {
+      listeners[`window:${type}`] = listener;
+      if (type === "storage") storageListener(listener);
+    },
     setTimeout(callback, delay = 0) {
       const id = ++nextTimerId;
       timers.push({ id, callback, delay });
@@ -118,6 +143,15 @@ function makeBrowser({ hash = "#home", storage = {}, providerError = false, defe
     },
     confirm() { return true; },
   };
+  const bus = channelBus || { channels: new Set() };
+  class FakeBroadcastChannel {
+    constructor(name) { this.name = name; this.onmessage = null; bus.channels.add(this); }
+    postMessage(data) { for (const channel of bus.channels) if (channel !== this && channel.name === this.name) channel.onmessage?.({ data }); }
+    close() { bus.channels.delete(this); }
+  }
+  class FakeStorageEvent {
+    constructor(type, init = {}) { this.type = type; Object.assign(this, init); }
+  }
   const document = {
     querySelector(selector) {
       return ({ "#app": root, ".topbar-right": modeControl, "#toast": toast })[selector] || null;
@@ -149,15 +183,36 @@ function makeBrowser({ hash = "#home", storage = {}, providerError = false, defe
     calls.push({ url, options });
     if (url === "/api/voice/stream" && options.method === "POST") events.push({ type: "voice-request" });
     if (url === "/api/voice/status") {
+      if (voiceStatusError) throw new Error("private-status-error");
       voiceStatusChecks += 1;
       const enabled = voiceReadyAfter ? voiceStatusChecks >= voiceReadyAfter : voiceEnabled;
       const configured = voiceReadyAfter ? true : voiceEnabled;
+      const status = { enabled, configured, mode: configured ? "local" : "unconfigured", diagnostics: voiceDiagnostics, compatibility_voice_available: compatibilityVoiceAvailable };
       if (deferVoiceStatus && voiceStatusChecks === 1) {
         return await new Promise((resolve) => {
-          resolveVoiceStatus = () => resolve({ ok: true, json: async () => ({ data: { enabled, configured } }) });
+          resolveVoiceStatus = () => resolve({ ok: true, json: async () => ({ data: status }) });
         });
       }
-      return { ok: true, json: async () => ({ data: { enabled, configured } }) };
+      return { ok: true, json: async () => ({ data: status }) };
+    }
+    if (url === "/api/model/providers") {
+      return { ok: true, json: async () => ({ data: [{ id: "deepseek", label: "DeepSeek", endpoint: "https://api.deepseek.com/v1", default_model: "deepseek-v4.1-flash" }] }) };
+    }
+    if (url === "/api/model/test" && options.method === "POST") {
+      const requestNumber = modelTestRequestCount++;
+      if (modelTestNetworkError) throw new TypeError("Failed to fetch");
+      if (deferModelTest && requestNumber === 0) {
+        return await new Promise((resolve, reject) => {
+          resolveModelTest = resolve;
+          options.signal?.addEventListener("abort", () => {
+            const error = new Error("aborted");
+            error.name = "AbortError";
+            reject(error);
+          });
+        });
+      }
+      if (modelTestError) return { ok: false, json: async () => ({ error: { code: modelTestError.code, message: modelTestError.message || "连接失败。", details: modelTestError.details || {} }, request_id: modelTestError.request_id || "request-model-test" }) };
+      return { ok: true, json: async () => ({ data: { ok: true, model: JSON.parse(options.body).model, endpoint: "https://api.deepseek.com/v1/chat/completions" } }) };
     }
     if (url === "/api/voice/stream" && options.method === "POST") {
       if (voiceError) throw new Error("Voice service unavailable");
@@ -231,7 +286,14 @@ function makeBrowser({ hash = "#home", storage = {}, providerError = false, defe
     }
     if (url === "/api/chat/sessions/chat-1/regenerate" && options.method === "POST") {
       if (deferRegenerate) {
-        await new Promise((resolve) => { resolveRegenerate = resolve; });
+        await new Promise((resolve, reject) => {
+          resolveRegenerate = resolve;
+          options.signal?.addEventListener("abort", () => {
+            const error = new Error("aborted");
+            error.name = "AbortError";
+            reject(error);
+          });
+        });
       }
       if (regenerateError) {
         return { ok: false, json: async () => ({ error: { message: "重新生成失败，请稍后重试。" } }) };
@@ -245,6 +307,13 @@ function makeBrowser({ hash = "#home", storage = {}, providerError = false, defe
           },
         }),
       };
+    }
+    if (url === "/api/chat/sessions/chat-1/messages" && chatApiError) {
+      if (!chatErrorReturned) {
+        chatErrorReturned = true;
+        chatPostRequestCount += 1;
+        return { ok: false, json: async () => ({ error: { code: chatApiError.code, message: chatApiError.message || "聊天失败。", details: chatApiError.details || {} }, request_id: chatApiError.request_id || "request-chat" }) };
+      }
     }
     if (url === "/api/chat/sessions/chat-1/messages" && providerError) {
       return {
@@ -301,6 +370,16 @@ function makeBrowser({ hash = "#home", storage = {}, providerError = false, defe
               reject(error);
             });
           }
+        });
+      }
+      if (deferRetryChat && requestNumber === 1) {
+        return await new Promise((resolve, reject) => {
+          resolveChat = resolve;
+          options.signal?.addEventListener("abort", () => {
+            const error = new Error("aborted");
+            error.name = "AbortError";
+            reject(error);
+          });
         });
       }
       return {
@@ -441,6 +520,7 @@ function makeBrowser({ hash = "#home", storage = {}, providerError = false, defe
     paused: false,
     current: null,
     speak(utterance) {
+      if (speechThrow) throw new Error("speech unavailable");
       this.current = utterance;
       this.speaking = true;
       this.paused = false;
@@ -469,6 +549,7 @@ function makeBrowser({ hash = "#home", storage = {}, providerError = false, defe
     document,
     window,
     localStorage,
+    sessionStorage,
     fetch,
     console,
     navigator,
@@ -476,6 +557,8 @@ function makeBrowser({ hash = "#home", storage = {}, providerError = false, defe
     TextDecoder,
     URL: { createObjectURL: () => "blob:voice-response", revokeObjectURL() {} },
     AbortController: FakeAbortController,
+    BroadcastChannel: FakeBroadcastChannel,
+    StorageEvent: FakeStorageEvent,
     SpeechSynthesisUtterance: browserSpeech ? FakeSpeechSynthesisUtterance : undefined,
   };
   if (browserSpeech) context.window.speechSynthesis = speechSynthesis;
@@ -486,6 +569,8 @@ function makeBrowser({ hash = "#home", storage = {}, providerError = false, defe
     events,
     root,
     values,
+    sessionValues,
+    channelBus: bus,
     clipboardWrites,
     audioPlayback,
     speechPlayback,
@@ -496,6 +581,7 @@ function makeBrowser({ hash = "#home", storage = {}, providerError = false, defe
     get streamReaderCancelled() { return streamReaderCancelled; },
     get speechPaused() { return Boolean(speechSynthesis.paused); },
     get speechSpeaking() { return Boolean(speechSynthesis.speaking); },
+    get voiceMode() { return vm.runInNewContext("appState.voiceMode", context); },
     get serverChatMessages() { return serverChatMessages.map((message) => ({ ...message })); },
     async runNextTimer() {
       const timer = timers.shift();
@@ -554,6 +640,48 @@ function makeBrowser({ hash = "#home", storage = {}, providerError = false, defe
       listeners["window:hashchange"]();
       await settle();
     },
+    triggerStorage(key, newValue = null) {
+      for (const listener of storageEventListeners) listener(new FakeStorageEvent("storage", { key, newValue, storageArea: localStorage }));
+    },
+    async submitModelSettings({ provider = "", endpoint = "", model = "", api_key = "", remember = false } = {}) {
+      const fields = { provider, endpoint, model, api_key, remember };
+      for (const [name, value] of Object.entries(fields)) {
+        if (name === "remember") modelControls[name].checked = Boolean(value);
+        else modelControls[name].value = value;
+      }
+      listeners["root:submit"]({
+        target: {
+          matches: (selector) => selector === '[data-form="model-settings"]',
+          dataset: {},
+          querySelector(selector) { return root.querySelector(selector); },
+        },
+        preventDefault() {},
+      });
+      await settle();
+    },
+    async submitVoiceSettings() {
+      listeners["root:submit"]({
+        target: {
+          matches: (selector) => selector === '[data-form="voice-settings"]',
+          querySelector() { return null; },
+        },
+        preventDefault() {},
+      });
+      await settle();
+    },
+    async selectModelPreset(provider) {
+      modelControls.provider.value = provider;
+      listeners["root:change"]?.({ target: modelControls.provider });
+      await settle();
+    },
+    get modelControls() { return modelControls; },
+    async testModelConnection() {
+      await this.click("test-model");
+      await settle();
+    },
+    get modelTestSignal() { return calls.findLast((call) => call.url === "/api/model/test")?.options.signal || null; },
+    get chatSignal() { return calls.findLast((call) => call.url === "/api/chat/sessions/chat-1/messages")?.options.signal || null; },
+    get regenerateSignal() { return calls.findLast((call) => call.url === "/api/chat/sessions/chat-1/regenerate")?.options.signal || null; },
     get errorMarkup() { return errorMarkup; },
     get hash() { return window.location.hash; },
     resolveRegenerate() {
@@ -618,6 +746,148 @@ function makeBrowser({ hash = "#home", storage = {}, providerError = false, defe
 async function settle() {
   for (let index = 0; index < 6; index += 1) await new Promise((resolve) => setImmediate(resolve));
 }
+
+test("browser has exactly one shared SSE reader", () => {
+  const frontend = path.join(__dirname, "..", "frontend");
+  const definitions = fs.readdirSync(frontend, { recursive: true })
+    .filter((name) => name.endsWith(".js"))
+    .flatMap((name) => [...fs.readFileSync(path.join(frontend, name), "utf8")
+      .matchAll(/\b(?:async\s+)?function\s*\*?\s+readSseEvents\s*\(/g)].map(() => name));
+  assert.deepEqual(definitions, ["app.js"]);
+});
+
+test("free chat renders one contextual model settings link beside the scene heading", () => {
+  const browser = makeBrowser({ hash: "#/chat" });
+  assert.equal((browser.root.innerHTML.match(/class="secondary-btn model-settings-link"/g) || []).length, 1);
+  assert.match(browser.root.innerHTML, /scene-head[\s\S]*class="secondary-btn model-settings-link"/);
+  assert.doesNotMatch(browser.root.innerHTML, /chat-start-btn[\s\S]*model-settings-link/);
+});
+
+test("free chat places model and voice settings links together with centered cyan labels", () => {
+  const browser = makeBrowser({ hash: "#/chat" });
+  assert.match(browser.root.innerHTML, /class="scene-head-actions"[\s\S]*href="#\/settings\/model"[^>]*>模型设置<\/a>[\s\S]*href="#\/settings\/voice"[^>]*>语音设置<\/a>/);
+  assert.match(styles, /\.scene-head-actions\s*\{[\s\S]*display:\s*flex/);
+  const sceneActionStyles = styles.split(".scene-head-actions a.secondary-btn")[1].split("}", 1)[0];
+  assert.match(sceneActionStyles, /text-decoration:\s*none/);
+  assert.match(sceneActionStyles, /justify-content:\s*center/);
+  assert.match(sceneActionStyles, /color:\s*var\(--cyan-blue\)/);
+});
+
+test("desktop navigation includes model and voice settings in the expected order", () => {
+  const navigation = index.match(/<nav class="site-nav"[\s\S]*?<\/nav>/)?.[0] || "";
+  assert.equal((navigation.match(/href="#\/settings\/model"/g) || []).length, 1);
+  assert.equal((navigation.match(/href="#\/settings\/voice"/g) || []).length, 1);
+  assert.match(navigation, /模型设置<\/a>[\s\S]*语音设置<\/a>[\s\S]*角色与玩法<\/a>/);
+});
+
+test("voice settings route exposes all voice modes and saves the selected mode", async () => {
+  const browser = makeBrowser({ hash: "#/settings/voice", voiceEnabled: true, browserSpeech: true, compatibilityVoiceAvailable: true });
+  await settle();
+  assert.match(browser.root.innerHTML, /data-form="voice-settings"/);
+  assert.match(browser.root.innerHTML, /data-voice-mode="trained"[^>]*>角色音色<\/button>/);
+  assert.match(browser.root.innerHTML, /data-voice-mode="compatibility"[^>]*>使用系统兼容音色<\/button>/);
+  assert.match(browser.root.innerHTML, /data-voice-mode="text"[^>]*>仅显示文字<\/button>/);
+  assert.match(browser.root.innerHTML, /<button class="primary-btn" type="submit">保存设置<\/button>/);
+  await browser.click("set-voice-mode", { voiceMode: "text" });
+  await browser.submitVoiceSettings();
+  assert.deepEqual(JSON.parse(browser.values.get("wanderer-voice-settings-v1")), { mode: "text" });
+});
+
+test("saved voice modes survive transient unavailability and settings can retry status", async () => {
+  const browser = makeBrowser({
+    hash: "#/settings/voice",
+    storage: { "wanderer-voice-settings-v1": JSON.stringify({ mode: "trained" }) },
+    voiceReadyAfter: 2,
+  });
+  await settle();
+
+  assert.equal(browser.voiceMode, "trained");
+  assert.match(browser.root.innerHTML, /data-voice-mode="trained"[^>]*aria-pressed="true"[^>]*disabled/);
+  assert.match(browser.root.innerHTML, /data-action="retry-voice-status"[^>]*>重试语音状态<\/button>/);
+
+  await browser.click("retry-voice-status");
+  assert.equal(browser.voiceMode, "trained");
+  assert.match(browser.root.innerHTML, /data-voice-mode="trained"[^>]*aria-pressed="true"/);
+  assert.doesNotMatch(browser.root.innerHTML, /data-action="retry-voice-status"/);
+});
+
+test("saved compatibility voice is not overwritten when browser speech is temporarily unavailable", async () => {
+  const browser = makeBrowser({
+    hash: "#/settings/voice",
+    storage: { "wanderer-voice-settings-v1": JSON.stringify({ mode: "compatibility" }) },
+    browserSpeech: false,
+    compatibilityVoiceAvailable: false,
+  });
+  await settle();
+
+  assert.equal(browser.voiceMode, "compatibility");
+  assert.match(browser.root.innerHTML, /data-voice-mode="compatibility"[^>]*aria-pressed="true"[^>]*disabled/);
+});
+
+test("chat and story move voice mode controls into the voice settings page", async () => {
+  const chat = makeBrowser({ hash: "#/chat", voiceEnabled: true, browserSpeech: true, compatibilityVoiceAvailable: true });
+  await settle();
+  assert.doesNotMatch(chat.root.innerHTML, /class="voice-controls"|data-action="set-voice-mode"/);
+  assert.match(chat.root.innerHTML, /class="secondary-btn voice-settings-link"/);
+
+  const story = makeBrowser({ hash: "#/stories", storage: { "wanderer-player-name": "清岚" }, voiceEnabled: true });
+  await story.click("select-story", { replayId: "demo_guarded_path" });
+  assert.doesNotMatch(story.root.innerHTML, /class="voice-controls"|data-action="set-voice-mode"/);
+
+  const settings = makeBrowser({ hash: "#/settings/voice", voiceEnabled: true, browserSpeech: true, compatibilityVoiceAvailable: true });
+  await settle();
+  assert.equal((settings.root.innerHTML.match(/data-action="set-voice-mode"/g) || []).length, 3);
+});
+
+test("free chat settings links are centered and remove the heading underline", () => {
+  const modelBrowser = makeBrowser({ hash: "#/settings/model" });
+  assert.match(modelBrowser.root.innerHTML, /<h1>模型设置<\/h1>/);
+  const voiceBrowser = makeBrowser({ hash: "#/settings/voice" });
+  assert.match(voiceBrowser.root.innerHTML, /<h1>语音设置<\/h1>/);
+  const sceneActionStyles = styles.split(".scene-head-actions a.secondary-btn")[1].split("}", 1)[0];
+  assert.match(sceneActionStyles, /display:\s*inline-flex/);
+  assert.match(sceneActionStyles, /align-items:\s*center/);
+  assert.match(sceneActionStyles, /justify-content:\s*center/);
+  assert.match(sceneActionStyles, /color:\s*var\(--cyan-blue\)/);
+  assert.match(styles, /\.chat-panel\s*>\s*\.scene-head\s*\{[\s\S]*border-bottom:\s*0/);
+});
+
+test("model connection reads the visible form values before sending the test request", async () => {
+  const browser = makeBrowser({ hash: "#/settings/model" });
+  browser.modelControls.endpoint.value = "https://provider.example/v1";
+  browser.modelControls.model.value = "visible-model";
+  browser.modelControls.api_key.value = "visible-key";
+  await browser.testModelConnection();
+  const request = browser.calls.findLast((call) => call.url === "/api/model/test");
+  assert.deepEqual(JSON.parse(request.options.body), {
+    endpoint: "https://provider.example/v1",
+    model: "visible-model",
+    api_key: "visible-key",
+  });
+});
+
+test("remembered model settings never enter offline story JSON requests", async () => {
+  const browser = makeBrowser({
+    hash: "#/stories",
+    storage: {
+      "wanderer-player-name": "清岚",
+      "wanderer-model-settings-v1": JSON.stringify({ endpoint: "https://custom.example/v1", model: "story-isolation-model", api_key: "story-isolation-key", remembered: true }),
+    },
+  });
+  await browser.click("select-story", { replayId: "demo_guarded_path" });
+  await browser.click("option", { option: "listen" });
+  await browser.runNextTimer();
+
+  const requests = browser.calls.filter((call) => call.url.startsWith("/api/sessions"));
+  assert.equal(requests.length, 2);
+  assert.deepEqual(JSON.parse(requests[0].options.body), { mode: "offline", replay_id: "demo_guarded_path", player_name: "清岚" });
+  assert.deepEqual(JSON.parse(requests[1].options.body), { option_id: "listen" });
+  for (const request of requests) {
+    assert.doesNotMatch(JSON.stringify(request.options), /story-isolation|custom\.example|text\/event-stream|X-Chat-Stream-ID/);
+  }
+  assert.equal(browser.calls.some((call) => call.url.startsWith("/api/model") || call.url.startsWith("/api/chat")), false);
+  assert.match(browser.root.innerHTML, /查阅旧档案/);
+});
 
 test("story catalog selection creates a fixed replay, hides mode controls, and renders no emotion", async () => {
   const browser = makeBrowser({ hash: "#/stories", storage: { "wanderer-player-name": "清岚" } });
@@ -1297,6 +1567,7 @@ test("pausing a restored chat gates an edited resend and ignores the abandoned l
   assert.ok(cancelCall, "pause sends a server cancellation request");
   assert.equal(cancelCall.options.method, "POST");
   assert.equal(cancelCall.options.keepalive, true);
+  assert.ok(cancelCall.options.signal, "server cancellation is tied to the shared abort controller");
   assert.equal(cancelCall.options.headers["X-Chat-Stream-ID"], firstStreamId);
 
   browser.inputChat("改写后的问题");
@@ -1450,7 +1721,7 @@ test("free chat reply offers copy and regenerate shortcuts", async () => {
   assert.deepEqual(browser.clipboardWrites, ["我听见了。"]);
 });
 
-test("story replies use browser Chinese speech when the local voice service is unavailable", async () => {
+test("unavailable story voice preserves text without implicit browser speech", async () => {
   const browser = makeBrowser({
     hash: "#/stories",
     storage: { "wanderer-player-name": "清岚" },
@@ -1459,11 +1730,13 @@ test("story replies use browser Chinese speech when the local voice service is u
 
   await browser.click("select-story", { replayId: "demo_guarded_path" });
 
-  assert.deepEqual(browser.speechPlayback, ["沿着这条线索继续查。"]);
+  assert.deepEqual(browser.speechPlayback, []);
   assert.equal(browser.audioPlayback.length, 0);
+  assert.equal(browser.voiceMode, "text");
+  assert.match(browser.root.innerHTML, /沿着这条线索继续查。/);
 });
 
-test("story replies fall back to browser speech when configured TTS audio cannot play", async () => {
+test("failed trained story playback preserves text without browser substitution", async () => {
   const browser = makeBrowser({
     hash: "#/stories",
     storage: { "wanderer-player-name": "清岚" },
@@ -1474,10 +1747,11 @@ test("story replies fall back to browser speech when configured TTS audio cannot
 
   await browser.click("select-story", { replayId: "demo_guarded_path" });
 
-  assert.deepEqual(browser.speechPlayback, ["沿着这条线索继续查。"]);
+  assert.deepEqual(browser.speechPlayback, []);
+  assert.match(browser.root.innerHTML, /沿着这条线索继续查。/);
 });
 
-test("free chat uses pausable browser Chinese speech when the local voice service is unavailable", async () => {
+test("free chat requires explicit labeled compatibility voice and stops it on route change", async () => {
   const browser = makeBrowser({
     hash: "#/chat",
     storage: { "wanderer-player-name": "清岚" },
@@ -1486,6 +1760,12 @@ test("free chat uses pausable browser Chinese speech when the local voice servic
   await browser.click("start-chat");
   await browser.submitChat("你好");
 
+  assert.deepEqual(browser.speechPlayback, []);
+  assert.equal(browser.voiceMode, "text");
+  assert.match(browser.root.innerHTML, /我听见了。/);
+  await browser.click("set-voice-mode", { voiceMode: "compatibility" });
+  assert.equal(browser.voiceMode, "compatibility");
+  await browser.submitChat("再说一次");
   assert.deepEqual(browser.speechPlayback, ["我听见了。"]);
   assert.equal(browser.speechSpeaking, true);
   assert.match(browser.root.innerHTML, /data-action="pause-voice"/);
@@ -1500,7 +1780,7 @@ test("free chat uses pausable browser Chinese speech when the local voice servic
   assert.equal(browser.speechSpeaking, false);
 });
 
-test("streamed chat speaks each reply chunk in order when the local voice service is unavailable", async () => {
+test("explicit compatibility voice speaks streamed chunks in order", async () => {
   const browser = makeBrowser({
     hash: "#/chat",
     storage: { "wanderer-player-name": "清岚" },
@@ -1509,6 +1789,7 @@ test("streamed chat speaks each reply chunk in order when the local voice servic
     chatStreamChunks: ["第一句。", "第二句！"],
   });
   await browser.click("start-chat");
+  await browser.click("set-voice-mode", { voiceMode: "compatibility" });
   browser.submitChatPending("你好");
   await settle();
 
@@ -1525,6 +1806,133 @@ test("streamed chat speaks each reply chunk in order when the local voice servic
   browser.resolveSpeechEnd();
   await settle();
   assert.match(browser.root.innerHTML, /第一句。第二句！/);
+});
+
+test("synchronous compatibility speech failure releases buffered text", async () => {
+  const browser = makeBrowser({
+    hash: "#/chat",
+    storage: { "wanderer-player-name": "清岚" },
+    browserSpeech: true,
+    speechThrow: true,
+    streamChat: true,
+  });
+  await browser.click("start-chat");
+  await browser.click("set-voice-mode", { voiceMode: "compatibility" });
+  await browser.submitChat("你好");
+  assert.match(browser.root.innerHTML, /第一句。/);
+  assert.match(browser.root.innerHTML, /第二句！/);
+});
+
+test("unavailable streamed voice releases all text without opting into browser speech", async () => {
+  const browser = makeBrowser({ hash: "#/chat", storage: { "wanderer-player-name": "清岚" }, browserSpeech: true, streamChat: true });
+  await browser.click("start-chat");
+  await browser.submitChat("你好");
+  assert.deepEqual(browser.speechPlayback, []);
+  assert.match(browser.root.innerHTML, /第一句。第二句！/);
+  assert.doesNotMatch(browser.root.innerHTML, /正在思考/);
+});
+
+test("failed trained chat voice releases text without browser substitution", async () => {
+  for (const streamChat of [false, true]) {
+    const browser = makeBrowser({ hash: "#/chat", storage: { "wanderer-player-name": "清岚" }, browserSpeech: true, voiceEnabled: true, voiceError: true, streamChat });
+    await browser.click("start-chat");
+    await browser.submitChat("你好");
+    assert.deepEqual(browser.speechPlayback, []);
+    assert.equal(browser.voiceMode, "text");
+    assert.match(browser.root.innerHTML, streamChat ? /第一句。第二句！/ : /我听见了。/);
+  }
+});
+
+test("compatibility selection takes precedence over trained voice and users can return to trained or text", async () => {
+  const browser = makeBrowser({ hash: "#/chat", storage: { "wanderer-player-name": "清岚" }, browserSpeech: true, voiceEnabled: true });
+  await browser.click("start-chat");
+  assert.equal(browser.voiceMode, "trained");
+  await browser.click("set-voice-mode", { voiceMode: "compatibility" });
+  await browser.submitChat("系统朗读");
+  assert.deepEqual(browser.speechPlayback, ["我听见了。"]);
+  assert.deepEqual(browser.audioPlayback, []);
+  await browser.click("set-voice-mode", { voiceMode: "trained" });
+  assert.equal(browser.speechSpeaking, false);
+  assert.equal(browser.voiceMode, "trained");
+  await browser.submitChat("角色朗读");
+  assert.deepEqual(browser.audioPlayback, ["blob:voice-response"]);
+  await browser.click("set-voice-mode", { voiceMode: "text" });
+  assert.equal(browser.voiceMode, "text");
+  assert.equal(browser.audioInstances.every((audio) => audio.paused), true);
+  await browser.click("retry-voice-status");
+  await browser.submitChat("只显示文字");
+  assert.equal(browser.voiceMode, "text");
+  assert.equal(browser.audioPlayback.length, 1);
+  assert.equal(browser.speechPlayback.length, 1);
+  assert.match(browser.root.innerHTML, /我听见了。/);
+});
+
+test("route cleanup stops compatibility streaming and prevents queued or late chunks from speaking", async () => {
+  const browser = makeBrowser({ hash: "#/chat", storage: { "wanderer-player-name": "清岚" }, browserSpeech: true, streamChat: true, deferStreamReads: true });
+  await browser.click("start-chat");
+  await browser.click("set-voice-mode", { voiceMode: "compatibility" });
+  browser.submitChatPending("你好");
+  await settle();
+  browser.releaseNextStreamEvent();
+  await settle();
+  assert.deepEqual(browser.speechPlayback, ["第一句。"]);
+  await browser.setRoute("#home");
+  assert.equal(browser.speechSpeaking, false);
+  browser.resolveSpeechEnd();
+  browser.releaseNextStreamEvent();
+  await settle();
+  browser.releaseNextStreamEvent();
+  await settle();
+  assert.deepEqual(browser.speechPlayback, ["第一句。"]);
+  assert.match(browser.root.innerHTML, /风起异途/);
+});
+
+test("pausing deleting and clearing model settings cancel explicit compatibility voice", async () => {
+  for (const action of ["pause-chat", "delete-chat", "clear-model-settings"]) {
+    const browser = makeBrowser({ hash: "#/chat", storage: { "wanderer-player-name": "清岚" }, browserSpeech: true, streamChat: true });
+    await browser.click("start-chat");
+    await browser.click("set-voice-mode", { voiceMode: "compatibility" });
+    browser.submitChatPending("你好");
+    await settle();
+    assert.deepEqual(browser.speechPlayback, ["第一句。"]);
+    await browser.click(action, { chatSession: "chat-1" });
+    browser.resolveSpeechEnd();
+    await settle();
+    assert.equal(browser.speechSpeaking, false);
+    assert.deepEqual(browser.speechPlayback, ["第一句。"]);
+    assert.doesNotMatch(browser.root.innerHTML, /第二句/);
+  }
+});
+
+test("voice settings expose safe actionable configuration names", async () => {
+  const cases = [
+    ["TTS_NOT_ENABLED", "WANDERER_TTS_ENABLED"],
+    ["TTS_REFERENCE_AUDIO_MISSING", "WANDERER_TTS_REFERENCE_AUDIO"],
+    ["TTS_ROOT_MISSING", "GPT_SOVITS_ROOT"],
+    ["TTS_WEIGHTS_MISSING", "WANDERER_TTS_GPT_WEIGHTS"],
+    ["TTS_API_INVALID", "WANDERER_TTS_API_URL"],
+    ["TTS_API_UNREACHABLE", "WANDERER_TTS_API_URL"],
+  ];
+  for (const [code, variable] of cases) {
+    const browser = makeBrowser({ hash: "#/settings/voice", browserSpeech: true, voiceDiagnostics: [{ code, message: "private-server-path", action: "secret-token", variables: ["private-variable"], check: "private-check" }] });
+    await settle();
+    assert.equal(browser.voiceMode, "text");
+    assert.match(browser.root.innerHTML, new RegExp(variable));
+    assert.doesNotMatch(browser.root.innerHTML, /private-|secret-token/);
+  }
+});
+
+test("unavailable browser capability or server permission cannot opt into compatibility voice", async () => {
+  for (const options of [{ browserSpeech: false }, { browserSpeech: true, compatibilityVoiceAvailable: false }, { browserSpeech: true, voiceStatusError: true }]) {
+    const browser = makeBrowser({ hash: "#/chat", storage: { "wanderer-player-name": "清岚" }, ...options });
+    await browser.click("start-chat");
+    await browser.click("set-voice-mode", { voiceMode: "compatibility" });
+    await browser.submitChat("你好");
+    assert.equal(browser.voiceMode, "text");
+    assert.deepEqual(browser.speechPlayback, []);
+    assert.match(browser.root.innerHTML, /我听见了。/);
+    assert.doesNotMatch(browser.root.innerHTML, /private-status-error/);
+  }
 });
 
 test("choosing a story option immediately pauses the previous voice playback", async () => {
@@ -1966,5 +2374,168 @@ test("free chat regenerate restores the old reply when the request fails", async
   assert.match(browser.root.innerHTML, /我听见了/);
   assert.doesNotMatch(browser.root.innerHTML, /正在思考……/);
   assert.match(browser.errorMarkup, /重新生成失败，请稍后重试/);
+});
+
+test("model settings route loads provider presets without cache and never fills a preset Key", async () => {
+  const browser = makeBrowser({ hash: "#/chat", storage: { "wanderer-player-name": "清岚" } });
+  assert.match(browser.root.innerHTML, /#\/settings\/model/);
+  await browser.setRoute("#/settings/model");
+  const providers = browser.calls.find((call) => call.url === "/api/model/providers");
+  assert.equal(providers.options.cache, "no-store");
+  await browser.selectModelPreset("deepseek");
+  assert.match(browser.root.innerHTML, /api\.deepseek\.com\/v1/);
+  assert.match(browser.root.innerHTML, /deepseek-v4\.1-flash/);
+  assert.match(browser.root.innerHTML, /type="password"/);
+  assert.match(browser.root.innerHTML, /autocomplete="new-password"/);
+  assert.match(browser.root.innerHTML, /autocomplete="off"/);
+  assert.equal(browser.modelControls.api_key.value, "");
+});
+
+test("model settings are lost after refresh unless remember is selected", async () => {
+  const sharedValues = new Map();
+  const browser = makeBrowser({ hash: "#/settings/model", sharedValues });
+  await browser.submitModelSettings({ endpoint: "https://custom.example/v1", model: "custom-model", api_key: "memory-secret" });
+  assert.equal(sharedValues.has("wanderer-model-settings-v1"), false);
+  const refreshed = makeBrowser({ hash: "#/settings/model", sharedValues });
+  assert.doesNotMatch(refreshed.root.innerHTML, /custom\.example|custom-model|memory-secret/);
+  await refreshed.submitModelSettings({ endpoint: "https://custom.example/v1", model: "custom-model", api_key: "remembered-secret", remember: true });
+  const saved = JSON.parse(sharedValues.get("wanderer-model-settings-v1"));
+  assert.equal(saved.remembered, true);
+  assert.equal(saved.api_key, "remembered-secret");
+  const restored = makeBrowser({ hash: "#/settings/model", sharedValues });
+  assert.match(restored.root.innerHTML, /custom\.example/);
+  assert.doesNotMatch(restored.root.innerHTML, /remembered-secret/);
+  assert.equal(restored.modelControls.api_key.value, "remembered-secret");
+});
+
+test("clearing model settings broadcasts to another tab and removes all local copies", async () => {
+  const sharedValues = new Map([["wanderer-model-settings-v1", JSON.stringify({ endpoint: "https://custom.example/v1", model: "custom-model", api_key: "remembered-secret", remembered: true })]]);
+  const channelBus = { channels: new Set() };
+  const firstTab = makeBrowser({ hash: "#/settings/model", sharedValues, channelBus });
+  const secondTab = makeBrowser({ hash: "#/settings/model", sharedValues, channelBus });
+  secondTab.sessionValues.set("wanderer-model-settings", "legacy-secret");
+  await firstTab.click("clear-model-settings");
+  assert.equal(sharedValues.has("wanderer-model-settings-v1"), false);
+  assert.equal(secondTab.sessionValues.has("wanderer-model-settings"), false);
+  assert.doesNotMatch(secondTab.root.innerHTML, /custom\.example|custom-model|remembered-secret/);
+});
+
+test("storage clear events reset the current tab without rebroadcasting", async () => {
+  const sharedValues = new Map([["wanderer-model-settings-v1", JSON.stringify({ endpoint: "https://custom.example/v1", model: "custom-model", api_key: "saved-key", remembered: true })]]);
+  const browser = makeBrowser({ hash: "#/settings/model", sharedValues });
+  browser.triggerStorage("wanderer-model-settings-v1", null);
+  assert.doesNotMatch(browser.root.innerHTML, /custom\.example|custom-model/);
+  assert.equal(sharedValues.has("wanderer-model-settings-v1"), false);
+});
+
+test("clearing settings aborts a pending model connection check", async () => {
+  const browser = makeBrowser({ hash: "#/settings/model", deferModelTest: true });
+  await browser.testModelConnection();
+  assert.equal(browser.modelTestSignal?.aborted, false);
+  await browser.click("clear-model-settings");
+  assert.equal(browser.modelTestSignal?.aborted, true);
+});
+
+test("model connection checks bypass browser caches and settings disclose proxy visibility", async () => {
+  const browser = makeBrowser({ hash: "#/settings/model" });
+  await browser.testModelConnection();
+  const call = browser.calls.findLast((entry) => entry.url === "/api/model/test");
+  assert.equal(call.options.cache, "no-store");
+  assert.match(browser.root.innerHTML, /API Key.*本站后端/);
+  assert.match(browser.root.innerHTML, /用量与费用/);
+});
+
+test("model connection network failures show an actionable backend connectivity message", async () => {
+  const browser = makeBrowser({ hash: "#/settings/model", modelTestNetworkError: true });
+  await browser.testModelConnection();
+  assert.match(browser.errorMarkup, /无法连接模型测试服务/);
+  assert.match(browser.errorMarkup, /检查当前页面网络、HTTPS 站点和后端部署状态/);
+  assert.match(browser.errorMarkup, /data-action="retry-chat"/);
+  assert.doesNotMatch(browser.errorMarkup, /Failed to fetch/);
+});
+
+test("model settings use primary styling for save and test, with secondary clear action", () => {
+  const browser = makeBrowser({ hash: "#/settings/model" });
+  assert.match(browser.root.innerHTML, /<button class="primary-btn" type="submit">保存设置<\/button>/);
+  assert.match(browser.root.innerHTML, /<button class="primary-btn" type="button" data-action="test-model">测试连接<\/button>/);
+  assert.match(browser.root.innerHTML, /<button class="secondary-btn" type="button" data-action="clear-model-settings">清除全部模型设置<\/button>/);
+});
+
+test("clearing settings aborts pending chat and regenerate requests without browser speech", async () => {
+  const storage = { "wanderer-player-name": "清岚", "wanderer-chat-session": "chat-1" };
+  const chat = makeBrowser({ hash: "#/chat", storage, deferChat: true, browserSpeech: true });
+  await chat.submitChat("保留草稿");
+  await chat.setRoute("#/settings/model");
+  await chat.click("clear-model-settings");
+  assert.equal(chat.chatSignal?.aborted, true);
+  assert.deepEqual(chat.speechPlayback, []);
+
+  const history = [{ message: "问题", reply: "旧回复", emotion: "calm" }];
+  const regenerate = makeBrowser({ hash: "#/chat", storage, chatHistory: history, deferRegenerate: true, browserSpeech: true });
+  await regenerate.click("regenerate-reply");
+  await regenerate.setRoute("#/settings/model");
+  await regenerate.click("clear-model-settings");
+  assert.equal(regenerate.regenerateSignal?.aborted, true);
+  assert.deepEqual(regenerate.speechPlayback, []);
+});
+
+test("free chat gives code-specific settings, authorization, retry, and rate-limit actions", async (t) => {
+  const cases = [
+    { name: "missing model", code: "MODEL_NOT_CONFIGURED", action: "open-model-settings", label: "打开模型设置" },
+    { name: "authorization", code: "MODEL_PROVIDER_ERROR", details: { provider_status: 403 }, action: "test-model", label: "检查 Key/权限" },
+    { name: "provider timeout", code: "MODEL_TIMEOUT", action: "edit-model-settings", label: "编辑模型设置" },
+    { name: "bad provider request", code: "MODEL_PROVIDER_ERROR", details: { provider_status: 400 }, action: "edit-model-settings", label: "编辑模型设置" },
+    { name: "missing provider route", code: "MODEL_PROVIDER_ERROR", details: { provider_status: 404 }, action: "edit-model-settings", label: "编辑模型设置" },
+    { name: "invalid model reply", code: "INVALID_AI_RESPONSE", action: "retry-chat", label: "重试" },
+    { name: "rate limit", code: "MODEL_PROVIDER_ERROR", details: { provider_status: 429, retry_after: 10 }, action: "wait-retry", label: "等待后重试" },
+  ];
+  for (const entry of cases) {
+    await t.test(entry.name, async () => {
+      const browser = makeBrowser({
+        hash: "#/chat",
+        storage: { "wanderer-player-name": "清岚", "wanderer-chat-session": "chat-1" },
+        chatApiError: { code: entry.code, message: "安全错误消息。", details: entry.details },
+        browserSpeech: true,
+      });
+      await browser.submitChat("保留我的草稿");
+      assert.match(browser.errorMarkup, new RegExp(`data-action="${entry.action}"`));
+      assert.match(browser.errorMarkup, new RegExp(entry.label));
+      assert.doesNotMatch(browser.errorMarkup, /api_key|provider\.example\/?\?/i);
+      assert.match(browser.root.innerHTML, /保留我的草稿/);
+      assert.deepEqual(browser.speechPlayback, []);
+      if (entry.action === "test-model") {
+        await browser.click("test-model");
+        assert.equal(browser.hash, "#/settings/model");
+        assert.ok(browser.calls.some((call) => call.url === "/api/model/test"));
+      }
+    });
+  }
+});
+
+test("clearing settings aborts an in-flight retry and hides Key, endpoint queries, and provider bodies", async () => {
+  const browser = makeBrowser({
+    hash: "#/settings/model",
+    storage: { "wanderer-player-name": "清岚", "wanderer-chat-session": "chat-1" },
+    chatApiError: {
+      code: "INVALID_AI_RESPONSE",
+      message: "拒绝 private-key https://provider.example/v1?token=query-secret",
+      details: { endpoint: "https://provider.example/v1/chat/completions?token=query-secret", provider_body: "raw-provider-body" },
+    },
+    deferRetryChat: true,
+    browserSpeech: true,
+  });
+  await browser.submitModelSettings({ endpoint: "https://custom.example/v1", model: "private-model", api_key: "private-key" });
+  await browser.setRoute("#/chat");
+  await browser.submitChat("不要丢掉草稿");
+  assert.doesNotMatch(browser.errorMarkup, /private-key|query-secret|raw-provider-body/);
+  assert.match(browser.errorMarkup, /provider\.example\/v1\/chat\/completions/);
+  const retry = browser.click("retry-chat");
+  await settle();
+  assert.ok(browser.chatSignal);
+  await browser.setRoute("#/settings/model");
+  await browser.click("clear-model-settings");
+  assert.equal(browser.chatSignal.aborted, true);
+  await retry;
+  assert.deepEqual(browser.speechPlayback, []);
 });
 

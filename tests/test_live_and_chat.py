@@ -1,15 +1,53 @@
 # 本文件由 codex 辅助生成（外围模块）
 import json
+import inspect
 import threading
 from uuid import UUID
 
 import pytest
-from fastapi.testclient import TestClient
+from pydantic import ValidationError
+from fastapi.testclient import TestClient as _BaseTestClient
 
+from backend.app.contracts.model import ModelConfig
+from backend.app.contracts.ai import AIResponse, ChatResponse
+from backend.app.contracts.game import GameState, initial_state
+from backend.app.core.roleplay_engine import RoleplayEngineImpl
+from backend.app.storage.session_repository import SessionRepository
 from backend.app.core.errors import ModelProviderError, ModelTimeoutError
-from backend.app.core.model_client import ChatReplyEventStream
-from backend.app.core.pronoun_guard import ELEMENT_SELF_REFERENCE_TERMS, FALLBACK_REPLIES, INTRO_FALLBACK_REPLIES
-from backend.app.main import create_app
+from backend.app.core.model_client import ChatReplyEventStream, DeterministicModelClient
+from backend.app.errors import AppError
+from backend.app.core.pronoun_guard import ELEMENT_SELF_REFERENCE_TERMS
+from backend.app.main import create_app as _real_create_app
+
+_TEST_MODEL_CONFIG = {
+    "endpoint": "https://provider.example/v1",
+    "model": "unit-test-model",
+    "api_key": "unit-test-secret",
+}
+
+
+class TestClient(_BaseTestClient):
+    """Attach request-scoped settings in legacy chat integration tests."""
+
+    def post(self, url, *args, json=None, **kwargs):
+        if isinstance(url, str) and "/api/chat/sessions/" in url:
+            if url.endswith("/messages") and isinstance(json, dict) and "model" not in json:
+                json = {**json, "model": dict(_TEST_MODEL_CONFIG)}
+            elif url.endswith("/regenerate"):
+                if json is None:
+                    json = {"model": dict(_TEST_MODEL_CONFIG)}
+                elif isinstance(json, dict) and "model" not in json:
+                    json = {**json, "model": dict(_TEST_MODEL_CONFIG)}
+        return super().post(url, *args, json=json, **kwargs)
+
+
+def create_app(*args, **kwargs):
+    """Legacy guard tests inject their response source behind the config seam."""
+    app = _real_create_app(*args, **kwargs)
+    service = app.state.session_service
+    service.chat_model_client = DeterministicModelClient()
+    service._chat_client_for_config = lambda _config: service.chat_model_client
+    return app
 
 
 def test_live_session_creation_returns_initial_state(tmp_path):
@@ -23,6 +61,286 @@ def test_live_session_creation_returns_initial_state(tmp_path):
     assert data["state"]["turn_count"] == 0
     assert data["mode"] == "offline"
     assert data["last_response"]["reply"]
+
+
+def test_story_contracts_and_engine_reject_request_model_settings():
+    config = dict(_TEST_MODEL_CONFIG)
+    state = initial_state()
+    response = DeterministicModelClient.opening_response("demo_guarded_path")
+    for contract, payload in ((GameState, state.model_dump()), (AIResponse, response)):
+        for field in ("model", "model_config", "endpoint", "api_key"):
+            with pytest.raises(ValidationError) as error:
+                contract.model_validate({**payload, field: config})
+            assert any(item["type"] == "extra_forbidden" and item["loc"] == (field,) for item in error.value.errors())
+
+    for operation in (
+        RoleplayEngineImpl, RoleplayEngineImpl.create_initial_state,
+        RoleplayEngineImpl.handle_turn, SessionRepository.save,
+    ):
+        assert {"model", "model_config", "endpoint", "api_key"}.isdisjoint(
+            inspect.signature(operation).parameters
+        )
+
+
+def test_free_chat_contract_has_no_story_fields():
+    story_fields = {"next_scene", "ending_id", "state_delta", "is_ending"}
+    response = ChatResponse(reply="收到。", emotion="calm")
+
+    assert story_fields.isdisjoint(ChatResponse.model_fields)
+    assert story_fields.isdisjoint(response.model_dump())
+    assert story_fields.isdisjoint(ChatResponse.model_json_schema()["properties"])
+
+
+@pytest.mark.parametrize("path", ["json", "stream", "regenerate"])
+def test_free_chat_drops_provider_story_fields_from_wire_and_storage(tmp_path, path):
+    app = create_app(database_path_override=tmp_path / f"chat-isolation-{path}.db")
+    client = TestClient(app)
+    chat_id = client.post("/api/chat/sessions").json()["data"]["chat_session_id"]
+    raw = {
+        "reply": "我听见了。", "emotion": "calm",
+        "next_scene": {"scene_id": "provider-scene"}, "ending_id": "provider-ending",
+        "state_delta": {"trust": 10}, "is_ending": True,
+    }
+    service = app.state.session_service
+    service.chat_model_client.generate_chat = lambda **kwargs: raw
+    service.chat_model_client.generate_chat_stream = lambda **kwargs: ChatReplyEventStream(iter([
+        {"type": "text", "delta": raw["reply"]}, {"type": "done", "response": raw},
+    ]))
+    if path == "regenerate":
+        assert client.post(f"/api/chat/sessions/{chat_id}/messages", json={"message": "你好"}).status_code == 200
+        result = client.post(f"/api/chat/sessions/{chat_id}/regenerate")
+    else:
+        result = client.post(f"/api/chat/sessions/{chat_id}/messages", json={"message": "你好"},
+                             headers={"accept": "text/event-stream"} if path == "stream" else {})
+    assert result.status_code == 200
+    if path == "stream":
+        events = [json.loads(line[6:]) for line in result.text.splitlines() if line.startswith("data: ")]
+        assert events[-1]["type"] == "done"
+        response = events[-1]["response"]
+    else:
+        response = result.json()["data"]["response"]
+    assert response["reply"] == "我听见了。"
+    assert {"next_scene", "ending_id", "state_delta", "is_ending"}.isdisjoint(response)
+    persisted = service.repository.get_chat_details(UUID(chat_id))[1]
+    assert persisted[-1]["reply"] == response["reply"]
+    assert all({"next_scene", "ending_id", "state_delta", "is_ending", "model", "api_key"}.isdisjoint(message) for message in persisted)
+    assert app.state.database.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 0
+
+
+def test_story_replay_stays_offline_json_and_persists_no_model_settings(tmp_path, monkeypatch):
+    def reject_live_transport(*args, **kwargs):
+        raise AssertionError("story replay must never use live model transport or SSE")
+
+    monkeypatch.setattr("backend.app.services.session_service.LiveModelClient", reject_live_transport)
+    monkeypatch.setattr("backend.app.core.model_client.open_model_request", reject_live_transport)
+    monkeypatch.setattr("backend.app.core.model_client.iter_sse_data", reject_live_transport)
+    app = _real_create_app(database_path_override=tmp_path / "isolated-story.db", demo_mode_override="live")
+    client = _BaseTestClient(app)
+    config = dict(_TEST_MODEL_CONFIG)
+    assert client.post("/api/sessions", json={"model": config}).status_code == 422
+    created = client.post("/api/sessions", json={"mode": "live", "replay_id": "demo_guarded_path"})
+    assert created.status_code == 201
+    data = created.json()["data"]
+    session_id = data["session_id"]
+    assert data["mode"] == "offline"
+    option_id = data["last_response"]["next_scene"]["options"][0]["id"]
+    assert client.post(f"/api/sessions/{session_id}/turn", json={"option_id": option_id, "model": config}).status_code == 400
+    turn = client.post(f"/api/sessions/{session_id}/turn", json={"option_id": option_id}, headers={"accept": "text/event-stream"})
+    assert turn.status_code == 200
+    assert turn.headers["content-type"].startswith("application/json")
+    assert turn.json()["data"]["state"]["turn_count"] == 1
+    restored = client.get(f"/api/sessions/{session_id}").json()["data"]
+    assert restored["mode"] == "offline"
+    assert restored["state"] == turn.json()["data"]["state"]
+    row = dict(app.state.database.execute("SELECT * FROM sessions WHERE session_id = ?", (session_id,)).fetchone())
+    for field in ("state_json", "last_response_json"):
+        assert {"model", "model_config", "api_key", "endpoint"}.isdisjoint(json.loads(row[field]))
+    persisted = json.dumps(row)
+    for marker in (*config.values(), '"model_config"', '"api_key"', '"endpoint"'):
+        assert marker not in persisted
+    assert row["mode"] == "offline"
+    assert row["replay_id"] == "demo_guarded_path"
+
+
+def test_free_chat_requires_model_config_and_does_not_persist_fixture_reply(tmp_path):
+    app = _real_create_app(database_path_override=tmp_path / "chat-no-config.db", demo_mode_override="offline")
+    service = app.state.session_service
+    chat_id, _ = service.create_chat("offline")
+
+    with pytest.raises(AppError) as error:
+        service.chat_message(chat_id, "这条消息不能回退到内置回复")
+
+    assert error.value.code == "MODEL_NOT_CONFIGURED"
+    assert service.repository.get_chat_details(chat_id)[1] == []
+
+
+def test_free_chat_builds_a_fresh_live_client_for_each_configured_request(tmp_path, monkeypatch):
+    app = _real_create_app(database_path_override=tmp_path / "chat-request-client.db", demo_mode_override="offline")
+    service = app.state.session_service
+    chat_id, _ = service.create_chat("offline")
+    config = ModelConfig(endpoint="https://provider.example/v1", model="request-model", api_key="request-key")
+    clients = []
+
+    class StubClient:
+        model_name = "request-model"
+        diagnostic_endpoint = "https://provider.example/v1/chat/completions"
+
+        def __init__(self, received_config):
+            self.config = received_config
+            clients.append(self)
+
+        def generate_chat(self, *, request):
+            return {"reply": "这是一条真实模型回复。"}
+
+    monkeypatch.setattr("backend.app.services.session_service.LiveModelClient", StubClient)
+
+    first, _ = service.chat_message(chat_id, "先回答", model_config=config)
+    second, _ = service.regenerate_chat(chat_id, model_config=config)
+
+    assert first.reply == second.reply == "这是一条真实模型回复。"
+    assert len(clients) == 2
+    assert all(client.config is config for client in clients)
+    assert service._chat_clients == {}
+    assert "request-key" not in str(service.repository.get_chat_details(chat_id))
+
+
+def test_streamed_provider_failure_emits_error_without_done_or_persistence(tmp_path, monkeypatch):
+    app = _real_create_app(database_path_override=tmp_path / "chat-stream-error.db", demo_mode_override="offline")
+    service = app.state.session_service
+    chat_id, _ = service.create_chat("offline")
+    config = ModelConfig(endpoint="https://provider.example/v1", model="request-model", api_key="stream-key")
+
+    class FailingClient:
+        def __init__(self, received_config):
+            assert received_config is config
+
+        def generate_chat_stream(self, *, request):
+            raise ModelProviderError("private provider response", status_code=429, user_message="rate limited")
+
+        def generate_chat(self, *, request):
+            raise AssertionError("stream failures must not retry through a separate client")
+
+    monkeypatch.setattr("backend.app.services.session_service.LiveModelClient", FailingClient)
+
+    events = list(service.stream_chat_message(chat_id, "请回答", stream_id="failure-1", model_config=config))
+
+    assert [event["type"] for event in events] == ["error"]
+    assert events[0]["code"] == "MODEL_PROVIDER_ERROR"
+    assert "private provider response" not in str(events)
+    assert "stream-key" not in str(events)
+    assert service.repository.get_chat_details(chat_id)[1] == []
+
+
+@pytest.mark.parametrize(
+    "status_code, expected_code, expected_status",
+    [(400, "MODEL_CONFIGURATION_ERROR", 400), (401, "MODEL_PROVIDER_ERROR", 502),
+     (403, "MODEL_PROVIDER_ERROR", 502), (404, "MODEL_CONFIGURATION_ERROR", 400),
+     (429, "MODEL_PROVIDER_ERROR", 502), (500, "MODEL_PROVIDER_ERROR", 502),
+     (503, "MODEL_PROVIDER_ERROR", 502)],
+)
+def test_live_chat_preserves_provider_failure_category_without_leaking_key(tmp_path, monkeypatch, status_code, expected_code, expected_status):
+    app = _real_create_app(database_path_override=tmp_path / f"chat-provider-{status_code}.db", demo_mode_override="offline")
+    service = app.state.session_service
+    chat_id, _ = service.create_chat("offline")
+    config = ModelConfig(endpoint="https://provider.example/v1", model="request-model", api_key="provider-secret")
+
+    class FailingClient:
+        def __init__(self, received_config):
+            assert received_config is config
+
+        def generate_chat(self, *, request):
+            raise ModelProviderError(
+                "private provider body with provider-secret",
+                status_code=status_code,
+                user_message="safe provider category",
+            )
+
+    monkeypatch.setattr("backend.app.services.session_service.LiveModelClient", FailingClient)
+
+    with pytest.raises(AppError) as error:
+        service.chat_message(chat_id, "请回答", model_config=config)
+
+    assert error.value.code == expected_code
+    assert error.value.status_code == expected_status
+    if expected_code == "MODEL_CONFIGURATION_ERROR":
+        assert error.value.details is None
+    else:
+        assert error.value.details == {"provider_status": status_code, "model": "request-model", "endpoint": "https://provider.example/v1/chat/completions"}
+    assert "provider-secret" not in str(error.value.details)
+    assert service.repository.get_chat_details(chat_id)[1] == []
+
+
+def test_live_chat_exposes_safe_retry_after_details(tmp_path, monkeypatch):
+    app = _real_create_app(database_path_override=tmp_path / "chat-retry-after.db", demo_mode_override="offline")
+    service = app.state.session_service
+    chat_id, _ = service.create_chat("offline")
+    config = ModelConfig(endpoint="https://provider.example/v1", model="request-model", api_key="provider-secret")
+
+    class FailingClient:
+        def __init__(self, received_config):
+            assert received_config is config
+
+        def generate_chat(self, *, request):
+            raise ModelProviderError("provider throttled", status_code=429, retry_after="23", user_message="safe rate limit")
+
+    monkeypatch.setattr("backend.app.services.session_service.LiveModelClient", FailingClient)
+    with pytest.raises(AppError) as error:
+        service.chat_message(chat_id, "请回答", model_config=config)
+    assert error.value.code == "MODEL_PROVIDER_ERROR"
+    assert error.value.details["retry_after"] == 23
+
+
+def test_live_chat_maps_timeout_and_malformed_output_without_fixture_reply(tmp_path, monkeypatch):
+    app = _real_create_app(database_path_override=tmp_path / "chat-invalid-output.db", demo_mode_override="offline")
+    service = app.state.session_service
+    chat_id, _ = service.create_chat("offline")
+    config = ModelConfig(endpoint="https://provider.example/v1", model="request-model", api_key="request-secret")
+    failure = {"kind": "timeout"}
+
+    class FailingClient:
+        def __init__(self, received_config):
+            assert received_config is config
+
+        def generate_chat(self, *, request):
+            if failure["kind"] == "timeout":
+                raise ModelTimeoutError("private timeout message")
+            return {"reply": "   "}
+
+    monkeypatch.setattr("backend.app.services.session_service.LiveModelClient", FailingClient)
+
+    with pytest.raises(AppError) as timeout_error:
+        service.chat_message(chat_id, "请回答", model_config=config)
+    assert timeout_error.value.code == "MODEL_TIMEOUT"
+
+    failure["kind"] = "malformed"
+    with pytest.raises(AppError) as malformed_error:
+        service.chat_message(chat_id, "请回答", model_config=config)
+    assert malformed_error.value.code == "INVALID_AI_RESPONSE"
+    assert "request-secret" not in str(timeout_error.value)
+    assert "request-secret" not in str(malformed_error.value)
+    assert service.repository.get_chat_details(chat_id)[1] == []
+
+
+def test_live_chat_classifies_invalid_provider_json_as_invalid_ai_response(tmp_path, monkeypatch):
+    app = _real_create_app(database_path_override=tmp_path / "chat-invalid-json.db", demo_mode_override="offline")
+    service = app.state.session_service
+    chat_id, _ = service.create_chat("offline")
+    config = ModelConfig(endpoint="https://provider.example/v1", model="request-model", api_key="request-secret")
+
+    class MalformedClient:
+        def __init__(self, received_config):
+            assert received_config is config
+
+        def generate_chat(self, *, request):
+            raise ModelProviderError("model provider returned an unexpected payload", user_message="格式错误")
+
+    monkeypatch.setattr("backend.app.services.session_service.LiveModelClient", MalformedClient)
+
+    with pytest.raises(AppError) as error:
+        service.chat_message(chat_id, "请回答", model_config=config)
+
+    assert error.value.code == "INVALID_AI_RESPONSE"
+    assert service.repository.get_chat_details(chat_id)[1] == []
 
 
 def test_free_chat_stream_emits_text_before_done_and_persists_only_after_completion(tmp_path):
@@ -266,9 +584,9 @@ def test_free_chat_rejects_external_source_and_internal_data_traces(tmp_path, re
 
     response = client.post(f"/api/chat/sessions/{chat_id}/messages", json={"message": "说说这件事"})
 
-    assert response.status_code == 200
-    reply = response.json()["data"]["response"]["reply"]
-    assert reply in FALLBACK_REPLIES
+    assert response.status_code == 502
+    assert response.json()["error"]["code"] == "INVALID_AI_RESPONSE"
+    assert app.state.session_service.repository.get_chat_details(UUID(chat_id))[1] == []
     assert "检索" not in response.text
     assert "训练数据" not in response.text
     assert "BV1GrNz6jEfB" not in response.text
@@ -336,10 +654,10 @@ def test_free_chat_stream_replaces_replies_that_become_blank_after_layout_normal
     assert response.status_code == 200
     events = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: ")]
     text_deltas = [event["delta"] for event in events if event["type"] == "text"]
-    assert text_deltas and all(delta.strip() for delta in text_deltas)
-    assert events[-1]["response"]["reply"] in FALLBACK_REPLIES
-    restored = client.get(f"/api/chat/sessions/{chat_id}").json()["data"]
-    assert restored["messages"][-1]["reply"] in FALLBACK_REPLIES
+    assert text_deltas == []
+    assert events[-1]["type"] == "error"
+    assert events[-1]["code"] == "INVALID_AI_RESPONSE"
+    assert client.get(f"/api/chat/sessions/{chat_id}").json()["data"]["messages"] == []
 
 
 def test_free_chat_read_flattens_paragraph_breaks_from_existing_sessions(tmp_path):
@@ -646,7 +964,7 @@ def test_live_free_chat_includes_safe_provider_diagnostics_on_forbidden(tmp_path
     assert details["provider_status"] == 403
     assert details["provider_code"] == "ip_blocked"
     assert details["provider_request_id"] == "req-safe-123"
-    assert details["model"] == "story-model"
+    assert details["model"] == "unit-test-model"
     assert details["endpoint"] == "https://provider.example/v1/chat/completions"
     assert "secret" not in response.text
     assert "query-secret" not in response.text
@@ -665,10 +983,7 @@ def test_live_free_chat_accepts_reply_only_provider_payload(tmp_path):
     data = response.json()["data"]["response"]
     assert data["reply"] == "我听见了。"
     assert data["emotion"] == "calm"
-    assert data["state_delta"] == {}
-    assert data["next_scene"] is None
-    assert data["is_ending"] is False
-    assert data["ending_id"] is None
+    assert {"state_delta", "next_scene", "is_ending", "ending_id"}.isdisjoint(data)
 
 
 def test_offline_free_chat_returns_structured_response_without_game_state(tmp_path):
@@ -683,9 +998,7 @@ def test_offline_free_chat_returns_structured_response_without_game_state(tmp_pa
     data = response.json()["data"]
     assert data["response"]["reply"]
     assert data["response"]["emotion"]
-    assert data["response"]["state_delta"] == {}
-    assert data["response"]["next_scene"] is None
-    assert data["response"]["is_ending"] is False
+    assert {"state_delta", "next_scene", "is_ending", "ending_id"}.isdisjoint(data["response"])
     assert data["game_state"] is None
 
 
@@ -890,15 +1203,10 @@ def test_free_chat_falls_back_after_three_unrepairable_replies(tmp_path):
 
     response = client.post(f"/api/chat/sessions/{chat_id}/messages", json={"message": "你会回头吗？"})
 
-    assert response.status_code == 200
-    data = response.json()["data"]
+    assert response.status_code == 502
+    assert response.json()["error"]["code"] == "INVALID_AI_RESPONSE"
     assert len(calls) == 3
-    assert data["response"]["reply"] in FALLBACK_REPLIES
-    assert data["response"]["emotion"] in ("guarded", "reluctant")
-    assert data["response"]["state_delta"] == {}
-    assert data["messages"][-1]["reply"] == data["response"]["reply"]
-    restored = client.get(f"/api/chat/sessions/{chat_id}")
-    assert restored.json()["data"]["messages"][-1]["reply"] in FALLBACK_REPLIES
+    assert client.get(f"/api/chat/sessions/{chat_id}").json()["data"]["messages"] == []
 
 
 @pytest.mark.parametrize("blank_reply", ["\n\n", "   ", "\u00a0", "\f", "\v"])
@@ -925,11 +1233,10 @@ def test_free_chat_retries_then_falls_back_when_layout_normalization_removes_the
 
     response = client.post(f"/api/chat/sessions/{chat_id}/messages", json={"message": "不要空白回答"})
 
-    assert response.status_code == 200
+    assert response.status_code == 502
+    assert response.json()["error"]["code"] == "INVALID_AI_RESPONSE"
     assert len(calls) == 3
-    assert response.json()["data"]["response"]["reply"] in FALLBACK_REPLIES
-    restored = client.get(f"/api/chat/sessions/{chat_id}").json()["data"]
-    assert restored["messages"][-1]["reply"] in FALLBACK_REPLIES
+    assert client.get(f"/api/chat/sessions/{chat_id}").json()["data"]["messages"] == []
 
 
 def test_free_chat_retries_and_adopts_the_first_repairable_reply(tmp_path):
@@ -1232,16 +1539,10 @@ def test_intro_scene_falls_back_to_intro_pool_after_unrepairable_replies(tmp_pat
 
     response = client.post(f"/api/chat/sessions/{chat_id}/messages", json={"message": "介绍一下你自己"})
 
-    assert response.status_code == 200
-    data = response.json()["data"]
+    assert response.status_code == 502
+    assert response.json()["error"]["code"] == "INVALID_AI_RESPONSE"
     assert len(calls) == 3
-    assert data["response"]["reply"] in INTRO_FALLBACK_REPLIES
-    assert data["response"]["reply"] not in FALLBACK_REPLIES
-    assert data["response"]["emotion"] in ("guarded", "reluctant")
-    assert data["response"]["state_delta"] == {}
-    assert data["messages"][-1]["reply"] == data["response"]["reply"]
-    restored = client.get(f"/api/chat/sessions/{chat_id}")
-    assert restored.json()["data"]["messages"][-1]["reply"] in INTRO_FALLBACK_REPLIES
+    assert client.get(f"/api/chat/sessions/{chat_id}").json()["data"]["messages"] == []
 
 
 def test_element_question_keeps_element_answer_live(tmp_path):

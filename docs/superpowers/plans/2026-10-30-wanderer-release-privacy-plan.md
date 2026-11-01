@@ -124,12 +124,9 @@ Run a Python check over ZIP names and decoded text for `.env` (except `.env.exam
 
 Expected: no prohibited match and only intentional source/doc changes remain.
 
-- [ ] **Step 4: Commit the verification updates**
+- [ ] **Step 4: Record verification and commit only actual fixes**
 
-```bash
-git add tests/test_startup.py tests/test_voice.py tests/test_live_and_chat.py
-git commit -m "test: verify complete privacy-safe release flow"
-```
+Record the exact test commands and archive scan result in the execution ledger. If this task found a regression, include its test and fix in the owning task's commit and rerun that task's verification. If no files changed, do not create an empty commit.
 
 ## Self-Review Checklist
 

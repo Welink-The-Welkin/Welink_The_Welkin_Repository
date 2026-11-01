@@ -11,3 +11,14 @@ services:
         value: offline
       - key: WANDERER_DATABASE_PATH
         value: data/sessions.db
+      # Configure these privately in Render; the TTS host runs independently.
+      - key: WANDERER_TTS_ENABLED
+        value: ""
+      - key: WANDERER_TTS_API_URL
+        value: ""
+      - key: WANDERER_TTS_REFERENCE_AUDIO
+        value: ""
+      - key: WANDERER_TTS_PROMPT_TEXT
+        value: ""
+      - key: WANDERER_TTS_TIMEOUT
+        value: ""

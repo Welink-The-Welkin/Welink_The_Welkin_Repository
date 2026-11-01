@@ -88,7 +88,7 @@ def test_frontend_chat_history_can_be_deleted_and_navigation_resets_hash():
     assert "对话 ${appState.chatHistory.length - index}" not in script
     assert 'href="#home"' in html
     assert html.count('class="home-shortcut top-home-shortcut"') == 1
-    assert "<a class=\"back-link\"" not in script
+    assert 'class="back-link"' not in script.split('function renderChat()', 1)[1].split('function renderGame()', 1)[0]
 
 
 def test_role_intro_uses_the_requested_description_and_personalized_journey_copy():
@@ -314,3 +314,29 @@ def test_free_chat_reply_actions_reuse_existing_design_tokens():
     assert "var(--line)" in actions_block
     assert "var(--cyan-blue)" in actions_block
     assert "border-radius:2px" in compact_actions
+
+
+def test_frontend_exposes_mobile_model_settings_and_safe_error_actions():
+    html = (ROOT / "frontend" / "index.html").read_text(encoding="utf-8")
+    script = (ROOT / "frontend" / "app.js").read_text(encoding="utf-8")
+    styles = (ROOT / "frontend" / "styles.css").read_text(encoding="utf-8")
+
+    assert "#/settings/model" in html + script
+    assert "loadModelSettings" in script
+    assert "saveModelSettings" in script
+    assert "clearModelSettings" in script
+    assert "BroadcastChannel" in script
+    assert 'cache: "no-store"' in script
+    assert 'autocomplete="new-password"' in script
+    assert 'type="password"' in script
+    assert ".model-settings" in styles
+    assert "showActionableError" in script
+    assert "MODEL_NOT_CONFIGURED" in script
+
+
+def test_frontend_chat_sends_sanitized_model_object_and_uses_one_sse_reader():
+    script = (ROOT / "frontend" / "app.js").read_text(encoding="utf-8")
+
+    assert "model: modelRequestPayload()" in script
+    assert script.count("async function* readSseEvents") == 1
+    assert "provider_body" not in script

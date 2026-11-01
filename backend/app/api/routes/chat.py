@@ -6,7 +6,8 @@ from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 from pydantic import ValidationError
 
-from backend.app.contracts.game import ChatCreateRequest, ChatMessageRequest
+from backend.app.contracts.game import ChatCreateRequest
+from backend.app.contracts.model import FreeChatRequest, ModelConfig
 from backend.app.errors import AppError
 
 router = APIRouter()
@@ -14,6 +15,21 @@ router = APIRouter()
 
 def _service(request: Request):
     return request.app.state.session_service
+
+
+async def _free_chat_payload(request: Request) -> FreeChatRequest:
+    try:
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            raise ValueError("request body must be an object")
+        if payload.get("model") is None:
+            raise AppError("MODEL_NOT_CONFIGURED", "请先配置模型服务后再开始自由对话。", 400)
+        model_config = ModelConfig.from_payload(payload["model"])
+        return FreeChatRequest.model_validate({**payload, "model": model_config})
+    except AppError:
+        raise
+    except (ValidationError, TypeError, ValueError) as exc:
+        raise AppError("INVALID_REQUEST", "请输入有效的对话内容和模型设置。", 400) from exc
 
 
 @router.post("/chat/sessions", status_code=201)
@@ -47,15 +63,17 @@ def cancel_chat_message(chat_session_id: UUID, request: Request):
 
 @router.post("/chat/sessions/{chat_session_id}/messages")
 async def send_chat_message(chat_session_id: UUID, request: Request):
-    try:
-        payload = ChatMessageRequest.model_validate(await request.json())
-    except (ValidationError, ValueError) as exc:
-        raise AppError("INVALID_REQUEST", "请输入有效的对话内容", 400) from exc
+    payload = await _free_chat_payload(request)
     if "text/event-stream" in request.headers.get("accept", "").lower():
         stream_id = request.headers.get("x-chat-stream-id") or request.state.request_id
 
         def event_source():
-            for event in _service(request).stream_chat_message(chat_session_id, payload.message, stream_id=stream_id):
+            for event in _service(request).stream_chat_message(
+                chat_session_id,
+                payload.message,
+                stream_id=stream_id,
+                model_config=payload.model,
+            ):
                 yield f"data: {json.dumps(event, ensure_ascii=False, separators=(',', ':'))}\n\n"
 
         return StreamingResponse(
@@ -66,10 +84,21 @@ async def send_chat_message(chat_session_id: UUID, request: Request):
                 "X-Accel-Buffering": "no",
             },
         )
-    response, messages = _service(request).chat_message(chat_session_id, payload.message)
+    response, messages = _service(request).chat_message(chat_session_id, payload.message, model_config=payload.model)
     return {"data": {"response": response, "game_state": None, "messages": messages}, "request_id": request.state.request_id}
 
 @router.post("/chat/sessions/{chat_session_id}/regenerate")
-def regenerate_chat_message(chat_session_id: UUID, request: Request):
-    response, messages = _service(request).regenerate_chat(chat_session_id)
+async def regenerate_chat_message(chat_session_id: UUID, request: Request):
+    try:
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            raise ValueError("request body must be an object")
+        if payload.get("model") is None:
+            raise AppError("MODEL_NOT_CONFIGURED", "请先配置模型服务后再重新生成回复。", 400)
+        model_config = ModelConfig.from_payload(payload.get("model"))
+    except AppError:
+        raise
+    except (TypeError, ValueError, ValidationError) as exc:
+        raise AppError("INVALID_REQUEST", "请提供有效的模型设置。", 400) from exc
+    response, messages = _service(request).regenerate_chat(chat_session_id, model_config=model_config)
     return {"data": {"response": response, "game_state": None, "messages": messages}, "request_id": request.state.request_id}

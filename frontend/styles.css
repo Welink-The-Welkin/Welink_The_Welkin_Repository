@@ -893,6 +893,27 @@ h1, h2, h3, p { margin-top: 0; }
   min-height: 560px;
 }
 
+.scene-head-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.scene-head-actions a.secondary-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin: 0;
+  color: var(--cyan-blue);
+  text-decoration: none;
+}
+
+.chat-panel > .scene-head {
+  border-bottom: 0;
+}
+
 .chat-title {
   margin: 8px 0 0;
   font: 500 28px 'Noto Serif SC', serif;
@@ -901,6 +922,36 @@ h1, h2, h3, p { margin-top: 0; }
 .chat-disclaimer {
   color: rgba(194, 197, 204, 0.7);
   font-size: 11px;
+}
+
+.voice-settings-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.voice-settings-options .voice-setting-btn {
+  min-height: 44px;
+  padding: 0 14px;
+}
+
+.voice-settings-options .voice-setting-btn.active {
+  color: var(--surface-0);
+  background: var(--cyan-blue);
+  border-color: var(--cyan-blue);
+}
+
+.voice-settings-options .voice-setting-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.voice-diagnostic {
+  flex-basis: 100%;
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.7;
+  overflow-wrap: anywhere;
 }
 
 .chat-messages {
@@ -1051,6 +1102,78 @@ h1, h2, h3, p { margin-top: 0; }
   font-size: 12px;
   white-space: pre-line;
 }
+
+.error-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin-top: 10px;
+}
+
+.model-settings {
+  width: min(620px, 100%);
+  margin: 0 auto;
+}
+
+.model-settings h1 {
+  margin: 10px 0 8px;
+  font: 500 28px 'Noto Serif SC', serif;
+}
+
+.model-settings-copy {
+  margin-bottom: 22px;
+  color: rgba(194, 197, 204, 0.75);
+  font-size: 12px;
+  line-height: 1.8;
+}
+
+.model-settings-form {
+  display: grid;
+  gap: 8px;
+  padding: 20px;
+  border: 1px solid var(--line);
+  background: rgba(22, 29, 43, 0.62);
+}
+
+.model-settings-form label {
+  color: rgba(232, 234, 237, 0.8);
+  font-size: 12px;
+}
+
+.model-settings-form input,
+.model-settings-form select {
+  width: 100%;
+  min-height: 40px;
+  padding: 0 10px;
+  border: 1px solid var(--wind);
+  border-radius: 2px;
+  color: var(--off-white);
+  background: rgba(5, 7, 12, 0.72);
+}
+
+.model-settings-form input:focus,
+.model-settings-form select:focus {
+  border-color: var(--light-blue);
+  outline: 2px solid rgba(100, 181, 246, 0.18);
+}
+
+.model-remember {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.model-remember input { width: auto; min-height: auto; }
+
+.model-settings-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.model-test-success { color: #9fd5a6; font-size: 12px; }
 
 .toast {
   position: fixed;
