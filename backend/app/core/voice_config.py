@@ -130,6 +130,12 @@ class VoiceSettings:
             return [VoiceDiagnostic("TTS_NOT_ENABLED", "语音未启用。", ("WANDERER_TTS_ENABLED",), "enabled", "设置 WANDERER_TTS_ENABLED=true 后检查语音配置。")]
         if self.mode == "remote":
             diagnostics = []
+            if not os.getenv("WANDERER_TTS_API_TOKEN", "").strip():
+                diagnostics.append(VoiceDiagnostic(
+                    "TTS_API_TOKEN_MISSING", "远程语音服务令牌未配置。",
+                    ("WANDERER_TTS_API_TOKEN",), "remote_credentials",
+                    "在网站部署平台的私有环境变量中设置 WANDERER_TTS_API_TOKEN；不要放入前端或代码仓库。",
+                ))
             if not os.getenv("WANDERER_TTS_REFERENCE_AUDIO", "").strip():
                 diagnostics.append(VoiceDiagnostic(
                     "TTS_REFERENCE_AUDIO_MISSING", "远程语音参考音频未配置。",

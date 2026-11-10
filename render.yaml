@@ -13,12 +13,14 @@ services:
         value: data/sessions.db
       # Configure these privately in Render; the TTS host runs independently.
       - key: WANDERER_TTS_ENABLED
-        value: ""
+        value: "true"
       - key: WANDERER_TTS_API_URL
-        value: ""
+        value: https://studio-ianelsewhere-wanderer-voice.api-inference.modelscope.net/tts
       - key: WANDERER_TTS_REFERENCE_AUDIO
-        value: ""
+        value: wanderer.wav
       - key: WANDERER_TTS_PROMPT_TEXT
-        value: ""
+        value: 可别让我失望.这世上没有纯粹的自由.
       - key: WANDERER_TTS_TIMEOUT
-        value: ""
+        value: "240"
+      - key: WANDERER_TTS_API_TOKEN
+        sync: false

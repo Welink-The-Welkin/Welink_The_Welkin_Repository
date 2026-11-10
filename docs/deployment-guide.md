@@ -76,14 +76,17 @@ WANDERER_DATABASE_PATH=data/sessions.db
 ```text
 WANDERER_TTS_ENABLED=true
 WANDERER_TTS_API_URL=https://voice-service.invalid/tts
-WANDERER_TTS_REFERENCE_AUDIO=
-WANDERER_TTS_PROMPT_TEXT=
+WANDERER_TTS_API_TOKEN=
+WANDERER_TTS_REFERENCE_AUDIO=wanderer.wav
+WANDERER_TTS_PROMPT_TEXT=可别让我失望.这世上没有纯粹的自由.
 WANDERER_TTS_TIMEOUT=240
 ```
 
 - `WANDERER_TTS_REFERENCE_AUDIO` 是语音主机能够识别的服务端值，不是访问者设备上的路径。
 - `WANDERER_TTS_PROMPT_TEXT` 必须与参考音频内容一致。
 - 地址不能包含凭据；访问控制应由服务端网络或反向代理处理。
+- `WANDERER_TTS_API_TOKEN` 必须作为网站部署平台的私有环境变量保存。浏览器不会接触该令牌，令牌不得写入前端、日志、响应或代码仓库。
+- 若使用 ModelScope Studio，请在 Studio 的 API 推理页面复制专用地址（主机名形如 `studio-<命名空间>-<创空间>.api-inference.modelscope.net`，路径为 `/tts`）填入该变量；公开文档不保存具体部署地址。
 - 远程模式拒绝 HTTP、回环地址和非公网 IP 字面量，避免公开网站意外连接本机或内网服务。
 
 保存环境变量并重新部署网站后，检查 `/api/voice/status`。就绪时应显示远程模式已启用；缺少参考音频或提示文本时，接口只返回变量名和处理建议，不回显真实配置值。

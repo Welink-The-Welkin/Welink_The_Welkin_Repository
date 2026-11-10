@@ -48,6 +48,7 @@ def isolated_remote_environment(monkeypatch, tmp_path):
     monkeypatch.setenv("WANDERER_TTS_API_URL", REMOTE_URL)
     monkeypatch.setenv("WANDERER_TTS_REFERENCE_AUDIO", REFERENCE)
     monkeypatch.setenv("WANDERER_TTS_PROMPT_TEXT", PROMPT)
+    monkeypatch.setenv("WANDERER_TTS_API_TOKEN", "server-only-test-token")
     monkeypatch.setenv("WANDERER_TTS_CACHE_DIR", str(tmp_path / "cache"))
     monkeypatch.setattr(
         voice.socket,
@@ -126,6 +127,7 @@ def test_remote_voice_proxies_wav_without_a_local_install(client, upstream, monk
     assert payload["ref_audio_path"] == REFERENCE
     assert payload["prompt_text"] == PROMPT
     assert payload["streaming_mode"] == (1 if route == "stream" else False)
+    assert requests[0].headers["authorization"] == "Bearer server-only-test-token"
 
 
 @pytest.mark.parametrize("field", ["url", "api_url", "ref_audio_path", "reference_audio", "prompt_text", "credentials"])
@@ -151,8 +153,17 @@ def test_remote_status_is_value_free_and_independent_of_workstation(client, upst
         "diagnostics": [], "compatibility_voice_available": True,
     }
     assert str(requests[0].url) == "https://voice-service.invalid/openapi.json"
+    assert requests[0].headers["authorization"] == "Bearer server-only-test-token"
     for private in (REMOTE_URL, REFERENCE, PROMPT):
         assert private not in response.text
+
+
+def test_remote_status_requires_server_token_without_echoing_it(client, upstream, monkeypatch):
+    monkeypatch.delenv("WANDERER_TTS_API_TOKEN")
+    response = client.get("/api/voice/status")
+    assert response.json()["data"]["enabled"] is False
+    assert response.json()["data"]["diagnostics"][0]["code"] == "TTS_API_TOKEN_MISSING"
+    assert "server-only-test-token" not in response.text
 
 
 def test_remote_ignores_local_weight_settings_and_preserves_upstream_path(client, upstream, monkeypatch):

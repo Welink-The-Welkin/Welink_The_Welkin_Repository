@@ -1006,6 +1006,7 @@ async function playPreparedBrowserVoiceAndWait(prepared, signal, sequence, relea
   let resolveStarted;
   let resolveEnded;
   let settled = false;
+  let startFallbackId;
   const started = new Promise((resolve) => { resolveStarted = resolve; });
   const ended = new Promise((resolve) => { resolveEnded = resolve; });
   const release = () => {
@@ -1033,6 +1034,7 @@ async function playPreparedBrowserVoiceAndWait(prepared, signal, sequence, relea
       return;
     }
     window.clearTimeout?.(startTimeoutId);
+    window.clearTimeout?.(startFallbackId);
     void release();
     renderVoiceState();
     resolveStarted("playing");
@@ -1054,6 +1056,12 @@ async function playPreparedBrowserVoiceAndWait(prepared, signal, sequence, relea
   }, voiceSynthesisTimeout(text));
   try {
     speech.synth.speak(utterance);
+    // Browser speech startup events are unreliable on some mobile engines.
+    // Releasing text must not depend on onstart being dispatched.
+    void release();
+    startFallbackId = window.setTimeout(() => {
+      if (!settled) resolveStarted("playing");
+    }, 0);
     const outcome = await started;
     if (outcome !== "playing") {
       if (outcome === "failed" && !signal?.aborted && sequence === appState.voiceSequence) await release();
@@ -1067,6 +1075,7 @@ async function playPreparedBrowserVoiceAndWait(prepared, signal, sequence, relea
     return false;
   } finally {
     window.clearTimeout?.(startTimeoutId);
+    window.clearTimeout?.(startFallbackId);
     cleanup();
   }
 }

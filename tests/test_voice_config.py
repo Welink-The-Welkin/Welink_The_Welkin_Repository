@@ -15,6 +15,7 @@ def isolated_voice_env(monkeypatch, tmp_path):
         "WANDERER_TTS_ENABLED", "WANDERER_TTS_API_URL", "GPT_SOVITS_ROOT",
         "WANDERER_TTS_GPT_WEIGHTS", "WANDERER_TTS_SOVITS_WEIGHTS",
         "WANDERER_TTS_REFERENCE_AUDIO", "WANDERER_TTS_PROMPT_TEXT",
+        "WANDERER_TTS_API_TOKEN",
     ):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
@@ -147,6 +148,7 @@ def test_explicit_weight_overrides_and_relative_reference_resolve_under_root(mon
 
 def test_remote_https_requires_explicit_enable_and_no_local_assets(monkeypatch):
     monkeypatch.setenv("WANDERER_TTS_API_URL", "https://tts.example/tts")
+    monkeypatch.setenv("WANDERER_TTS_API_TOKEN", "server-only-test-token")
     monkeypatch.setenv("WANDERER_TTS_REFERENCE_AUDIO", "deployment-reference")
     monkeypatch.setenv("WANDERER_TTS_PROMPT_TEXT", "deployment-prompt")
     assert settings_module().VoiceSettings.from_env().enabled is False
