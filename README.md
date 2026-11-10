@@ -97,12 +97,13 @@ uvicorn backend.app.main:app --host 0.0.0.0 --port $PORT
 ```text
 WANDERER_TTS_ENABLED=true
 WANDERER_TTS_API_URL=https://voice-service.invalid/tts
+WANDERER_TTS_API_TOKEN=
 WANDERER_TTS_REFERENCE_AUDIO=
 WANDERER_TTS_PROMPT_TEXT=
 WANDERER_TTS_TIMEOUT=240
 ```
 
-远程模式拒绝 HTTP、回环地址和带凭据的 URL。`WANDERER_TTS_REFERENCE_AUDIO` 是语音主机能够识别的服务端值，不是访问者电脑上的文件路径。公开仓库和镜像不包含 GPT-SoVITS、模型权重、参考音频、真实端点或访问密钥。
+`WANDERER_TTS_API_TOKEN` 必须只填写在网站部署平台的私密环境变量中，用于调用 ModelScope Studio 的 API 推理地址；浏览器、公开仓库和日志都不应接触它。远程模式拒绝 HTTP、回环地址和带凭据的 URL。`WANDERER_TTS_REFERENCE_AUDIO` 是语音主机能够识别的服务端值，不是访问者电脑上的文件路径。公开仓库和镜像不包含 GPT-SoVITS、模型权重、参考音频、真实端点或访问密钥。
 
 完整部署与验收步骤见 [`docs/deployment-guide.md`](docs/deployment-guide.md)。
 
