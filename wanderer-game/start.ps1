@@ -82,7 +82,7 @@ try {
     $voiceErrorPreference = $ErrorActionPreference
     try {
         $ErrorActionPreference = "Continue"
-        $voiceOutput = & $pythonPath "scripts\start_gpt_sovits.py" --state-file $voiceSessionFile 2>&1
+        $voiceOutput = & $pythonPath "scripts/start_gpt_sovits.py" --state-file $voiceSessionFile 2>&1
         $voiceExitCode = $LASTEXITCODE
     } finally {
         $ErrorActionPreference = $voiceErrorPreference
@@ -125,6 +125,6 @@ try {
         Stop-Process -Id $server.Id -Force
     }
     if (Test-Path $pythonPath) {
-        & $pythonPath "scripts\start_gpt_sovits.py" --stop --state-file $voiceSessionFile 2>$null
+        & $pythonPath "scripts/start_gpt_sovits.py" --stop --state-file $voiceSessionFile 2>$null
     }
 }

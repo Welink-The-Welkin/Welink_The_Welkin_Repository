@@ -3,6 +3,7 @@ services:
     name: wanderer-game
     runtime: python
     plan: free
+    rootDir: wanderer-game
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn backend.app.main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /api/health
@@ -11,16 +12,15 @@ services:
         value: offline
       - key: WANDERER_DATABASE_PATH
         value: data/sessions.db
-      # Configure these privately in Render; the TTS host runs independently.
       - key: WANDERER_TTS_ENABLED
-        value: "true"
+        value: ""
       - key: WANDERER_TTS_API_URL
-        value: https://studio-ianelsewhere-wanderer-voice.api-inference.modelscope.net/tts
-      - key: WANDERER_TTS_REFERENCE_AUDIO
-        value: wanderer.wav
-      - key: WANDERER_TTS_PROMPT_TEXT
-        value: 可别让我失望.这世上没有纯粹的自由.
-      - key: WANDERER_TTS_TIMEOUT
-        value: "240"
+        value: ""
       - key: WANDERER_TTS_API_TOKEN
         sync: false
+      - key: WANDERER_TTS_REFERENCE_AUDIO
+        value: ""
+      - key: WANDERER_TTS_PROMPT_TEXT
+        value: ""
+      - key: WANDERER_TTS_TIMEOUT
+        value: ""

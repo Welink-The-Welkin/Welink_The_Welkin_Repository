@@ -159,7 +159,28 @@ def test_tracked_symlink_outside_root_fails_closed(tmp_path):
     output.write_bytes(b"existing archive")
     result = run_packager(project, output)
     assert result.returncode != 0
-    assert "outside" in result.stderr.lower() or "root" in result.stderr.lower()
+    assert "RELEASE_PATH_OUTSIDE_ROOT" in result.stderr
+    assert output.read_bytes() == b"existing archive"
+
+
+def test_tracked_symlink_to_untracked_file_inside_root_fails_closed(tmp_path):
+    project = make_project(tmp_path)
+    private = project / "private" / "credentials.json"
+    private.parent.mkdir()
+    private.write_text("PRIVATE_TEST_VALUE", encoding="utf-8")
+    link = project / "backend" / "app" / "external.txt"
+    try:
+        os.symlink(private, link)
+    except OSError:
+        pytest.skip("symlinks unavailable")
+    git_track(project, "README.md", "requirements.txt", ".env.example", "Dockerfile", "render.yaml", "backend", "frontend", "scripts")
+    output = tmp_path / "upload.zip"
+    output.write_bytes(b"existing archive")
+
+    result = run_packager(project, output)
+
+    assert result.returncode != 0
+    assert "RELEASE_SYMLINK_REJECTED" in result.stderr
     assert output.read_bytes() == b"existing archive"
 
 

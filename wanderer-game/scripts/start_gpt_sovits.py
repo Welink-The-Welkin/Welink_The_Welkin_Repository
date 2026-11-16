@@ -18,7 +18,7 @@ import httpx
 # Direct script execution puts scripts/, rather than the project, on sys.path.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from backend.app.core.voice_config import (  # noqa: E402
-    DEFAULT_VOICE_REFERENCE, VoiceDiagnostic, VoiceSettings, validate_api_url,
+    VoiceDiagnostic, VoiceSettings, validate_api_url,
 )
 
 
@@ -129,7 +129,7 @@ def voice_config(root: Path, device: str | None = None) -> dict:
             "TTS_ROOT_MISSING", "启动目录与明确配置不一致。", ("GPT_SOVITS_ROOT",),
             "runtime", "设置 GPT_SOVITS_ROOT 为要使用的唯一安装目录。",
         ))
-    _require_settings(voice_settings, {"enabled", "runtime", "weights", "reference_audio"})
+    _require_settings(voice_settings, {"enabled", "runtime", "weights", "reference_audio", "prompt_text"})
     selected_device = device or os.getenv("WANDERER_TTS_DEVICE", "").strip().lower() or "auto"
     if selected_device == "auto":
         selected_device = "cuda" if _runtime_has_usable_cuda(root) else "cpu"
@@ -193,7 +193,7 @@ def ensure_tts_server(session_file: Path | None = None) -> bool:
     root = resolve_root()
     requested_device = os.getenv("WANDERER_TTS_DEVICE", "").strip().lower() or "auto"
     session_file = session_file or voice_session_path()
-    _require_settings(_settings(), {"reference_audio"})
+    _require_settings(_settings(), {"reference_audio", "prompt_text"})
     if _is_ready(host, port):
         _write_session_state(session_file, owns_server=False, pid=None, port=port)
         return True

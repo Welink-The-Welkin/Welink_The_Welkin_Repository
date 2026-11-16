@@ -14,10 +14,6 @@ import httpx
 
 
 DEFAULT_API_URL = "http://127.0.0.1:9880/tts"
-DEFAULT_VOICE_REFERENCE = Path("logs/wanderer/5-wav32k/6.1流浪者全语音无音效无背景音乐（自用）.mp3_0000716160_0000856960.wav")
-DEFAULT_VOICE_PROMPT = "可别让我失望.这世上没有纯粹的自由."
-DEFAULT_GPT_WEIGHTS = Path("GPT_weights_v2Pro/流浪者-e15.ckpt")
-DEFAULT_SOVITS_WEIGHTS = Path("GPT_SoVITS/pretrained_models/v2Pro/s2Gv2Pro.pth")
 
 
 @dataclass(frozen=True)
@@ -118,11 +114,10 @@ class VoiceSettings:
 
         return cls(
             enabled=enabled, mode=mode, api_url=api_url, root=root,
-            gpt_weights=configured_path("WANDERER_TTS_GPT_WEIGHTS", DEFAULT_GPT_WEIGHTS if root else None) if mode == "local" else None,
-            sovits_weights=configured_path("WANDERER_TTS_SOVITS_WEIGHTS", DEFAULT_SOVITS_WEIGHTS if root else None) if mode == "local" else None,
-            # Custom roots require an explicit reference; never search for alternatives.
-            reference_audio=configured_path("WANDERER_TTS_REFERENCE_AUDIO", DEFAULT_VOICE_REFERENCE if root and not root_value else None),
-            prompt_text=os.getenv("WANDERER_TTS_PROMPT_TEXT", DEFAULT_VOICE_PROMPT if mode == "local" else "").strip(),
+            gpt_weights=configured_path("WANDERER_TTS_GPT_WEIGHTS", None) if mode == "local" else None,
+            sovits_weights=configured_path("WANDERER_TTS_SOVITS_WEIGHTS", None) if mode == "local" else None,
+            reference_audio=configured_path("WANDERER_TTS_REFERENCE_AUDIO", None),
+            prompt_text=os.getenv("WANDERER_TTS_PROMPT_TEXT", "").strip(),
         )
 
     def diagnostics(self) -> list[VoiceDiagnostic]:
@@ -152,6 +147,8 @@ class VoiceSettings:
         diagnostics = []
         if not _is_accessible_file(self.reference_audio):
             diagnostics.append(VoiceDiagnostic("TTS_REFERENCE_AUDIO_MISSING", "参考音频未配置、不存在或无法访问。", ("WANDERER_TTS_REFERENCE_AUDIO",), "reference_audio", "设置 WANDERER_TTS_REFERENCE_AUDIO 为有效的参考音频文件，并检查访问权限。"))
+        if not self.prompt_text:
+            diagnostics.append(VoiceDiagnostic("TTS_PROMPT_TEXT_MISSING", "语音提示文本未配置。", ("WANDERER_TTS_PROMPT_TEXT",), "prompt_text", "设置 WANDERER_TTS_PROMPT_TEXT，内容必须与参考音频一致。"))
         if self.root is None or not all(_is_accessible_file(self.root / name) for name in ("api_v2.py", "runtime/python.exe")):
             diagnostics.append(VoiceDiagnostic("TTS_ROOT_MISSING", "本机语音运行环境不完整或无法访问。", ("GPT_SOVITS_ROOT",), "runtime", "设置 GPT_SOVITS_ROOT，确认包含 api_v2.py 和 bundled runtime，并检查访问权限。"))
         missing_weights = tuple(

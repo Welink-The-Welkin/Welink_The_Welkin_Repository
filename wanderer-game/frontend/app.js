@@ -364,6 +364,7 @@ function renderModelSettings() {
 function voiceSettingsDiagnosticMarkup() {
   const diagnostics = {
     TTS_NOT_ENABLED: "角色语音未启用，请联系部署者检查 WANDERER_TTS_ENABLED。",
+    TTS_API_TOKEN_MISSING: "远程语音凭据未配置，请联系部署者检查 WANDERER_TTS_API_TOKEN。",
     TTS_REFERENCE_AUDIO_MISSING: "参考音频不可用，请联系部署者检查 WANDERER_TTS_REFERENCE_AUDIO。",
     TTS_PROMPT_TEXT_MISSING: "语音提示文本未配置，请联系部署者检查 WANDERER_TTS_PROMPT_TEXT。",
     TTS_ROOT_MISSING: "语音运行环境不完整，请联系部署者检查 GPT_SOVITS_ROOT。",
@@ -1056,8 +1057,7 @@ async function playPreparedBrowserVoiceAndWait(prepared, signal, sequence, relea
   }, voiceSynthesisTimeout(text));
   try {
     speech.synth.speak(utterance);
-    // Browser speech startup events are unreliable on some mobile engines.
-    // Releasing text must not depend on onstart being dispatched.
+    // Some mobile engines speak without dispatching onstart. Text must remain visible.
     void release();
     startFallbackId = window.setTimeout(() => {
       if (!settled) resolveStarted("playing");
