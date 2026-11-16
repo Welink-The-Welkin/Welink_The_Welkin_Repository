@@ -127,6 +127,28 @@ def test_custom_root_requires_explicit_reference_even_when_default_cut_exists(tm
     assert error.value.diagnostic.code == "TTS_REFERENCE_AUDIO_MISSING"
 
 
+def test_voice_config_requires_explicit_prompt_text(tmp_path, monkeypatch):
+    launcher = _load_launcher()
+    monkeypatch.delenv("WANDERER_TTS_PROMPT_TEXT")
+
+    with pytest.raises(launcher.VoiceSetupError) as error:
+        launcher.voice_config(tmp_path, "cpu")
+
+    assert error.value.diagnostic.code == "TTS_PROMPT_TEXT_MISSING"
+    assert error.value.diagnostic.variables == ("WANDERER_TTS_PROMPT_TEXT",)
+
+
+def test_ready_local_api_cannot_bypass_missing_prompt_text(tmp_path, monkeypatch):
+    launcher = _load_launcher()
+    monkeypatch.delenv("WANDERER_TTS_PROMPT_TEXT")
+    monkeypatch.setattr(launcher, "_is_ready", lambda host, port: True)
+
+    with pytest.raises(launcher.VoiceSetupError) as error:
+        launcher.ensure_tts_server(tmp_path / "session.json")
+
+    assert error.value.diagnostic.code == "TTS_PROMPT_TEXT_MISSING"
+
+
 def test_launcher_uses_explicit_chinese_root_and_relative_weight_overrides(tmp_path, monkeypatch):
     launcher = _load_launcher()
     root = tmp_path / "语音 安装"
