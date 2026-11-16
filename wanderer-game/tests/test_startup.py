@@ -85,27 +85,46 @@ def test_dependency_installer_retries_with_fallback_index_after_primary_failure(
         pytest.skip("PowerShell is required for the native-command integration test")
 
     helper_path = str(ROOT / "scripts" / "python_import_check.ps1").replace("'", "''")
-    shim_path = tmp_path / "python.cmd"
     calls_path = tmp_path / "pip-calls.txt"
     first_call_path = tmp_path / "first-call.txt"
     requirements_path = tmp_path / "requirements.txt"
     requirements_path.write_text("test-only\n", encoding="utf-8")
-    shim_path.write_text(
-        "\r\n".join(
-            (
-                "@echo off",
-                f'>>"{calls_path}" echo %*',
-                f'if not exist "{first_call_path}" (',
-                f'  >"{first_call_path}" echo called',
-                "  echo primary index unavailable 1>&2",
-                "  exit /b 1",
-                ")",
-                "echo fallback index succeeded 1>&2",
-                "exit /b 0",
-            )
-        ),
-        encoding="utf-8",
-    )
+    if os.name == "nt":
+        shim_path = tmp_path / "python.cmd"
+        shim_path.write_text(
+            "\r\n".join(
+                (
+                    "@echo off",
+                    f'>>"{calls_path}" echo %*',
+                    f'if not exist "{first_call_path}" (',
+                    f'  >"{first_call_path}" echo called',
+                    "  echo primary index unavailable 1>&2",
+                    "  exit /b 1",
+                    ")",
+                    "echo fallback index succeeded 1>&2",
+                    "exit /b 0",
+                )
+            ),
+            encoding="utf-8",
+        )
+    else:
+        shim_path = tmp_path / "python-shim"
+        shim_path.write_text(
+            "#!/usr/bin/env python3\n"
+            "from pathlib import Path\n"
+            "import sys\n"
+            f"calls = Path({str(calls_path)!r})\n"
+            f"first_call = Path({str(first_call_path)!r})\n"
+            "with calls.open('a', encoding='utf-8') as stream:\n"
+            "    stream.write(' '.join(sys.argv[1:]) + '\\n')\n"
+            "if not first_call.exists():\n"
+            "    first_call.write_text('called', encoding='utf-8')\n"
+            "    print('primary index unavailable', file=sys.stderr)\n"
+            "    raise SystemExit(1)\n"
+            "print('fallback index succeeded', file=sys.stderr)\n",
+            encoding="utf-8",
+        )
+        shim_path.chmod(0o755)
     probe = tmp_path / "fallback_probe.ps1"
     probe.write_text(
         "\n".join(
@@ -188,7 +207,7 @@ def test_voice_diagnostic_is_visible_before_web_startup_continues(tmp_path):
         "$gamePort = 8000\nSet-Location $projectRoot\n"
         "function Start-Process {\n"
         "param($FilePath, $ArgumentList, $WorkingDirectory, [switch]$PassThru, $WindowStyle, [switch]$NoNewWindow)\n"
-        "if ($ArgumentList[0] -eq 'scripts\\start_gpt_sovits.py') {\n"
+        "if ($ArgumentList[0] -eq 'scripts/start_gpt_sovits.py') {\n"
         "return Microsoft.PowerShell.Management\\Start-Process -FilePath $FilePath -ArgumentList $ArgumentList -WorkingDirectory $WorkingDirectory -PassThru -WindowStyle Hidden\n}\n"
         "if (-not (Test-Path 'diagnostic-ready')) { throw 'web started before voice result' }\n"
         "Write-Host 'web startup continued'\n}\n"

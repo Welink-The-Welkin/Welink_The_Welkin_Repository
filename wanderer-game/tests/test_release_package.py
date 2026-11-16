@@ -159,7 +159,7 @@ def test_tracked_symlink_outside_root_fails_closed(tmp_path):
     output.write_bytes(b"existing archive")
     result = run_packager(project, output)
     assert result.returncode != 0
-    assert "outside" in result.stderr.lower() or "root" in result.stderr.lower()
+    assert "RELEASE_PATH_OUTSIDE_ROOT" in result.stderr
     assert output.read_bytes() == b"existing archive"
 
 

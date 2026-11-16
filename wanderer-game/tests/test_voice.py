@@ -66,6 +66,7 @@ def test_tts_config_uses_existing_character_checkpoint_and_cpu_compatible_v2pro(
 
 def test_default_voice_reference_uses_a_known_training_cut_with_its_transcript(tmp_path, monkeypatch):
     launcher = _load_launcher()
+    monkeypatch.setattr("backend.app.core.voice_config.platform.system", lambda: "Windows")
     monkeypatch.delenv("GPT_SOVITS_ROOT")
     root = tmp_path / "Desktop" / "GPT-SoVITS-v2pro-20250604"
     _placeholder_install(root)
