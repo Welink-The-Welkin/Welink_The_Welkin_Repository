@@ -5,6 +5,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import ipaddress
+import socket
+import struct
 from pathlib import Path
 from urllib.parse import urlsplit
 import wave
@@ -16,9 +19,11 @@ from uuid import uuid4
 
 import httpx
 
+from backend.app.core.voice_config import VoiceDiagnostic, VoiceSettings, validate_api_url
+
 
 class VoiceUnavailableError(RuntimeError):
-    """The local TTS service cannot produce audio for this request."""
+    """The configured TTS service cannot produce audio for this request."""
 
 
 _CACHE_LOCKS: dict[Path, tuple[Lock, int]] = {}
@@ -48,51 +53,100 @@ def _as_bool(value: str | None) -> bool:
 
 
 def voice_enabled() -> bool:
-    return _as_bool(os.getenv("WANDERER_TTS_ENABLED"))
+    try:
+        return VoiceSettings.from_env().enabled
+    except ValueError as exc:
+        raise VoiceUnavailableError("voice endpoint configuration is invalid") from exc
 
 
 def _validate_api_url(value: str) -> str:
-    parsed = urlsplit(value)
-    if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost"}:
-        raise VoiceUnavailableError("the local GPT-SoVITS endpoint must use localhost")
-    if parsed.username or parsed.password or parsed.query or parsed.fragment:
-        raise VoiceUnavailableError("the local GPT-SoVITS endpoint is invalid")
-    if parsed.path not in {"", "/", "/tts"}:
-        raise VoiceUnavailableError("the local GPT-SoVITS endpoint is invalid")
-    return f"http://{parsed.netloc}/tts"
+    try:
+        return validate_api_url(value, mode="local")
+    except ValueError as exc:
+        raise VoiceUnavailableError("the local GPT-SoVITS endpoint is invalid") from exc
 
 
 def _api_ready(api_url: str) -> bool:
     parsed = urlsplit(api_url)
     try:
-        response = httpx.get(f"{parsed.scheme}://{parsed.netloc}/openapi.json", timeout=1)
-        return response.status_code == 200 and "/tts" in response.json().get("paths", {})
-    except (httpx.HTTPError, ValueError):
+        _guard_remote_endpoint(api_url)
+        response = httpx.get(
+            f"{parsed.scheme}://{parsed.netloc}/openapi.json",
+            timeout=1,
+            follow_redirects=False,
+            trust_env=False,
+        )
+        if response.status_code != 200:
+            return False
+        schema = response.json()
+        paths = schema.get("paths") if isinstance(schema, dict) else None
+        endpoint = paths.get("/tts") if isinstance(paths, dict) else None
+        return isinstance(endpoint, dict) and isinstance(endpoint.get("post"), dict)
+    except (httpx.HTTPError, ValueError, VoiceUnavailableError):
         return False
 
 
-def voice_status() -> dict[str, bool]:
-    configured = voice_enabled()
-    if not configured:
-        return {"enabled": False, "configured": False}
+def _guard_remote_endpoint(api_url: str) -> None:
+    """Reject DNS answers that can reach local infrastructure before remote I/O."""
+    settings = VoiceSettings.from_env()
+    if settings.mode != "remote":
+        return
+    parsed = urlsplit(api_url)
+    if not parsed.hostname:
+        raise VoiceUnavailableError("the remote TTS service is unavailable")
     try:
-        ready = _api_ready(_validate_api_url(_api_url()))
-    except VoiceUnavailableError:
-        ready = False
-    return {"enabled": ready, "configured": True}
+        records = socket.getaddrinfo(parsed.hostname, parsed.port or 443, type=socket.SOCK_STREAM)
+    except OSError:
+        raise VoiceUnavailableError("the remote TTS service is unavailable") from None
+    addresses = {str(record[4][0]).split("%", 1)[0] for record in records if record and record[4]}
+    if not addresses:
+        raise VoiceUnavailableError("the remote TTS service is unavailable")
+    try:
+        if any(not ipaddress.ip_address(value).is_global for value in addresses):
+            raise VoiceUnavailableError("the remote TTS service is unavailable")
+    except ValueError:
+        raise VoiceUnavailableError("the remote TTS service is unavailable") from None
+
+
+def voice_status() -> dict[str, object]:
+    try:
+        settings = VoiceSettings.from_env()
+    except ValueError:
+        diagnostic = VoiceDiagnostic("TTS_API_INVALID", "语音服务地址无效。", ("WANDERER_TTS_API_URL",), "api_url", "本机使用 loopback HTTP 地址；远程部署使用不含凭据的 HTTPS /tts 地址。")
+        return {"enabled": False, "configured": False, "mode": "unconfigured", "diagnostics": [diagnostic.to_dict()], "compatibility_voice_available": True}
+    diagnostics = settings.diagnostics()
+    configured = settings.enabled and not diagnostics
+    ready = configured and _api_ready(settings.api_url)
+    if configured and not ready:
+        diagnostics.append(VoiceDiagnostic("TTS_API_UNREACHABLE", "语音服务尚未就绪。", ("WANDERER_TTS_API_URL",), "api_readiness", "启动对应语音服务并检查 WANDERER_TTS_API_URL。"))
+    return {
+        "enabled": ready, "configured": configured, "mode": settings.mode,
+        "diagnostics": [item.to_dict() for item in diagnostics],
+        "compatibility_voice_available": True,
+    }
 
 
 def _api_url() -> str:
-    value = os.getenv("WANDERER_TTS_API_URL", "http://127.0.0.1:9880/tts").strip()
-    return _validate_api_url(value)
+    try:
+        return VoiceSettings.from_env().api_url
+    except ValueError as exc:
+        raise VoiceUnavailableError("voice endpoint configuration is invalid") from exc
 
 
 def _reference_audio() -> str:
-    return os.getenv("WANDERER_TTS_REFERENCE_AUDIO", "").strip()
+    settings = VoiceSettings.from_env()
+    if settings.mode == "remote":
+        if not os.getenv("WANDERER_TTS_REFERENCE_AUDIO", "").strip() or not settings.prompt_text:
+            raise VoiceUnavailableError("remote voice settings are incomplete")
+        # This path belongs to the independently deployed TTS host. Preserve
+        # its syntax and never probe it on the web host's filesystem.
+        return os.getenv("WANDERER_TTS_REFERENCE_AUDIO", "").strip()
+    path = settings.reference_audio
+    return str(path) if path is not None else ""
 
 
 def _prompt_text() -> str:
-    return os.getenv("WANDERER_TTS_PROMPT_TEXT", "").strip()
+    return VoiceSettings.from_env().prompt_text
 
 
 def _timeout() -> float:
@@ -130,16 +184,18 @@ def _tts_parameters() -> dict[str, object]:
 
 
 def _cache_path(text: str) -> Path:
-    cache_dir = Path(os.getenv("WANDERER_TTS_CACHE_DIR", "data/voice-cache"))
-    root = os.getenv("GPT_SOVITS_ROOT", "")
+    cache_dir = Path(os.getenv("WANDERER_TTS_CACHE_DIR", "").strip() or "data/voice-cache")
+    settings = VoiceSettings.from_env()
     fingerprint = hashlib.sha256(
         "\0".join((
-            "v2",
+            "v3",
+            settings.mode,
+            settings.api_url,
             text,
             _reference_audio(),
-            _prompt_text(),
-            os.getenv("WANDERER_TTS_GPT_WEIGHTS", "") or f"{root}/GPT_weights_v2Pro/流浪者-e15.ckpt",
-            os.getenv("WANDERER_TTS_SOVITS_WEIGHTS", "") or f"{root}/GPT_SoVITS/pretrained_models/v2Pro/s2Gv2Pro.pth",
+            settings.prompt_text,
+            str(settings.gpt_weights) if settings.gpt_weights else "",
+            str(settings.sovits_weights) if settings.sovits_weights else "",
             json.dumps(_tts_parameters(), ensure_ascii=False, sort_keys=True, separators=(",", ":")),
         )).encode("utf-8")
     ).hexdigest()
@@ -160,6 +216,36 @@ def _tts_payload(text: str, *, streaming_mode: int | bool = False) -> dict[str, 
         "repetition_penalty": 1.35,
         **_tts_parameters(),
     }
+
+
+def _wav_chunks(chunks: Iterator[bytes]) -> Iterator[bytes]:
+    """Validate GPT-SoVITS' standard PCM header before exposing any bytes.
+
+    Buffer only the 44-byte header, including across arbitrary HTTP fragments.
+    Zero-length mode-1 WAV headers are valid; PCM can follow immediately.
+    Reject metadata/extended headers rather than forwarding untrusted content.
+    """
+    header = bytearray()
+    for chunk in chunks:
+        needed = 44 - len(header)
+        header.extend(chunk[:needed])
+        if len(header) < 44:
+            continue
+        riff, size, kind, fmt, fmt_size, encoding, channels, rate, byte_rate, align, bits, data, data_size = struct.unpack(
+            "<4sI4s4sIHHIIHH4sI", header
+        )
+        if (
+            (riff, kind, fmt, data) != (b"RIFF", b"WAVE", b"fmt ", b"data")
+            or fmt_size != 16 or encoding != 1 or channels not in {1, 2}
+            or bits not in {8, 16, 24, 32} or not 1 <= rate <= 384000
+            or align != channels * (bits // 8) or byte_rate != rate * align
+            or data_size % align or size != 36 + data_size
+        ):
+            raise VoiceUnavailableError("the TTS service returned invalid audio")
+        yield bytes(header) + chunk[needed:]
+        yield from chunks
+        return
+    raise VoiceUnavailableError("the TTS service returned incomplete audio")
 
 
 def _validate_wav(audio: bytes) -> None:
@@ -192,8 +278,11 @@ def synthesize_voice(text: str) -> bytes:
     """Synthesize one Chinese line and cache it by text and voice settings."""
     if not voice_enabled():
         raise VoiceUnavailableError("voice is disabled")
+    settings = VoiceSettings.from_env()
     reference_audio = _reference_audio()
-    if not reference_audio or not Path(reference_audio).is_file():
+    if settings.mode == "remote":
+        _guard_remote_endpoint(settings.api_url)
+    if settings.mode == "local" and (not reference_audio or not Path(reference_audio).is_file()):
         raise VoiceUnavailableError("voice reference audio is not configured")
 
     cache_path = _cache_path(text)
@@ -203,10 +292,16 @@ def synthesize_voice(text: str) -> bytes:
 
         payload = _tts_payload(text)
         try:
-            response = httpx.post(_api_url(), json=payload, timeout=_timeout())
+            response = httpx.post(
+                _api_url(),
+                json=payload,
+                timeout=_timeout(),
+                follow_redirects=False,
+                trust_env=False,
+            )
             response.raise_for_status()
-        except httpx.HTTPError as exc:
-            raise VoiceUnavailableError("the local TTS service did not respond") from exc
+        except (httpx.HTTPError, VoiceUnavailableError):
+            raise VoiceUnavailableError("the TTS service did not respond") from None
 
         audio = response.content
         if not audio:
@@ -231,13 +326,16 @@ def stream_voice(text: str) -> Iterator[bytes]:
     """
     if not voice_enabled():
         raise VoiceUnavailableError("voice is disabled")
+    settings = VoiceSettings.from_env()
     reference_audio = _reference_audio()
-    if not reference_audio or not Path(reference_audio).is_file():
+    if settings.mode == "remote":
+        _guard_remote_endpoint(settings.api_url)
+    if settings.mode == "local" and (not reference_audio or not Path(reference_audio).is_file()):
         raise VoiceUnavailableError("voice reference audio is not configured")
 
     cache_path = _cache_path(text)
     if cache_path.is_file():
-        return iter((cache_path.read_bytes(),))
+        return _wav_chunks(iter((cache_path.read_bytes(),)))
 
     def generate() -> Iterator[bytes]:
         # Each producer gets its own staging file.  The in-process cache lock
@@ -248,15 +346,22 @@ def stream_voice(text: str) -> Iterator[bytes]:
         try:
             with _cache_lock(cache_path):
                 if cache_path.is_file():
-                    yield cache_path.read_bytes()
+                    yield from _wav_chunks(iter((cache_path.read_bytes(),)))
                     return
-                with httpx.stream("POST", _api_url(), json=_tts_payload(text, streaming_mode=1), timeout=_timeout()) as response:
+                with httpx.stream(
+                    "POST",
+                    _api_url(),
+                    json=_tts_payload(text, streaming_mode=1),
+                    timeout=_timeout(),
+                    follow_redirects=False,
+                    trust_env=False,
+                ) as response:
                     response.raise_for_status()
                     content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
                     if content_type != "audio/wav":
                         raise VoiceUnavailableError("the local TTS service returned an unexpected audio format")
                     with temporary.open("wb") as output:
-                        for chunk in response.iter_bytes():
+                        for chunk in _wav_chunks(response.iter_bytes()):
                             if chunk:
                                 output.write(chunk)
                                 yield chunk
@@ -268,9 +373,9 @@ def stream_voice(text: str) -> Iterator[bytes]:
         except VoiceUnavailableError:
             temporary.unlink(missing_ok=True)
             raise
-        except httpx.HTTPError as exc:
+        except httpx.HTTPError:
             temporary.unlink(missing_ok=True)
-            raise VoiceUnavailableError("the local TTS service did not respond") from exc
+            raise VoiceUnavailableError("the TTS service did not respond") from None
         except BaseException:
             temporary.unlink(missing_ok=True)
             raise

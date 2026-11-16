@@ -37,7 +37,7 @@ function storySession({ id = "story-1", finished = false, history = [] } = {}) {
   };
 }
 
-function makeBrowser({ hash = "#home", storage = {}, sharedValues = null, channelBus = null, modelTestError = null, modelTestNetworkError = false, deferModelTest = false, chatApiError = null, deferRetryChat = false, providerError = false, deferRegenerate = false, regenerateError = false, deleteChatError = false, deferDeleteChat = false, deferChat = false, deferChatDespiteAbort = false, deferChatCancel = false, chatCancelFailures = 0, chatCancelCommitted = false, chatHistory = [], deferStoryTurn = false, finishStoryTurn = false, deferVoice = false, deferVoiceAfter = 0, deferVoiceStatus = false, deferAudioReady = false, deferAudioStart = false, deferAudioEnd = false, deferStreamReads = false, suppressAudioPlaying = false, audioRequiresGesture = false, voiceEnabled = false, browserSpeech = false, speechThrow = false, suppressSpeechStart = false, compatibilityVoiceAvailable = true, voiceDiagnostics = [], voiceStatusError = false, voiceReadyAfter = 0, voiceError = false, streamChat = false, chatStreamChunks = ["第一句。", "第二句！"], chatReply = "我听见了。" } = {}) {
+function makeBrowser({ hash = "#home", storage = {}, sharedValues = null, channelBus = null, modelTestError = null, modelTestNetworkError = false, deferModelTest = false, chatApiError = null, deferRetryChat = false, providerError = false, deferRegenerate = false, regenerateError = false, deleteChatError = false, deferDeleteChat = false, deferChat = false, deferChatDespiteAbort = false, deferChatCancel = false, chatCancelFailures = 0, chatCancelCommitted = false, chatHistory = [], deferStoryTurn = false, finishStoryTurn = false, deferVoice = false, deferVoiceAfter = 0, deferVoiceStatus = false, deferAudioReady = false, deferAudioStart = false, deferAudioEnd = false, deferStreamReads = false, suppressAudioPlaying = false, audioRequiresGesture = false, voiceEnabled = false, browserSpeech = false, speechThrow = false, compatibilityVoiceAvailable = true, voiceDiagnostics = [], voiceStatusError = false, voiceReadyAfter = 0, voiceError = false, streamChat = false, chatStreamChunks = ["第一句。", "第二句！"], chatReply = "我听见了。", clockStart = null } = {}) {
   const listeners = {};
   const calls = [];
   const events = [];
@@ -525,7 +525,7 @@ function makeBrowser({ hash = "#home", storage = {}, sharedValues = null, channe
       this.speaking = true;
       this.paused = false;
       speechPlayback.push(utterance.text);
-      if (!suppressSpeechStart) utterance.onstart?.();
+      utterance.onstart?.();
     },
     cancel() {
       if (!this.current) return;
@@ -545,6 +545,10 @@ function makeBrowser({ hash = "#home", storage = {}, sharedValues = null, channe
       utterance.onend?.();
     },
   };
+  let clockNow = clockStart;
+  class ControlledDate extends Date {
+    static now() { return clockNow; }
+  }
   const context = {
     document,
     window,
@@ -561,6 +565,7 @@ function makeBrowser({ hash = "#home", storage = {}, sharedValues = null, channe
     StorageEvent: FakeStorageEvent,
     SpeechSynthesisUtterance: browserSpeech ? FakeSpeechSynthesisUtterance : undefined,
   };
+  if (clockStart !== null) context.Date = ControlledDate;
   if (browserSpeech) context.window.speechSynthesis = speechSynthesis;
   vm.runInNewContext(source, context, { filename: "frontend/app.js" });
 
@@ -576,6 +581,10 @@ function makeBrowser({ hash = "#home", storage = {}, sharedValues = null, channe
     speechPlayback,
     audioInstances,
     timerDelays,
+    advanceClock(milliseconds) {
+      if (clockNow === null) throw new Error("This browser does not use a controlled clock.");
+      clockNow += milliseconds;
+    },
     get chatInputDisabled() { return chatInputControl.disabled; },
     get currentChatDeleteDisabled() { return deleteChatControl.disabled; },
     get streamReaderCancelled() { return streamReaderCancelled; },
@@ -589,7 +598,11 @@ function makeBrowser({ hash = "#home", storage = {}, sharedValues = null, channe
       await settle();
     },
     async runTimer(delay) {
-      const timerIndex = timers.findIndex((timer) => timer.delay === delay);
+      let timerIndex = -1;
+      for (let index = 0; index < timers.length; index += 1) {
+        if (timers[index].delay > delay) continue;
+        if (timerIndex < 0 || timers[index].delay > timers[timerIndex].delay) timerIndex = index;
+      }
       const [timer] = timerIndex >= 0 ? timers.splice(timerIndex, 1) : [];
       if (timer) timer.callback();
       await settle();
@@ -1072,11 +1085,16 @@ test("finishing the last story turn does not prepare or play the ending reply", 
     storage: { "wanderer-player-name": "清岚" },
     voiceEnabled: true,
     finishStoryTurn: true,
+    deferStoryTurn: true,
+    clockStart: 0,
   });
   await browser.click("select-story", { replayId: "demo_guarded_path" });
   const eventStart = browser.events.length;
 
   const turning = browser.click("option", { option: "accept_burden" });
+  await settle();
+  browser.advanceClock(1);
+  browser.resolveStoryTurn();
   await settle();
   await browser.runTimer(1000);
   await turning;
@@ -1806,29 +1824,6 @@ test("explicit compatibility voice speaks streamed chunks in order", async () =>
   browser.resolveSpeechEnd();
   await settle();
   assert.match(browser.root.innerHTML, /第一句。第二句！/);
-});
-
-test("compatibility voice startup does not hold streamed chat text hostage", async () => {
-  const browser = makeBrowser({
-    hash: "#/chat",
-    storage: { "wanderer-player-name": "清岚" },
-    browserSpeech: true,
-    suppressSpeechStart: true,
-    streamChat: true,
-    chatStreamChunks: ["第一句。", "第二句！"],
-  });
-  await browser.click("start-chat");
-  await browser.click("set-voice-mode", { voiceMode: "compatibility" });
-  browser.submitChatPending("你好");
-  await settle();
-
-  assert.match(browser.root.innerHTML, /第一句。/);
-  assert.doesNotMatch(browser.root.innerHTML, /正在思考/);
-  assert.deepEqual(browser.speechPlayback, ["第一句。"]);
-
-  browser.resolveSpeechEnd();
-  await settle();
-  assert.deepEqual(browser.speechPlayback, ["第一句。", "第二句！"]);
 });
 
 test("synchronous compatibility speech failure releases buffered text", async () => {

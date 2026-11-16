@@ -1,0 +1,28 @@
+# 本文件由 codex 辅助生成（外围模块）
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.env
+data/
+.edge-*
+.browser-flow.html
+dist/
+# 本机密钥、数据库和日志
+.env.*
+!.env.example
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.log
+# 本机测试和临时文件
+.pytest-*/
+.pytest_*/
+.tmp*/
+tmp*/
+wanderer-integration-*/
+.codeartsdoer/
+.idea/
+*.iml
