@@ -27,7 +27,29 @@ jobs:
       - name: Install dependencies
         run: python -m pip install -r requirements.txt
       - name: Run Python tests
-        run: python -m pytest tests -q --basetemp=.pytest-basetemp-ci
+        run: python -m pytest tests -q --basetemp=.pytest-basetemp-ci --junitxml=.pytest-results.xml
+      - name: Report Python test failures
+        if: failure()
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from xml.etree import ElementTree
+
+          report = Path(".pytest-results.xml")
+          if not report.exists():
+              raise SystemExit(0)
+          root = ElementTree.parse(report).getroot()
+          for case in root.iter("testcase"):
+              failure = case.find("failure")
+              if failure is None:
+                  failure = case.find("error")
+              if failure is None:
+                  continue
+              name = f"{case.get('classname', '')}::{case.get('name', '')}"
+              message = failure.get("message", "test failed").splitlines()[0]
+              summary = f"{name}: {message}".replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+              print(f"::error title=Pytest failure::{summary}")
+          PY
       - name: Compile backend
         run: python -m compileall -q backend
       - name: Check frontend JavaScript
