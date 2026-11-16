@@ -18,7 +18,7 @@ import httpx
 # Direct script execution puts scripts/, rather than the project, on sys.path.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from backend.app.core.voice_config import (  # noqa: E402
-    DEFAULT_VOICE_REFERENCE, VoiceDiagnostic, VoiceSettings, validate_api_url,
+    VoiceDiagnostic, VoiceSettings, validate_api_url,
 )
 
 

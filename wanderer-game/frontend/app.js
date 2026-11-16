@@ -364,6 +364,7 @@ function renderModelSettings() {
 function voiceSettingsDiagnosticMarkup() {
   const diagnostics = {
     TTS_NOT_ENABLED: "角色语音未启用，请联系部署者检查 WANDERER_TTS_ENABLED。",
+    TTS_API_TOKEN_MISSING: "远程语音凭据未配置，请联系部署者检查 WANDERER_TTS_API_TOKEN。",
     TTS_REFERENCE_AUDIO_MISSING: "参考音频不可用，请联系部署者检查 WANDERER_TTS_REFERENCE_AUDIO。",
     TTS_PROMPT_TEXT_MISSING: "语音提示文本未配置，请联系部署者检查 WANDERER_TTS_PROMPT_TEXT。",
     TTS_ROOT_MISSING: "语音运行环境不完整，请联系部署者检查 GPT_SOVITS_ROOT。",
@@ -1006,6 +1007,7 @@ async function playPreparedBrowserVoiceAndWait(prepared, signal, sequence, relea
   let resolveStarted;
   let resolveEnded;
   let settled = false;
+  let startFallbackId;
   const started = new Promise((resolve) => { resolveStarted = resolve; });
   const ended = new Promise((resolve) => { resolveEnded = resolve; });
   const release = () => {
@@ -1033,6 +1035,7 @@ async function playPreparedBrowserVoiceAndWait(prepared, signal, sequence, relea
       return;
     }
     window.clearTimeout?.(startTimeoutId);
+    window.clearTimeout?.(startFallbackId);
     void release();
     renderVoiceState();
     resolveStarted("playing");
@@ -1054,6 +1057,11 @@ async function playPreparedBrowserVoiceAndWait(prepared, signal, sequence, relea
   }, voiceSynthesisTimeout(text));
   try {
     speech.synth.speak(utterance);
+    // Some mobile engines speak without dispatching onstart. Text must remain visible.
+    void release();
+    startFallbackId = window.setTimeout(() => {
+      if (!settled) resolveStarted("playing");
+    }, 0);
     const outcome = await started;
     if (outcome !== "playing") {
       if (outcome === "failed" && !signal?.aborted && sequence === appState.voiceSequence) await release();
@@ -1067,6 +1075,7 @@ async function playPreparedBrowserVoiceAndWait(prepared, signal, sequence, relea
     return false;
   } finally {
     window.clearTimeout?.(startTimeoutId);
+    window.clearTimeout?.(startFallbackId);
     cleanup();
   }
 }

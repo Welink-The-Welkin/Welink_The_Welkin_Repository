@@ -72,6 +72,7 @@ def _api_ready(api_url: str) -> bool:
         _guard_remote_endpoint(api_url)
         response = httpx.get(
             f"{parsed.scheme}://{parsed.netloc}/openapi.json",
+            headers=_upstream_headers(),
             timeout=1,
             follow_redirects=False,
             trust_env=False,
@@ -84,6 +85,20 @@ def _api_ready(api_url: str) -> bool:
         return isinstance(endpoint, dict) and isinstance(endpoint.get("post"), dict)
     except (httpx.HTTPError, ValueError, VoiceUnavailableError):
         return False
+
+
+def _upstream_headers() -> dict[str, str]:
+    """Return server-only credentials for the independent remote TTS host."""
+    try:
+        mode = VoiceSettings.from_env().mode
+    except ValueError as exc:
+        raise VoiceUnavailableError("voice endpoint configuration is invalid") from exc
+    if mode != "remote":
+        return {}
+    token = os.getenv("WANDERER_TTS_API_TOKEN", "").strip()
+    if not token:
+        raise VoiceUnavailableError("remote TTS service credentials are not configured")
+    return {"Authorization": f"Bearer {token}"}
 
 
 def _guard_remote_endpoint(api_url: str) -> None:
@@ -295,6 +310,7 @@ def synthesize_voice(text: str) -> bytes:
             response = httpx.post(
                 _api_url(),
                 json=payload,
+                headers=_upstream_headers(),
                 timeout=_timeout(),
                 follow_redirects=False,
                 trust_env=False,
@@ -352,6 +368,7 @@ def stream_voice(text: str) -> Iterator[bytes]:
                     "POST",
                     _api_url(),
                     json=_tts_payload(text, streaming_mode=1),
+                    headers=_upstream_headers(),
                     timeout=_timeout(),
                     follow_redirects=False,
                     trust_env=False,

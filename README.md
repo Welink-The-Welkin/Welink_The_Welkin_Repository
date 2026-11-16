@@ -18,6 +18,6 @@ Welink The Welkin 团队项目仓库。每个项目使用独立子目录维护�
 
 ## 链接
 
-- GitHub 仓库：<https://github.com/IanElseWhere/Welink_The_Welkin_Repository>
+- GitHub 仓库：<https://github.com/Welink-The-Welkin/Welink_The_Welkin_Repository>
 - GitCode 镜像：<https://gitcode.com/IanElseWhere/Welink_The_Welkin_Repository>
 - 作品展览馆：<https://gallery.developer.huaweicloud.com/gallery/007342752f000000>

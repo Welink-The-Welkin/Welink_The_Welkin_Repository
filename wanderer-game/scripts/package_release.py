@@ -98,6 +98,8 @@ def _tracked_source_files(root: Path, output: Path) -> list[Path]:
         path = (root / relative).resolve()
         if root not in path.parents:
             raise SystemExit(f"RELEASE_PATH_OUTSIDE_ROOT: 无法打包：git 路径超出项目根目录：{raw}")
+        if (root / relative).is_symlink():
+            raise SystemExit(f"RELEASE_SYMLINK_REJECTED: 无法打包：不允许已跟踪的符号链接：{raw}")
         if path == output:
             raise SystemExit(f"无法打包：输出路径不能是已跟踪文件：{raw}")
         if path.is_file():

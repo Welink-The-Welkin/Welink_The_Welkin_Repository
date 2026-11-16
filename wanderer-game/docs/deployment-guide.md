@@ -76,6 +76,7 @@ WANDERER_DATABASE_PATH=data/sessions.db
 ```text
 WANDERER_TTS_ENABLED=true
 WANDERER_TTS_API_URL=https://voice-service.invalid/tts
+WANDERER_TTS_API_TOKEN=
 WANDERER_TTS_REFERENCE_AUDIO=
 WANDERER_TTS_PROMPT_TEXT=
 WANDERER_TTS_TIMEOUT=240
@@ -83,7 +84,8 @@ WANDERER_TTS_TIMEOUT=240
 
 - `WANDERER_TTS_REFERENCE_AUDIO` 是语音主机能够识别的服务端值，不是访问者设备上的路径。
 - `WANDERER_TTS_PROMPT_TEXT` 必须与参考音频内容一致。
-- 地址不能包含凭据；访问控制应由服务端网络或反向代理处理。
+- `WANDERER_TTS_API_TOKEN` 只保存在网站服务端，用于访问独立语音服务；浏览器和公开日志不会获得它。
+- 地址不能包含凭据；访问令牌通过服务端请求头发送。
 - 远程模式拒绝 HTTP、回环地址和非公网 IP 字面量，避免公开网站意外连接本机或内网服务。
 
 保存环境变量并重新部署网站后，检查 `/api/voice/status`。就绪时应显示远程模式已启用；缺少参考音频或提示文本时，接口只返回变量名和处理建议，不回显真实配置值。

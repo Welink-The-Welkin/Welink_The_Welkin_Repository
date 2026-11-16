@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import hashlib
 import subprocess
 from pathlib import Path
 from urllib.parse import urlparse
@@ -11,18 +12,19 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+REPOSITORY_ROOT = ROOT.parent
 PUBLIC_DOCS = (ROOT / "README.md", ROOT / "docs" / "deployment-guide.md")
 
 
 def _tracked_paths() -> list[Path]:
     result = subprocess.run(
         ["git", "ls-files", "-z"],
-        cwd=ROOT,
+        cwd=REPOSITORY_ROOT,
         check=True,
         capture_output=True,
     )
     names = result.stdout.decode().split("\0")
-    return [ROOT / name for name in names if name]
+    return [REPOSITORY_ROOT / name for name in names if name]
 
 
 def _tracked_text() -> list[tuple[Path, str]]:
@@ -182,6 +184,7 @@ def test_public_docs_have_no_real_remote_endpoint():
     allowed_hosts = {
         "127.0.0.1",
         "localhost",
+        "github.com",
         "gitcode.com",
         "gallery.developer.huaweicloud.com",
     }
@@ -201,6 +204,7 @@ def test_env_example_contains_names_only_for_private_voice_inputs():
     text = (ROOT / ".env.example").read_text(encoding="utf-8")
     for name in (
         "WANDERER_TTS_API_URL",
+        "WANDERER_TTS_API_TOKEN",
         "WANDERER_TTS_REFERENCE_AUDIO",
         "WANDERER_TTS_PROMPT_TEXT",
         "WANDERER_TTS_GPT_WEIGHTS",
@@ -211,7 +215,21 @@ def test_env_example_contains_names_only_for_private_voice_inputs():
 
 
 def test_tracked_tree_has_no_private_artifact_paths_or_machine_profiles():
-    _assert_public_entries([(path.relative_to(ROOT), text) for path, text in _tracked_text()])
+    _assert_public_entries([(path.relative_to(REPOSITORY_ROOT), text) for path, text in _tracked_text()])
+
+
+def test_tracked_tree_has_no_private_voice_asset_identifiers():
+    fingerprints = (
+        (12, "19762d3d04a6dd58a047c8379fbe24e1059a82125d4245bc91b129b8a53a0ba5"),
+        (12, "73b6ab573b6633ffd9aa02e81e63659bc11b99ed353c3a15fca04f886785b892"),
+        (51, "535516243101cdda8c353de3d1d58870cfe3a8d46b24c1951a7e414e9f454b33"),
+        (18, "b30b774ab81ab3ed6de991e75497ac1b7ee8977835c241a66f3cb1d6fe8e5636"),
+    )
+    for _, text in _tracked_text():
+        tokens = re.split(r"[\s/\\'\"`=,:;()\[\]{}]+", text)
+        for length, fingerprint in fingerprints:
+            candidates = (value for value in tokens if len(value) == length)
+            assert all(hashlib.sha256(value.encode("utf-8")).hexdigest() != fingerprint for value in candidates)
 
 
 @pytest.mark.parametrize("filename", _packager_private_artifact_names())

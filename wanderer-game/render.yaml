@@ -16,6 +16,8 @@ services:
         value: ""
       - key: WANDERER_TTS_API_URL
         value: ""
+      - key: WANDERER_TTS_API_TOKEN
+        sync: false
       - key: WANDERER_TTS_REFERENCE_AUDIO
         value: ""
       - key: WANDERER_TTS_PROMPT_TEXT

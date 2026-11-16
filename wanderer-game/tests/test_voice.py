@@ -18,8 +18,14 @@ from backend.app.main import create_app
 from backend.app.voice import stream_voice
 
 
+TEST_GPT_WEIGHTS = Path("test-assets/gpt.ckpt")
+TEST_SOVITS_WEIGHTS = Path("test-assets/sovits.pth")
+TEST_REFERENCE_AUDIO = Path("test-assets/reference.wav")
+TEST_PROMPT = "synthetic prompt text"
+
+
 def _placeholder_install(root):
-    for relative in ("api_v2.py", "runtime/python.exe", "GPT_weights_v2Pro/流浪者-e15.ckpt", "GPT_SoVITS/pretrained_models/v2Pro/s2Gv2Pro.pth"):
+    for relative in ("api_v2.py", "runtime/python.exe", TEST_GPT_WEIGHTS, TEST_SOVITS_WEIGHTS, TEST_REFERENCE_AUDIO):
         target = root / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         target.touch()
@@ -38,6 +44,10 @@ def isolated_voice_environment(tmp_path, monkeypatch):
     _placeholder_install(tmp_path)
     monkeypatch.setenv("GPT_SOVITS_ROOT", str(tmp_path))
     monkeypatch.setenv("WANDERER_TTS_ENABLED", "true")
+    monkeypatch.setenv("WANDERER_TTS_GPT_WEIGHTS", str(TEST_GPT_WEIGHTS))
+    monkeypatch.setenv("WANDERER_TTS_SOVITS_WEIGHTS", str(TEST_SOVITS_WEIGHTS))
+    monkeypatch.setenv("WANDERER_TTS_REFERENCE_AUDIO", str(tmp_path / TEST_REFERENCE_AUDIO))
+    monkeypatch.setenv("WANDERER_TTS_PROMPT_TEXT", TEST_PROMPT)
 
 
 def _load_launcher(*, load_project_env=False):
@@ -60,37 +70,36 @@ def test_tts_config_uses_existing_character_checkpoint_and_cpu_compatible_v2pro(
     assert config["custom"]["device"] == "cpu"
     assert config["custom"]["version"] == "v2Pro"
     assert config["custom"]["is_half"] is False
-    assert config["custom"]["t2s_weights_path"] == str(root / "GPT_weights_v2Pro" / "流浪者-e15.ckpt")
-    assert config["custom"]["vits_weights_path"] == str(root / "GPT_SoVITS" / "pretrained_models" / "v2Pro" / "s2Gv2Pro.pth")
+    assert config["custom"]["t2s_weights_path"] == str(root / TEST_GPT_WEIGHTS)
+    assert config["custom"]["vits_weights_path"] == str(root / TEST_SOVITS_WEIGHTS)
 
 
-def test_default_voice_reference_uses_a_known_training_cut_with_its_transcript(tmp_path, monkeypatch):
+def test_windows_default_root_requires_explicit_private_voice_assets(tmp_path, monkeypatch):
     launcher = _load_launcher()
     monkeypatch.setattr("backend.app.core.voice_config.platform.system", lambda: "Windows")
     monkeypatch.delenv("GPT_SOVITS_ROOT")
-    root = tmp_path / "Desktop" / "GPT-SoVITS-v2pro-20250604"
-    _placeholder_install(root)
-    reference = root / "logs" / "wanderer" / "5-wav32k" / "6.1流浪者全语音无音效无背景音乐（自用）.mp3_0000716160_0000856960.wav"
-    reference.parent.mkdir(parents=True)
-    reference.write_bytes(WAV_BYTES)
+    monkeypatch.delenv("WANDERER_TTS_GPT_WEIGHTS")
+    monkeypatch.delenv("WANDERER_TTS_SOVITS_WEIGHTS")
     monkeypatch.delenv("WANDERER_TTS_REFERENCE_AUDIO", raising=False)
     monkeypatch.delenv("WANDERER_TTS_PROMPT_TEXT", raising=False)
 
-    settings = launcher.voice_config(root, "cpu")
+    settings = launcher._settings()
 
-    assert settings["reference_audio"] == reference.resolve()
-    assert settings["prompt_text"] == "可别让我失望.这世上没有纯粹的自由."
+    assert settings.root == tmp_path / "Desktop" / "GPT-SoVITS-v2pro-20250604"
+    assert settings.gpt_weights is None
+    assert settings.sovits_weights is None
+    assert settings.reference_audio is None
+    assert settings.prompt_text == ""
 
 
 @pytest.mark.parametrize("missing, variable, code", [
     ("api_v2.py", "GPT_SOVITS_ROOT", "TTS_ROOT_MISSING"),
-    ("GPT_weights_v2Pro/流浪者-e15.ckpt", "WANDERER_TTS_GPT_WEIGHTS", "TTS_WEIGHTS_MISSING"),
-    ("reference.wav", "WANDERER_TTS_REFERENCE_AUDIO", "TTS_REFERENCE_AUDIO_MISSING"),
+    (TEST_GPT_WEIGHTS, "WANDERER_TTS_GPT_WEIGHTS", "TTS_WEIGHTS_MISSING"),
+    (TEST_REFERENCE_AUDIO, "WANDERER_TTS_REFERENCE_AUDIO", "TTS_REFERENCE_AUDIO_MISSING"),
 ])
 def test_launcher_missing_assets_print_actionable_value_free_diagnostics(tmp_path, monkeypatch, capsys, missing, variable, code):
     launcher = _load_launcher()
-    reference = tmp_path / "reference.wav"
-    reference.touch()
+    reference = tmp_path / TEST_REFERENCE_AUDIO
     monkeypatch.setenv("WANDERER_TTS_ENABLED", "true")
     monkeypatch.setenv("WANDERER_TTS_REFERENCE_AUDIO", str(reference))
     (tmp_path / missing).unlink()
@@ -106,10 +115,11 @@ def test_launcher_missing_assets_print_actionable_value_free_diagnostics(tmp_pat
 
 def test_custom_root_requires_explicit_reference_even_when_default_cut_exists(tmp_path, monkeypatch):
     launcher = _load_launcher()
-    default_cut = tmp_path / launcher.DEFAULT_VOICE_REFERENCE
+    default_cut = tmp_path / "logs" / "voice" / "candidate.wav"
     default_cut.parent.mkdir(parents=True)
     default_cut.touch()
     monkeypatch.setenv("WANDERER_TTS_ENABLED", "true")
+    monkeypatch.delenv("WANDERER_TTS_REFERENCE_AUDIO")
 
     with pytest.raises(ValueError) as error:
         launcher.voice_config(tmp_path, "cpu")
@@ -123,7 +133,6 @@ def test_launcher_uses_explicit_chinese_root_and_relative_weight_overrides(tmp_p
     _placeholder_install(root)
     for name in ("自定义.ckpt", "自定义.pth", "参考.wav"):
         (root / name).touch()
-    (root / "GPT_weights_v2Pro/流浪者-e15.ckpt").unlink()
     monkeypatch.setenv("GPT_SOVITS_ROOT", str(root))
     monkeypatch.setenv("WANDERER_TTS_ENABLED", "true")
     monkeypatch.setenv("WANDERER_TTS_GPT_WEIGHTS", "自定义.ckpt")
@@ -148,8 +157,8 @@ def test_relative_install_root_writes_absolute_weight_paths(tmp_path, monkeypatc
 
     config = launcher.voice_config(root, "cpu")["config"]["custom"]
 
-    assert config["t2s_weights_path"] == str(root / "GPT_weights_v2Pro" / "流浪者-e15.ckpt")
-    assert config["vits_weights_path"] == str(root / "GPT_SoVITS" / "pretrained_models" / "v2Pro" / "s2Gv2Pro.pth")
+    assert config["t2s_weights_path"] == str(root / TEST_GPT_WEIGHTS)
+    assert config["vits_weights_path"] == str(root / TEST_SOVITS_WEIGHTS)
 
 
 def test_windows_defaults_reuse_ready_requested_local_api_without_spawning(tmp_path, monkeypatch):
@@ -160,9 +169,7 @@ def test_windows_defaults_reuse_ready_requested_local_api_without_spawning(tmp_p
     monkeypatch.delenv("WANDERER_TTS_ENABLED")
     root = tmp_path / "Desktop" / "GPT-SoVITS-v2pro-20250604"
     _placeholder_install(root)
-    reference = root / launcher.DEFAULT_VOICE_REFERENCE
-    reference.parent.mkdir(parents=True)
-    reference.touch()
+    monkeypatch.setenv("WANDERER_TTS_REFERENCE_AUDIO", str(root / TEST_REFERENCE_AUDIO))
     server, thread = _tts_server()
     monkeypatch.setenv("WANDERER_TTS_API_URL", f"http://127.0.0.1:{server.server_port}/tts")
     monkeypatch.setenv("WANDERER_TTS_DEVICE", "cpu")
@@ -570,7 +577,7 @@ def test_voice_status_enables_only_after_the_local_tts_api_is_ready(tmp_path, mo
     server, thread = _tts_server()
     reference_audio = tmp_path / "reference.wav"
     reference_audio.write_bytes(WAV_BYTES)
-    for relative in ("api_v2.py", "runtime/python.exe", "GPT_weights_v2Pro/流浪者-e15.ckpt", "GPT_SoVITS/pretrained_models/v2Pro/s2Gv2Pro.pth"):
+    for relative in ("api_v2.py", "runtime/python.exe", TEST_GPT_WEIGHTS, TEST_SOVITS_WEIGHTS):
         target = tmp_path / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         target.touch()
@@ -598,7 +605,7 @@ def test_voice_status_rejects_an_unrelated_local_openapi_server(tmp_path, monkey
     _TTSHandler.api_paths = {"/health": {"get": {"operationId": "health"}}}
     reference_audio = tmp_path / "reference.wav"
     reference_audio.write_bytes(WAV_BYTES)
-    for relative in ("api_v2.py", "runtime/python.exe", "GPT_weights_v2Pro/流浪者-e15.ckpt", "GPT_SoVITS/pretrained_models/v2Pro/s2Gv2Pro.pth"):
+    for relative in ("api_v2.py", "runtime/python.exe", TEST_GPT_WEIGHTS, TEST_SOVITS_WEIGHTS):
         target = tmp_path / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         target.touch()
@@ -631,7 +638,7 @@ def test_voice_synthesis_proxies_audio_and_reuses_cached_text(tmp_path, monkeypa
         monkeypatch.setenv("WANDERER_TTS_ENABLED", "true")
         monkeypatch.setenv("WANDERER_TTS_API_URL", f"http://127.0.0.1:{server.server_port}/tts")
         monkeypatch.setenv("WANDERER_TTS_REFERENCE_AUDIO", str(reference_audio))
-        monkeypatch.setenv("WANDERER_TTS_PROMPT_TEXT", "可别让我失望。")
+        monkeypatch.setenv("WANDERER_TTS_PROMPT_TEXT", TEST_PROMPT)
         monkeypatch.setenv("WANDERER_TTS_CACHE_DIR", str(tmp_path / "voice-cache"))
         client = TestClient(create_app(database_path_override=tmp_path / "voice.db", demo_mode_override="offline"))
 
