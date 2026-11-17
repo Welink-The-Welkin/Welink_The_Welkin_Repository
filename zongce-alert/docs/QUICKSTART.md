@@ -7,10 +7,23 @@
 ## 前置条件
 
 - Windows 10 / 11
-- Python 3.8+（[下载](https://www.python.org/downloads/)，安装时勾选 **Add Python to PATH**）
+- Python 3.8+（[下载](https://www.python.org/downloads/)）
 - 一个邮箱（用于注册监测服务和接收提醒，QQ 邮箱即可）
 
-> 检查 Python 是否就绪：命令行执行 `python --version`，能显示版本号即可。
+> **安装 Python 时务必勾选这两项**：
+> - `Add python.exe to PATH` —— 否则双击 `.bat` 时找不到解释器
+> - `tcl/tk and IDLE` —— 弹窗靠 tkinter 绘制，缺了它程序无法提醒
+>
+> 检查是否就绪：命令行执行 `python -c "import tkinter"`，没有任何输出就是正常的。
+
+**关于 `.bat` 脚本**：双击即用，不需要手动配环境。脚本会按以下顺序自动找解释器，
+找到的第一个能 `import tkinter` 的即被采用：
+
+1. PATH 中的 `python`
+2. Windows 自带的 `py` 启动器
+3. `%LOCALAPPDATA%\Programs\Python\Python31x` 等常见安装位置
+
+都找不到时会明确提示去哪装、勾什么，而不是闪一下就消失。
 
 ---
 

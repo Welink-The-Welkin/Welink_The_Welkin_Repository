@@ -21,10 +21,13 @@ if /i not "%CONFIRM%"=="Y" (
     exit /b 0
 )
 echo.
-if exist "C:\Python\python.exe" (
-    "C:\Python\python.exe" startup.py install
-) else (
-    python startup.py install
+call "%~dp0_find_python.bat"
+if errorlevel 1 (
+    echo.
+    pause
+    exit /b 1
 )
+
+"%PY%" startup.py install
 echo.
 pause

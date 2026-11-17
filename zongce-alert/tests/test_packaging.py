@@ -266,5 +266,159 @@ class TestWindowsOnlyDeclared(unittest.TestCase):
         self.assertIn("Windows", readme)
 
 
+class TestNoHardcodedUserPaths(unittest.TestCase):
+    """可分发项目不能写死作者本机的绝对路径。
+
+    `C:\\Python\\python.exe` 只在作者机器上成立；别人 clone 后若没有这个目录，
+    脚本还得靠 PATH 兜底，等于那行 if exist 永远走 else 分支——
+    既没用，又误导读者以为需要装到 C:\\Python。
+    """
+
+    # 需要扫描的文本类文件
+    SUFFIXES = (".bat", ".py", ".json", ".md", ".yml", ".yaml", ".toml", ".txt")
+
+    def _text_files(self):
+        for dirpath, dirnames, filenames in os.walk(ROOT):
+            # 跳过 git 与缓存目录
+            dirnames[:] = [d for d in dirnames if d not in (".git", "__pycache__", "data")]
+            for name in filenames:
+                if name.lower().endswith(self.SUFFIXES):
+                    yield os.path.join(dirpath, name)
+
+    def test_批处理不硬编码C盘Python路径(self):
+        """只看真正会被执行的行，注释里提到这个路径不算违规。"""
+        offenders = []
+        for path in self._text_files():
+            if not path.lower().endswith(".bat"):
+                continue
+            for lineno, line in enumerate(_read(path).splitlines(), 1):
+                stripped = line.strip()
+                # 跳过注释与 echo 说明文字
+                if stripped.lower().startswith(("rem ", "rem\t", "::")):
+                    continue
+                if stripped.lower().startswith("echo"):
+                    continue
+                if re.search(r"[Cc]:[\\/]Python", stripped):
+                    offenders.append("%s:%d" % (os.path.relpath(path, ROOT), lineno))
+        self.assertEqual(
+            offenders,
+            [],
+            "以下位置写死了 C:\\Python 路径，换台机器就失效：%s" % offenders,
+        )
+
+    def test_源码优先使用当前解释器(self):
+        """startup.py 必须首选「与当前解释器同目录」的 pythonw。"""
+        text = _read(os.path.join(ROOT, "startup.py"))
+        self.assertIn("sys.executable", text, "应基于 sys.executable 推导 pythonw")
+        self.assertNotIn(
+            r'r"C:\Python\pythonw.exe"',
+            text.replace("'", '"'),
+            "不应把 C:\\Python 作为首选回退",
+        )
+
+    def test_批处理里有解释器探测(self):
+        """探测逻辑集中在 _find_python.bat，各脚本通过 call 复用。"""
+        probe = os.path.join(ROOT, "_find_python.bat")
+        self.assertTrue(os.path.exists(probe), "缺少共享的解释器探测脚本")
+        probe_text = _read(probe).lower()
+        self.assertIn("where python", probe_text, "应当用 where 探测 PATH 中的 python")
+        self.assertIn("py -c", probe_text, "应当尝试 py launcher")
+
+        # 各入口脚本必须引用这个共享片段，而不是各自硬编码
+        for name in ("启动.bat", "自检.bat", "查看状态.bat", "安装开机自启.bat"):
+            text = _read(os.path.join(ROOT, name))
+            self.assertIn(
+                "_find_python.bat",
+                text,
+                "%s 应调用共享的解释器探测，而不是自己写一套" % name,
+            )
+
+
+class TestBatchFileEncoding(unittest.TestCase):
+    """Windows 批处理的编码/换行是硬约束，踩过就别再踩。
+
+    两条规则，任一违反都会让脚本在真实双击场景下崩溃：
+    1. 换行必须是 CRLF —— 纯 LF 时 cmd 会把整行当一条命令，
+       `goto` 标签和续行符全部失效
+    2. 若非纯 ASCII，必须先 chcp 65001，否则中文按 GBK 解析成乱码，
+       连 `@echo off` 之后的命令都可能被截断
+    """
+
+    def _bats(self):
+        return sorted(
+            os.path.join(ROOT, n) for n in os.listdir(ROOT) if n.lower().endswith(".bat")
+        )
+
+    @staticmethod
+    def _read_bytes(path):
+        with open(path, "rb") as f:
+            return f.read()
+
+    def test_存在批处理文件(self):
+        self.assertTrue(self._bats(), "一个 .bat 都没有？这项目是给 Windows 用的")
+
+    def test_全部使用CRLF换行(self):
+        bad = []
+        for path in self._bats():
+            raw = self._read_bytes(path)
+            crlf = raw.count(b"\r\n")
+            bare_lf = raw.count(b"\n") - crlf
+            if bare_lf > 0:
+                bad.append("%s(裸LF=%d)" % (os.path.basename(path), bare_lf))
+        self.assertEqual(bad, [], "以下批处理混入了裸 LF，cmd 会解析错乱：%s" % bad)
+
+    def test_无UTF8_BOM(self):
+        """BOM 会让 cmd 把第一行识别成乱码命令。"""
+        bad = []
+        for path in self._bats():
+            if self._read_bytes(path)[:3] == b"\xef\xbb\xbf":
+                bad.append(os.path.basename(path))
+        self.assertEqual(bad, [], "以下批处理带 UTF-8 BOM：%s" % bad)
+
+    def test_含中文的批处理先切换代码页(self):
+        bad = []
+        for path in self._bats():
+            raw = self._read_bytes(path)
+            try:
+                text = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                continue  # GBK 编码的文件由 Windows 原生解析，不需要 chcp
+            has_non_ascii = any(ord(c) > 127 for c in text)
+            if has_non_ascii and "chcp 65001" not in text:
+                bad.append(os.path.basename(path))
+        self.assertEqual(
+            bad,
+            [],
+            "以下批处理含中文却没 chcp 65001，中文会变乱码：%s" % bad,
+        )
+
+    def test_探测脚本可被call执行(self):
+        """_find_python.bat 用 call 执行时应返回 0 并设置 PY。"""
+        import subprocess
+        import tempfile
+
+        probe = os.path.join(ROOT, "_find_python.bat")
+        if not os.path.exists(probe):
+            self.skipTest("探测脚本不存在")
+        with tempfile.TemporaryDirectory() as td:
+            runner = os.path.join(td, "run.bat")
+            with open(runner, "w", encoding="utf-8", newline="\r\n") as f:
+                f.write("@echo off\n")
+                f.write("chcp 65001 >nul\n")
+                f.write('call "%s"\n' % probe)
+                f.write("echo RESULT=[%PY%]\n")
+                f.write("echo RC=[%errorlevel%]\n")
+            r = subprocess.run(
+                ["cmd", "/c", runner],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=60,
+            )
+        self.assertIn("RC=[0]", r.stdout, "探测失败：%s" % r.stdout)
+        self.assertNotIn("RESULT=[]", r.stdout, "探测成功但没设置 PY")
+
+
 if __name__ == "__main__":
     unittest.main()

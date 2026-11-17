@@ -203,15 +203,48 @@ cloudflared tunnel run --url http://127.0.0.1:8765 zongce
 可能原因：
 
 1. **换行被改成 LF**。`.bat` 必须是 **CRLF**，否则 `goto` 标签失效、脚本会乱跳。
-   用 Git 时要确保 `core.autocrlf` 配置正确，或加 `.gitattributes`。
+   仓库已在 `.gitattributes` 里锁定 `*.bat text eol=crlf`，正常 clone 不会出问题。
 2. **BOM**。文件开头不能有 UTF-8 BOM，否则第一行 `@echo off` 会变成乱码命令。
-3. Python 不在 PATH 里。脚本会尝试 `C:\Python\python.exe`，都没有就报错退出。
+3. **找不到带 tkinter 的 Python**。脚本会自动探测（PATH → `py` 启动器 → 常见安装目录），
+   全都没有时会打印安装指引并 `pause` 等你按任意键，不会秒退。
 
 手动验证：
 
 ```bash
 python -c "d=open('启动.bat','rb').read(); print('CRLF:', d.count(b'\r\n'), 'BOM:', d[:3]==b'\xef\xbb\xbf')"
 ```
+
+如果只是想确认探测到的是哪个解释器：
+
+```bash
+_find_python.bat
+```
+
+（这个脚本单独运行不会启动程序，只做探测。）
+
+---
+
+## 提示找不到可用的 Python
+
+先确认 tkinter 在不在——这是最常见的坑，很多人装 Python 时没勾 `tcl/tk`：
+
+```bash
+python -c "import tkinter"
+```
+
+- 无输出 = 正常
+- `ModuleNotFoundError: No module named 'tkinter'` = 缺 tcl/tk，需要重装 Python 并勾选该组件
+
+然后确认这个 `python` 就是脚本会用的那个：
+
+```bash
+where python
+```
+
+如果装了多个 Python，用 `py -0` 可以看到全部版本。脚本优先用 PATH 里第一个能 `import tkinter` 的。
+
+> 想强制指定解释器：临时把目标 Python 目录放到 PATH 最前面，或用
+> `安装开机自启.bat` 生成快捷方式后，右键属性里看到的 `目标` 就是实际使用的路径。
 
 ---
 

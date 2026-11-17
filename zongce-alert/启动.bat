@@ -16,24 +16,13 @@ echo.
 echo ============================================
 echo.
 
-where python >nul 2>&1
-if errorlevel 1 goto use_C_python
-python -c "import tkinter" >nul 2>&1
-if errorlevel 1 goto use_C_python
-set PY=python
-goto run
-
-:use_C_python
-if exist "C:\Python\python.exe" (
-    set PY=C:\Python\python.exe
-    goto run
+call "%~dp0_find_python.bat"
+if errorlevel 1 (
+    echo.
+    pause
+    exit /b 1
 )
-echo [错误] 找不到可用的 Python（需要带 tkinter）
-echo 请安装 Python 3.10+ 并勾选 tcl/tk 组件。
-pause
-exit /b 1
 
-:run
 echo 使用解释器: %PY%
 echo.
 "%PY%" run.py --tray

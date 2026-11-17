@@ -25,14 +25,29 @@ def lnk_path() -> str:
 
 
 def find_pythonw() -> str:
-    """找 pythonw.exe：与当前解释器同目录的优先。"""
+    """找 pythonw.exe。
+
+    顺序：当前解释器同目录 → 探测到的其他解释器 → PATH 中的 pythonw。
+    不再硬编码 C:\\Python——那是作者本机路径，对其他人无意义。
+    """
+    # 1. 与当前解释器同目录（最可信）
     candidate = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
     if os.path.exists(candidate):
         return candidate
-    for p in (r"C:\Python\pythonw.exe",):
-        if os.path.exists(p):
-            return p
-    # 退回 PATH 中的 pythonw
+
+    # 2. 交给统一的解释器探测，再由 python 推导 pythonw
+    try:
+        from pyenv import find_python, find_pythonw as derive_pythonw
+
+        py, _ = find_python(require_tkinter=False)
+        if py:
+            pw = derive_pythonw(py)
+            if os.path.exists(pw):
+                return pw
+    except Exception:
+        pass
+
+    # 3. 退回 PATH 中的 pythonw
     return "pythonw.exe"
 
 
