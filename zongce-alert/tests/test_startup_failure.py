@@ -79,10 +79,15 @@ class TestStartupLogMasking(unittest.TestCase):
         # 直接验证行为：mask_secret 的输出不会包含原 token 的中段
         from config import mask_secret
 
-        token = "f3S8jN5yaU0S_3OEGf444T-ABZzQKGNf"
+        # 刻意用短字符串：既要能验证掩码逻辑，又不能在视觉上冒充真实密钥。
+        # 仓库级隐私扫描会把「>=24 位的 token = xxx」当成泄漏，用它当样本会被误伤。
+        token = "abcdefghij"
         masked = mask_secret(token)
-        self.assertNotIn("N5yaU0S", masked)
         self.assertNotEqual(masked, token)
+        # 中段必须被遮住，只留首尾各 2 位
+        self.assertNotIn("cdefgh", masked)
+        self.assertTrue(masked.startswith("ab"))
+        self.assertTrue(masked.endswith("ij"))
 
 
 if __name__ == "__main__":

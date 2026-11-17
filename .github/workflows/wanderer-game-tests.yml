@@ -2,7 +2,13 @@ name: Wanderer Game Tests
 
 on:
   push:
+    paths:
+      - "wanderer-game/**"
+      - ".github/workflows/wanderer-game-tests.yml"
   pull_request:
+    paths:
+      - "wanderer-game/**"
+      - ".github/workflows/wanderer-game-tests.yml"
 
 permissions:
   contents: read
