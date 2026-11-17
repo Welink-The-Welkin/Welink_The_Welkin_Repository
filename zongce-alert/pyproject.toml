@@ -41,4 +41,4 @@ dev = ["PyYAML>=6.0"]
 # src/ 下是裸模块而非包（没有 __init__.py），按 py-modules 声明。
 # 安装后 run.py / check.py 等进入 site-packages，可直接 python -m run。
 package-dir = { "" = "src" }
-py-modules = ["config", "filter", "notify", "parser", "server", "store", "tray"]
+py-modules = ["article_parser", "config", "filter", "notify", "pyenv", "server", "store", "tray"]

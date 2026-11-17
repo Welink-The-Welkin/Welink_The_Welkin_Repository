@@ -1,4 +1,4 @@
-"""Webhook payload 自适应解析。
+"""Webhook payload 自适应解析，使用唯一模块名以兼容 Python 3.8。
 
 背景：FeedWe 的 webhook 字段格式没有公开文档。硬编码字段名是脆弱设计——
 对方一改字段，程序就会静默失效（看起来在跑，其实永远不提醒）。

@@ -10,7 +10,7 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from notify import build_email_message, build_alert_text, EmailSender  # noqa: E402
-from parser import Article  # noqa: E402
+from article_parser import Article  # noqa: E402
 
 
 def make_article(**kw):

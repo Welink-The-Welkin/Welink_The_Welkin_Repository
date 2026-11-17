@@ -88,20 +88,24 @@ def _install_excepthook(log_dir: str) -> None:
 
 def self_test(cfg: dict, base_dir: str) -> int:
     """发一条模拟提醒，让用户确认弹窗/声音/邮件都通了。"""
-    from parser import Article
+    from article_parser import Article
     from server import AlertService
 
     service = AlertService(cfg, base_dir)
 
     demo = Article(
         title="【这是一条测试提醒】综测加分活动通知",
-        url="https://mp.weixin.qq.com/",
+        # 用 example.com（RFC 2606 保留域名）而不是 mp.weixin.qq.com：
+        # 后者是网站首页，点「打开原文」跳过去会让人以为程序抓错了文章。
+        # 自检要验证的是按钮点得动，不是链接能不能打开真文章。
+        url="https://example.com/",
         account="上理大学生",
         published_at="（测试）",
     )
 
     print("-" * 56)
     print("自检：如果你能看到弹窗、听到提示音，说明通知通路正常。")
+    print("（弹窗里的「打开原文」指向示例地址 example.com，点开跳转属正常）")
     print("-" * 56)
 
     popup_reported = False

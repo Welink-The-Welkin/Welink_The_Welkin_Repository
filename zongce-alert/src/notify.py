@@ -17,7 +17,7 @@ from email.mime.text import MIMEText
 from email.utils import formatdate
 from typing import Any, Dict, List, Optional
 
-from parser import Article
+from article_parser import Article
 
 log = logging.getLogger(__name__)
 

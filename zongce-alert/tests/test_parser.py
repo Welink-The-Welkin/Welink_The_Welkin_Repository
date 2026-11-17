@@ -10,7 +10,7 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from parser import parse_payload, Article  # noqa: E402
+from article_parser import parse_payload, Article  # noqa: E402
 
 
 class TestParseFlatObject(unittest.TestCase):

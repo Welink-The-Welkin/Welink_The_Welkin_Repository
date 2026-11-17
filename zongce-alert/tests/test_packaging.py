@@ -246,12 +246,46 @@ class TestNoSecretsCommitted(unittest.TestCase):
         )
 
     def test_仓库副本里没有data目录(self):
+        """判断标准是「git 有没有跟踪」，不是「目录存不存在」。
+
+        跑过一次自检就会生成 data/（日志、去重库、原始 payload），
+        这是正常现象。真正要防的是它被提交进仓库。
+        """
         if not self.is_repo_copy:
             self.skipTest("开发副本，运行时数据存在是预期的")
-        self.assertFalse(
-            os.path.exists(os.path.join(ROOT, "data")),
-            "data/ 是运行时数据，不应提交",
+
+        data_dir = os.path.join(ROOT, "data")
+        if not os.path.exists(data_dir):
+            return  # 没跑过，自然没问题
+
+        # 目录存在则必须被 .gitignore 排除，且没有任何文件被跟踪
+        import subprocess
+
+        try:
+            tracked = subprocess.run(
+                ["git", "ls-files", "--", "data/"],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except (OSError, subprocess.SubprocessError):
+            self.skipTest("无法调用 git，跳过")
+
+        if tracked.returncode != 0:
+            self.skipTest("不在 git 仓库内，跳过")
+
+        self.assertEqual(
+            tracked.stdout.strip(),
+            "",
+            "data/ 下的运行时数据被 git 跟踪了，应从索引中移除：%s"
+            % tracked.stdout.strip()[:200],
         )
+
+    def test_data目录被gitignore覆盖(self):
+        """无论副本形态，data/ 都必须在 .gitignore 里。"""
+        text = _read(os.path.join(ROOT, ".gitignore"))
+        self.assertIn("data/", text, ".gitignore 必须排除 data/")
 
     def test_gitignore排除敏感项(self):
         """无论哪种副本都必须有这个保护。"""

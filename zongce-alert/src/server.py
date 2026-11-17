@@ -26,7 +26,7 @@ from urllib.parse import urlparse, parse_qs
 from config import load_config, mask_secret
 from filter import match_keywords
 from notify import EmailSender, PopupNotifier, build_alert_text
-from parser import parse_payload
+from article_parser import parse_payload
 from store import SeenStore
 
 log = logging.getLogger(__name__)
