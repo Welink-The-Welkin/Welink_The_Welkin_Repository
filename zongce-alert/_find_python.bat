@@ -47,10 +47,12 @@ if not defined PY (
     )
 )
 
-rem --- 3. 常见安装位置兜底（含作者的 C:\Python）---
+rem --- 3. 常见安装位置兜底 ---
+rem 刻意不写死 C:\Python：那只是作者本机的安装位置，别人 clone 后该目录不存在，
+rem 这行 if exist 永远走 else 分支，既没用又误导读者以为必须装到那里。
+rem 自定义盘符的安装位置靠第 2 步的 py 启动器兜住（py 会读注册表，不挑路径）。
 if not defined PY (
     for %%d in (
-        "C:\Python"
         "%LOCALAPPDATA%\Programs\Python\Python313"
         "%LOCALAPPDATA%\Programs\Python\Python312"
         "%LOCALAPPDATA%\Programs\Python\Python311"
