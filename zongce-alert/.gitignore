@@ -22,8 +22,3 @@ venv/
 .idea/
 Thumbs.db
 desktop.ini
-
-# ---- 待补的占位资源 ----
-# 截图尚未提供时留空，GitHub 会显示破图；补图后删掉这两行
-# docs/screenshot-popup.png
-# docs/screenshot-tray.png

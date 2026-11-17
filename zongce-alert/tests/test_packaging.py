@@ -420,5 +420,66 @@ class TestBatchFileEncoding(unittest.TestCase):
         self.assertNotIn("RESULT=[]", r.stdout, "探测成功但没设置 PY")
 
 
+class TestDocsMatchCode(unittest.TestCase):
+    """文档里承诺的行为，代码里必须真有。
+
+    写文档最容易犯的错是「按自己的想象写」，比如把某个日志说成 DEBUG 级，
+    实际却是 INFO；或者引用了根本不存在的日志文案。用户照着文档排查就会走空。
+    """
+
+    def test_配置文档记录的键都存在于默认配置(self):
+        """CONFIG.md 里以 `"键":` 形式出现的名字，必须真能在默认配置里找到。
+
+        只认 JSON 键的写法，避免把取值（如 match_field 的 title_and_summary）误当键。
+        """
+        sys.path.insert(0, os.path.join(ROOT, "src"))
+        import config as cfg_mod  # noqa: E402
+
+        known = set()
+
+        def walk(d):
+            for k, v in d.items():
+                if not isinstance(k, str) or k.startswith("_") or " " in k:
+                    continue
+                known.add(k)
+                if isinstance(v, dict):
+                    walk(v)
+
+        walk(cfg_mod.DEFAULT_CONFIG)
+
+        doc = _read(os.path.join(DOCS, "CONFIG.md"))
+        # 匹配 "key": 这种 JSON 键写法（允许前后有空格）
+        mentioned = set(re.findall(r'"([a-zA-Z_][a-zA-Z0-9_]*)"\s*:', doc))
+        suspicious = {m for m in mentioned if m not in known}
+        self.assertEqual(
+            suspicious,
+            set(),
+            "CONFIG.md 以键的形式提到了代码里并不存在的配置项：%s" % sorted(suspicious),
+        )
+
+    def test_配置文档引用的日志文案真实存在(self):
+        """文档里整段引用的日志文案，应在源码里找得到。"""
+        doc = _read(os.path.join(DOCS, "CONFIG.md"))
+
+        sources = ""
+        for base in (ROOT, os.path.join(ROOT, "src")):
+            if not os.path.isdir(base):
+                continue
+            for name in os.listdir(base):
+                if name.endswith(".py"):
+                    sources += _read(os.path.join(base, name))
+
+        # 只挑「中文 + 冒号 + 占位符」这种明确的日志引用，且长度够长，
+        # 避免把表格里的普通说明文字也当成日志
+        quoted = re.findall(r"`([\u4e00-\u9fa5]{2,}，[^`]{0,20}：<[^`]+>)`", doc)
+        for q in set(quoted):
+            core = q.split("：")[0]
+            self.assertIn(
+                core,
+                sources,
+                "CONFIG.md 引用了不存在的日志文案：`%s`" % q,
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
