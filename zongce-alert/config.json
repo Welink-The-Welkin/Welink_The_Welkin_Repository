@@ -1,0 +1,42 @@
+{
+  "_说明": "本文件可安全提交/分享。敏感凭据（token、邮箱授权码）请放在 secrets.local.json。",
+  "port": 8765,
+  "host": "127.0.0.1",
+  "_token说明": "留空即可——真实 token 从 secrets.local.json 读取，或用环境变量 ZONGCE_TOKEN 覆盖",
+  "token": "",
+  "_关键词说明": "标题里出现任意一个就会提醒。按需增删",
+  "keywords": [
+    "综测",
+    "综合素质测评",
+    "加分",
+    "第二课堂",
+    "志愿时长",
+    "德育分",
+    "报名"
+  ],
+  "_match_field": "title = 只看标题（推荐，噪音少）；title_and_summary = 标题加摘要",
+  "match_field": "title",
+  "_health_requires_token": "true = /health 也要 token（推荐，因为它经隧道后公网可访问）",
+  "health_requires_token": true,
+  "_test_mode_allow_remote": "false = 只有本机能用 &test=1（推荐）。改成 true 会让隧道地址持有者也能全量放行",
+  "test_mode_allow_remote": false,
+  "notify": {
+    "popup": true,
+    "sound": true,
+    "popup_timeout": 60,
+    "always_on_top": true,
+    "tray": true
+  },
+  "email": {
+    "enabled": false,
+    "smtp_host": "smtp.qq.com",
+    "smtp_port": 465,
+    "use_ssl": true,
+    "_说明": "username/password/to 都在 secrets.local.json 里"
+  },
+  "storage": {
+    "save_raw_payload": true,
+    "keep_raw_days": 7
+  },
+  "log_level": "INFO"
+}

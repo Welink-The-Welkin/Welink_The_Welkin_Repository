@@ -1,0 +1,30 @@
+# 统一行尾符，避免不同平台 clone 后脚本失效
+# https://git-scm.com/docs/gitattributes#_end_of_line_conversion
+
+# 默认：由 Git 自动判断文本文件，仓库内存 LF
+* text=auto
+
+# Windows 批处理必须用 CRLF，否则 goto/label 会解析失败
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 脚本与源码统一 LF
+*.py   text eol=lf
+*.sh   text eol=lf
+*.json text eol=lf
+*.md   text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.toml text eol=lf
+*.txt  text eol=lf
+
+# 二进制 / 字体 / 图片：不做任何转换
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.webp binary
+*.zip  binary
+*.exe  binary
+*.db   binary
