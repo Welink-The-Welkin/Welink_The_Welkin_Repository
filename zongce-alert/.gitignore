@@ -1,0 +1,24 @@
+# ---- 敏感凭据：绝对不要提交 ----
+secrets.local.json
+*.secret.json
+.env
+
+# ---- 运行时数据 ----
+data/
+启动失败.txt
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.venv/
+venv/
+
+# ---- 编辑器/系统 ----
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

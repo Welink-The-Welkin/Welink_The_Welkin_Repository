@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zongce-alert"
+version = "1.0.0"
+description = "监控任意微信公众号，命中关键词时弹窗 + 邮件提醒"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "Ian" }]
+keywords = ["wechat", "monitor", "webhook", "notification", "windows"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Win32 (MS Windows)",
+  "Intended Audience :: End Users/Desktop",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: Microsoft :: Windows",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.8",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Communications :: Email",
+  "Topic :: Desktop Environment",
+]
+# 核心只用标准库，无硬依赖——缺任何第三方包程序仍能跑，只是相关功能降级
+dependencies = []
+
+[project.optional-dependencies]
+# 系统托盘图标（缺失时无托盘入口，提醒功能不受影响）
+tray = ["pystray>=0.19", "Pillow>=9.0"]
+# 开机自启需要 pywin32 创建 .lnk 快捷方式
+win = ["pywin32>=305"]
+# 开发/CI 需要（packaging 测试会校验 YAML 语法）
+dev = ["PyYAML>=6.0"]
+
+[tool.setuptools]
+# src/ 下是裸模块而非包（没有 __init__.py），按 py-modules 声明。
+# 安装后 run.py / check.py 等进入 site-packages，可直接 python -m run。
+package-dir = { "" = "src" }
+py-modules = ["article_parser", "config", "filter", "notify", "pyenv", "server", "store", "tray"]

@@ -1,0 +1,31 @@
+@echo off
+chcp 65001 >nul
+title 综测提醒 - 主程序（可关闭此窗口，程序在托盘运行）
+cd /d "%~dp0"
+
+echo ============================================
+echo   综测加分活动提醒 - 启动中
+echo ============================================
+echo.
+echo 程序会启动并在右下角托盘区显示图标。
+echo 这个窗口可以最小化，但请别关——关了程序就停了。
+echo.
+echo   想彻底后台运行（无窗口）：用「安装开机自启.bat」
+echo   想退出程序：右键点托盘图标 → 退出
+echo.
+echo ============================================
+echo.
+
+call "%~dp0_find_python.bat"
+if errorlevel 1 (
+    echo.
+    pause
+    exit /b 1
+)
+
+echo 使用解释器: %PY%
+echo.
+"%PY%" run.py --tray
+echo.
+echo 程序已退出。若异常，请查看 data\alert.log
+pause

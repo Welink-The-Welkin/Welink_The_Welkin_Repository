@@ -7,6 +7,7 @@ Welink The Welkin 团队项目仓库。每个项目使用独立子目录维护�
 | 项目 | 内容 | 入口 |
 | --- | --- | --- |
 | `wanderer-game` | 《风起异途》AI 互动叙事项目，包含剧情旅途、自由对话、模型设置与三种明确语音模式 | [项目说明](wanderer-game/README.md) |
+| `zongce-alert` | 微信公众号关键词监控提醒工具。命中关键词时桌面弹窗 + 邮件推送，静默托盘运行，仅支持 Windows | [项目说明](zongce-alert/README.md) |
 
 ## 仓库约定
 
