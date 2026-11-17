@@ -138,6 +138,12 @@ python start_tunnel.py --mode funnel
 | `Access denied: this command must be run as administrator` | 没用管理员终端 | Win+X → 终端(管理员) |
 | `Tailscale 尚未分配域名` | 没登录，或 MagicDNS 没开 | 先 `tailscale up`，再开 MagicDNS |
 | `failed to get cert: rate limited` | Let's Encrypt 签证书太频繁 | 等 34 小时，别反复重试 |
+| Funnel 状态显示正常，但访问返回 **502** | 后端程序没运行（隧道活着但转发不到东西） | 确认托盘图标在、`netstat -ano \| findstr :8765` 有 LISTENING |
+
+> **502 是最容易误判的一条。** `tailscale funnel status` 显示 `proxy http://127.0.0.1:8765`
+> 只代表"配置写好了、隧道通了"，**不代表程序在跑**。两者是独立的：
+> 隧道是 Tailscale 的系统服务（后台常驻），程序是你手动起的进程（会退出）。
+> 出 502 先查程序，别去改 Funnel 配置。
 
 > **为什么必须写 `--https=443`**：Funnel 只监听 **443 / 8443 / 10000** 三个端口，
 > 而程序默认在 8765。脚本已经自动带上这个映射，手动敲命令时别漏。
