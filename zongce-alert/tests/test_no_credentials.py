@@ -28,6 +28,37 @@ def _read(path):
         return f.read()
 
 
+def _looks_like_word(value):
+    """判断一个长串是不是"可读的标识符/单词组合"，而不是随机凭据。
+
+    规则：只有字母（含大小写）和下划线，且能按 CamelCase 或下划线
+    切出多个全字母片段。长类名、长函数名会通过；含数字混排的随机串不会。
+    """
+    if not re.fullmatch(r"[A-Za-z_]+", value):
+        return False
+    parts = [p for p in re.split(r"_|(?<=[a-z])(?=[A-Z])", value) if p]
+    return len(parts) >= 2 and all(len(p) >= 2 for p in parts)
+
+
+def _is_local_secret_file(name):
+    """本地凭据文件及其任何副本（备份、时间戳副本）都不该被扫描。
+
+    这些文件本来就装着真 token，扫它们只会制造噪音。
+    它们靠 .gitignore 保证不提交——这一点由 TestGitignoreCoversBackups 守。
+    """
+    lower = name.lower()
+    if lower in (".env", "启动失败.txt"):
+        return True
+    if lower.startswith(".env."):
+        return True
+    # secrets.local.json / secrets.local.json.bak-222718 / secrets.xxx.json
+    # 注意备份名里 .json 在中间，所以用 startswith 判断，不能看后缀。
+    # 但模板 secrets.example.json 要保留，它是给用户看的。
+    if lower.startswith("secrets") and ".json" in lower:
+        return "example" not in lower
+    return False
+
+
 def _iter_text_files():
     """遍历项目内所有**可能被提交**的文本文件。
 
@@ -36,11 +67,10 @@ def _iter_text_files():
     """
     skip_dirs = {".git", "__pycache__", "data", "build", "dist", ".pytest_cache"}
     skip_suffix = {".png", ".jpg", ".jpeg", ".gif", ".ico", ".db", ".exe", ".zip"}
-    skip_files = {"secrets.local.json", ".env", "启动失败.txt"}
     for dirpath, dirnames, filenames in os.walk(ROOT):
         dirnames[:] = [d for d in dirnames if d not in skip_dirs]
         for name in filenames:
-            if name in skip_files:
+            if _is_local_secret_file(name):
                 continue
             if os.path.splitext(name)[1].lower() in skip_suffix:
                 continue
@@ -104,6 +134,11 @@ class TestNoCredentialInTree(unittest.TestCase):
                 continue
             for m in long_token.finditer(line):
                 value = m.group(0)
+                # 合法的 Python 标识符（类名/函数名/变量名）不是凭据。
+                # CamelCase 或 snake_case 的长名字很常见，
+                # 而真密码不会是 TestXxxYyy 这种可读词组合。
+                if value.isidentifier() and _looks_like_word(value):
+                    continue
                 # sha16 常量是 16 位，不会命中；这里命中的才是可疑的长串
                 if value.isalnum() and len(set(value)) > 3:
                     offenders.append("第%d行: %s..." % (lineno, value[:8]))
@@ -166,6 +201,49 @@ class TestNoCredentialInTree(unittest.TestCase):
             hits,
             [],
             "测试里的样例凭据不该这么长，容易被隐私扫描误认为真密钥：%s" % hits,
+        )
+
+
+class TestGitignoreCoversBackups(unittest.TestCase):
+    """回归：.gitignore 曾只写 secrets.local.json，拦不住轮换时的备份副本。
+
+    `python run.py --gen-token` 之前手工备份会产生一份带时间戳的
+    `secrets.local.json` 副本，里面是**旧 token 明文**。
+    原来的规则精确匹配文件名，这类备份直接漏网，
+    一次 `git add -A` 就把旧凭据又提交上去了。
+    """
+
+    def _gitignore(self):
+        p = os.path.join(ROOT, ".gitignore")
+        if not os.path.exists(p):
+            self.skipTest("没有 .gitignore")
+        return _read(p)
+
+    def test_备份副本被忽略(self):
+        lines = [l.strip() for l in self._gitignore().splitlines()]
+        covered = any(
+            l
+            for l in lines
+            if l in ("secrets.local.json.*", "secrets*.json", "*.json.bak*")
+        )
+        self.assertTrue(
+            covered,
+            "需要在 .gitignore 里用通配符覆盖 secrets.local.json 的备份副本",
+        )
+
+    def test_模板文件不被忽略(self):
+        text = self._gitignore()
+        self.assertIn(
+            "!secrets.example.json",
+            text,
+            "secrets.example.json 是模板，必须能被提交，需要显式反忽略",
+        )
+
+    def test_环境变量文件被忽略(self):
+        lines = [l.strip() for l in self._gitignore().splitlines()]
+        self.assertTrue(
+            any(l in (".env", ".env.*") for l in lines),
+            ".env 及其变体（.env.local 等）都含凭据，必须忽略",
         )
 
 

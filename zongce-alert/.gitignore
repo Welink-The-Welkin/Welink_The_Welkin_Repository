@@ -1,7 +1,13 @@
 # ---- 敏感凭据：绝对不要提交 ----
 secrets.local.json
+# 备份/临时副本同样含凭据。轮换 token 时会生成 secrets.local.json.bak-<时间>，
+# 不加这条就等着 git add -A 把旧 token 一起提交上去。
+secrets.local.json.*
+secrets*.json
+!secrets.example.json
 *.secret.json
 .env
+.env.*
 
 # ---- 运行时数据 ----
 data/
