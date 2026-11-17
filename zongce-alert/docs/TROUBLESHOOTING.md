@@ -104,17 +104,47 @@ curl "https://你的隧道地址/hook?token=你的token"
 ## 隧道地址每次重启都变
 
 这是 **Cloudflare 免费快速隧道**（quick tunnel）的固有设计：每次启动分配新的
-`*.trycloudflare.com` 随机域名。不是 bug，也没法在免费额度下改。
+`*.trycloudflare.com` 随机域名。不是 bug，也没有办法把这个随机域名"买断"或"占住"。
+Cloudflare 的产品逻辑就是：临时试用走免费随机域名，要固定地址就走命名隧道。
 
 ### 三条路
 
 | 方案 | 结果 | 成本 |
 |---|---|---|
 | **接受它** | 每次重启后重开隧道 + 更新服务商地址 | 免费，麻烦 |
-| **命名隧道** | 地址永久固定 | 需要一个域名（几块钱/年）+ Cloudflare 免费账号 |
-| **换内网穿透服务** | 各家策略不同 | 视服务商 |
+| **Tailscale Funnel** ⭐ | 地址永久固定，重启不用管 | 免费，需注册账号 |
+| **Cloudflare 命名隧道** | 地址永久固定 | 需要一个域名（几块钱/年）+ Cloudflare 免费账号 |
 
-### 命名隧道大概怎么做
+### 推荐：Tailscale Funnel（不用买域名）
+
+完整步骤见 [QUICKSTART.md 的「B. Tailscale Funnel」](QUICKSTART.md#b-tailscale-funnel固定地址推荐)。
+
+一句话版本（全部在**管理员**终端里执行）：
+
+```powershell
+winget install --id Tailscale.Tailscale
+& "C:\Program Files\Tailscale\tailscale.exe" up
+python start_tunnel.py --mode funnel
+```
+
+拿到 `https://机器名.tailnet名.ts.net/hook?token=...`，填到监测服务后台，**从此不再变**。
+
+**踩坑清单**（报错对号入座）：
+
+| 报错 | 原因 | 解法 |
+|---|---|---|
+| `Funnel not available; nodeAttrs does not include "funnel"` | 后台没开 funnel 属性 | ACL policy 里加 `nodeAttrs`，见 QUICKSTART |
+| `Funnel not available; HTTPS must be enabled` | 没开 HTTPS 证书 | <https://login.tailscale.com/admin/dns> 点 Enable HTTPS |
+| `Access denied: this command must be run as administrator` | 没用管理员终端 | Win+X → 终端(管理员) |
+| `Tailscale 尚未分配域名` | 没登录，或 MagicDNS 没开 | 先 `tailscale up`，再开 MagicDNS |
+| `failed to get cert: rate limited` | Let's Encrypt 签证书太频繁 | 等 34 小时，别反复重试 |
+
+> **为什么必须写 `--https=443`**：Funnel 只监听 **443 / 8443 / 10000** 三个端口，
+> 而程序默认在 8765。脚本已经自动带上这个映射，手动敲命令时别漏。
+
+### 备选：Cloudflare 命名隧道
+
+需要一个托管在 Cloudflare 的域名。
 
 ```bash
 cloudflared tunnel login
@@ -124,8 +154,6 @@ cloudflared tunnel run --url http://127.0.0.1:8765 zongce
 ```
 
 配好后地址固定为 `https://alert.你的域名.com/hook?token=...`，重启也不用改。
-
-> 需要先有一个托管在 Cloudflare 的域名。
 
 ---
 

@@ -81,9 +81,24 @@ python run.py --test
 
 ## 第 4 步：开隧道，拿到公网回调地址
 
-监测服务在云端，它需要一个公网地址才能把消息推到你电脑。用 Cloudflare 免费隧道 :
+监测服务在云端，它需要一个公网地址才能把消息推到你电脑。
 
-1. 重新生成隧道并打印回调地址：
+这里有两条路，**先看清区别再选**：
+
+| | Cloudflare 快速隧道 | Tailscale Funnel |
+|---|---|---|
+| 地址 | `xxx.trycloudflare.com` | `机器名.tailnet名.ts.net` |
+| **重启后** | **每次随机变**，要回后台改 | **固定不变**，只填一次 |
+| 需要账号 | 不需要 | 需要（免费注册） |
+| 需要域名 | 不需要 | 不需要 |
+| 延迟 | 低 | 略高（走中继） |
+| 启动窗口 | 要一直开着 | 后台常驻，可关窗口 |
+
+只想先跑通，走 A。**不想每次重启都手动改后台，直接走 B。**
+
+### A. Cloudflare 快速隧道（最快跑通）
+
+1. 生成隧道并打印回调地址：
 
    ```bash
    python start_tunnel.py
@@ -104,6 +119,79 @@ python run.py --test
 **把这个地址复制下来。**
 
 > 隧道窗口要一直开着。关掉 = 断开 = 收不到推送。
+> 而且这个地址**每次重启都会变**，见文末「每次重启电脑后要做的事」。
+
+### B. Tailscale Funnel（固定地址，推荐）
+
+一次配置，之后重启不用管。
+
+1. **装 Tailscale**（管理员终端）：
+
+   ```powershell
+   winget install --id Tailscale.Tailscale
+   ```
+
+2. **登录一次**（管理员终端，会弹浏览器让你授权）：
+
+   ```powershell
+   & "C:\Program Files\Tailscale\tailscale.exe" up
+   ```
+
+   用 Google / Microsoft / GitHub 账号都行，注册免费。授权后这个终端窗口可以关掉。
+
+3. **在 Tailscale 后台开两样东西**（打开 <https://login.tailscale.com/admin/dns>）：
+
+   - **MagicDNS** —— 打开
+   - **HTTPS Certificates** —— 点 `Enable HTTPS...` 打开
+
+   然后在 <https://login.tailscale.com/admin/acls> 的 policy 文件里，给节点加上
+   `funnel` 属性。最简单是整段替换成：
+
+   ```json
+   {
+     "nodeAttrs": [
+       { "target": ["autogroup:member"], "attr": ["funnel"] }
+     ]
+   }
+   ```
+
+   这一步不做，Funnel 会报 `Funnel not available; nodeAttrs does not include "funnel"`。
+
+4. **开 Funnel**（管理员终端）：
+
+   ```powershell
+   python start_tunnel.py --mode funnel
+   ```
+
+   脚本会自己跑 `tailscale funnel --bg --https=443 http://127.0.0.1:8765`，
+   然后打印：
+
+   ```
+   https://你的机器名.你的tailnet名.ts.net/hook?token=你的token
+   ```
+
+   > 为什么是 `--https=443`：Funnel 只允许 **443 / 8443 / 10000** 三个公网端口，
+   > 而你本地程序在 8765。这行参数就是把 443 映射到 8765，必须写。
+
+**这个地址是固定的，重启电脑后还是它。** 只需要在监测服务后台填**一次**。
+
+随时可以重新问出当前地址：
+
+```bash
+python start_tunnel.py --mode funnel --print-url
+```
+
+停止 Funnel：
+
+```powershell
+& "C:\Program Files\Tailscale\tailscale.exe" funnel --https=443 off
+```
+
+> ⚠ **Funnel 是 Tailscale 的 beta 功能**，官方不承诺 SLA，也声称有未公开的带宽限制。
+> 对本用途（一天几次 webhook 推送）完全够用。
+>
+> ⚠ **Funnel 的公开地址没有任何身份验证层** —— 拿到 URL 的人都能访问你的程序。
+> 所以 `config.json` 里的 token 是唯一的门锁，**不要设成能猜到的值**。
 
 ---
 
@@ -157,10 +245,19 @@ curl "http://127.0.0.1:8765/hook?token=你的token"
 
 ## 每次重启电脑后要做的事
 
+### 如果你用的是 Cloudflare 快速隧道
+
 隧道地址每次重启都会变，所以：
 
 1. 程序会随开机自启自动运行（如果装了自启）
 2. **需要手动重开隧道**：`python start_tunnel.py`
 3. 把新地址粘到监测服务的 Webhook 设置里
 
-实测下这是当前架构最麻烦的一环。想彻底解决，见 [TROUBLESHOOTING.md 的「隧道地址每次重启都变」](TROUBLESHOOTING.md#隧道地址每次重启都变)。
+嫌麻烦想换成固定地址，见 [TROUBLESHOOTING.md 的「隧道地址每次重启都变」](TROUBLESHOOTING.md#隧道地址每次重启都变)。
+
+### 如果你用的是 Tailscale Funnel
+
+**什么都不用做。** 地址固定，Funnel 用 `--bg` 起来后会跟着 Tailscale 服务
+自动重连，重启后地址还是原来那个，监测服务后台不需要再改。
+
+这就是推荐 Funnel 的唯一理由 —— 换一次配置，省掉往后每次重启的手工活。
