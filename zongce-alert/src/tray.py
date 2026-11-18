@@ -5,6 +5,7 @@
 
 依赖：pystray + Pillow。缺失时优雅降级（只记日志，不影响核心提醒功能）。
 """
+import ctypes
 import logging
 import os
 import subprocess
@@ -12,8 +13,37 @@ import sys
 import threading
 import webbrowser
 from typing import Callable, List, Optional
+from urllib.parse import urlsplit
 
 log = logging.getLogger(__name__)
+
+# MessageBoxW 的样式位（winuser.h）
+MB_ICONINFORMATION = 0x00000040
+MB_SETFOREGROUND = 0x00010000
+MB_TOPMOST = 0x00040000
+
+
+def _show_message_box(title: str, message: str) -> None:
+    """弹一个系统原生信息框（阻塞，调用方负责放到后台线程）。
+
+    为什么不用托盘气泡：Windows 会把通知折叠进操作中心，专注助手/勿扰一开
+    就直接不显示，用户点了菜单等于什么都没发生。原生对话框一定能看见。
+    也不用 tkinter：文章弹窗已经有自己的 Tk 主循环，再起一个容易互相干扰。
+    """
+    try:
+        user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+        flags = MB_ICONINFORMATION | MB_SETFOREGROUND | MB_TOPMOST
+        user32.MessageBoxW(None, message, title, flags)
+    except Exception as e:  # user32 缺失或调用被拦
+        log.warning("弹窗失败，用户可能看不到提示：%s", e)
+
+
+def _show_async(title: str, message: str) -> None:
+    """在后台线程弹窗，避免阻塞托盘菜单的消息循环。"""
+    def _target():
+        _show_message_box(title, message)
+
+    threading.Thread(target=_target, name="tray-dialog", daemon=True).start()
 
 
 def build_status_text(port: int, seen: int, email_enabled: bool,
@@ -37,16 +67,101 @@ def build_menu_labels(port: int) -> List[str]:
     """菜单项文字（顺序即显示顺序）。
 
     独立成函数是为了可测——菜单项文案是用户唯一的交互指引，
-    改错了比崩溃更麻烦。
+    改错了比崩溃更麻烦。必须与 _build_menu 里的实际标签逐字一致。
     """
     return [
         "查看状态",
         "在浏览器中查看状态",
         "打开日志",
         "打开回调地址文件",
-        "重启提示",
+        "重启后要做什么？",
         "退出",
     ]
+
+
+def read_callback_host(base_dir: str) -> Optional[str]:
+    """读 data/callback-url.txt 里的主机名。
+
+    只返回 hostname：那个文件里带着 token，绝不能整段显示或写日志。
+    """
+    path = os.path.join(base_dir, "data", "callback-url.txt")
+    try:
+        with open(path, encoding="utf-8", errors="ignore") as f:
+            url = f.read().strip()
+    except OSError:
+        return None
+    if not url:
+        return None
+    return urlsplit(url).hostname or None
+
+
+def describe_restart_steps(host: Optional[str]) -> str:
+    """按当前回调地址的主机名，给出重启后真正该做的事。
+
+    临时隧道的地址会变、Funnel 的不会——两种情况混着说，
+    用户就会按错的那套去操作（比如白跑一趟去改 FeedWe）。
+    """
+    head = "程序会随开机自启自动运行（装过自启的话）。"
+    common_tail = (
+        "怎么确认在用哪种地址：\n"
+        "  右键托盘 →「打开回调地址文件」，看域名。\n"
+        "    以 .ts.net 结尾  →  Tailscale Funnel\n"
+        "    以 .trycloudflare.com 结尾  →  Cloudflare 临时隧道"
+    )
+
+    if host and host.endswith(".ts.net"):
+        return "\n".join([
+            "你用的是 Tailscale Funnel，地址固定不变。",
+            "",
+            "重启后只需要：",
+            "1. 等 Tailscale 自己连上（托盘图标出现即算就绪）",
+            "2. 启动本程序（双击 启动.bat）",
+            "3. FeedWe 后台的 Webhook 不用动，地址不会变",
+            "",
+            "只有这三种情况才需要回 FeedWe 改一次：",
+            "  · 换了电脑（机器名变了，域名跟着变）",
+            "  · 退出了 tailnet 或改了 tailnet 名称",
+            "  · 用 python run.py --gen-token 轮换了 token",
+            "",
+            head,
+            "托盘图标出现就说明 Tailscale 和本程序都在跑。",
+            "",
+            "如果长时间收不到推送，先看 data\\alert.log，",
+            "那多半是程序没起来，而不是隧道的问题。",
+        ])
+
+    if host and host.endswith(".trycloudflare.com"):
+        return "\n".join([
+            "你用的是 Cloudflare 临时隧道，地址每次启动都会变。",
+            "",
+            "重启后要：",
+            "1. 运行 python start_tunnel.py，等它打印新地址",
+            "2. 复制 data\\callback-url.txt 里的完整地址",
+            "3. 粘到 FeedWe 后台的 Webhook 设置里",
+            "",
+            "嫌麻烦的话，可以改用 Tailscale Funnel，地址固定：",
+            "  python start_tunnel.py --mode funnel",
+            "",
+            head,
+        ])
+
+    return "\n".join([
+        "还没读到当前的回调地址（data\\callback-url.txt 不存在或为空）。",
+        "",
+        "请先确定自己用的是哪种隧道：",
+        "",
+        "【A. Tailscale Funnel】地址固定，重启后什么都不用改",
+        "  1. 确认托盘图标出现（Tailscale 已连上）",
+        "  2. 双击 启动.bat",
+        "  3. FeedWe 后台不用动",
+        "  启动命令：python start_tunnel.py --mode funnel",
+        "",
+        "【B. Cloudflare 临时隧道】地址每次都变",
+        "  1. python start_tunnel.py，记下新地址",
+        "  2. 粘到 FeedWe 后台的 Webhook 设置里",
+        "",
+        common_tail,
+    ])
 
 
 def make_icon_image(size: int = 64):
@@ -160,10 +275,13 @@ class TrayIcon:
         def show_status(icon=None, item=None):
             try:
                 text = self._status_provider()
-                log.info("用户查看状态：\n%s", text)
-                self._notify("当前状态", text)
             except Exception as e:
                 log.warning("查看状态失败：%s", e)
+                _show_async("查看状态",
+                            "读取状态失败，详细信息见 data\\alert.log：\n%s" % e)
+                return
+            log.info("用户查看状态：\n%s", text)
+            _show_async("综测加分提醒 · 当前状态", text)
 
         def open_health(icon=None, item=None):
             webbrowser.open(self.health_url())
@@ -177,13 +295,8 @@ class TrayIcon:
             self._open_path(path, fallback=self.base_dir)
 
         def show_restart_hint(icon=None, item=None):
-            self._notify(
-                "重启后要做的事",
-                "隧道地址每次重启都会变。\n"
-                "1. 运行 start_tunnel.py\n"
-                "2. 复制 data\\callback-url.txt 里的地址\n"
-                "3. 粘到 FeedWe 的 Webhook 设置",
-            )
+            host = read_callback_host(self.base_dir)
+            _show_async("重启后要做什么？", describe_restart_steps(host))
 
         def quit_app(icon=None, item=None):
             log.info("用户从托盘退出程序")
