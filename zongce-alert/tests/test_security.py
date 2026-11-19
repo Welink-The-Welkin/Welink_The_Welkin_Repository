@@ -41,6 +41,37 @@ def _base_cfg(tmpdir):
     return cfg
 
 
+class TestStatusHelper(unittest.TestCase):
+    def test_状态输出不展示完整回调且重启提示分隧道(self):
+        import contextlib
+        import io
+        from pathlib import Path
+        from unittest import mock
+        import check
+
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp) / "data"
+            data.mkdir()
+            for host, kind in (("example.tail.ts.net", "Funnel"),
+                               ("example.trycloudflare.com", "临时隧道")):
+                with self.subTest(kind=kind):
+                    (data / "callback-url.txt").write_text(
+                        "https://" + host + "/hook?token=private-test-value", encoding="utf-8")
+                    output = io.StringIO()
+                    with mock.patch.object(check, "BASE_DIR", tmp), \
+                            mock.patch("config.load_config", return_value={"token": "unit-local-value"}), \
+                            mock.patch.object(check, "get_json", return_value={"ok": True}), \
+                            mock.patch.object(sys, "path", list(sys.path)), \
+                            contextlib.redirect_stdout(output):
+                        self.assertEqual(check.main(), 0)
+                    text = output.getvalue()
+                    self.assertIn(kind, text)
+                    self.assertIn("打开回调地址文件", text)
+                    self.assertNotIn(host, text)
+                    self.assertNotIn("private-test-value", text)
+                    self.assertNotIn("unit-local-value", text)
+
+
 class _ServerCase(unittest.TestCase):
     """起一个真实 HTTP 服务，用真实请求验证行为。"""
 

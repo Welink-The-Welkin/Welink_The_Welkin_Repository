@@ -3,10 +3,8 @@
 链路：POST /hook?token=xxx
    → 校验 token
    → 解析 payload（自适应）
-   → 关键词筛选
-   → 去重
-   → 弹窗 + 邮件
-   → 返回 JSON（FeedWe 侧能看到结果）
+   → 关键词分类、收件和派送任务一起落盘
+   → 返回处理计数；后台按已启用的渠道逐篇或按批派送
 
 安全考虑：
 - 只监听 127.0.0.1，公网入口交给 Cloudflare Tunnel，不直接暴露
@@ -16,6 +14,8 @@
 import json
 import logging
 import os
+import sqlite3
+from collections import OrderedDict
 import threading
 import time
 from datetime import datetime
@@ -28,6 +28,8 @@ from filter import match_keywords
 from notify import EmailSender, PopupNotifier, build_alert_text
 from article_parser import parse_payload
 from store import SeenStore
+from inbox_store import InboxStore
+from concurrent.futures import ThreadPoolExecutor
 
 log = logging.getLogger(__name__)
 
@@ -47,7 +49,14 @@ class AlertService:
 
         storage = cfg.get("storage", {})
         db_path = storage.get("db_path") or os.path.join(base_dir, "data", "seen.db")
-        self.store = SeenStore(db_path)
+        self.legacy_problem = ""
+        try:
+            self.store = SeenStore(db_path)
+        except (OSError, sqlite3.Error):
+            # 不修改或重建损坏的旧库。新收件库仍可接收、去重与恢复派送。
+            self.legacy_problem = "旧版去重库不可用；历史计数暂从本次启动算起。"
+            log.warning(self.legacy_problem)
+            self.store = SeenStore(":memory:")
 
         raw_dir = storage.get("raw_dir") or os.path.join(base_dir, "data", "raw")
         self.raw_dir = raw_dir
@@ -66,65 +75,191 @@ class AlertService:
 
         self.email = EmailSender(cfg.get("email", {}))
         self._lock = threading.Lock()
+        self.batch_all = cfg.get("batch_all_accounts", True) is not False
+        self.inbox_path = os.path.join(os.path.dirname(os.path.abspath(db_path)), "inbox.db")
+        self.inbox = None
+        self.storage_problem = ""
+        self._wake = threading.Event()
+        self._unsaved_receipts = {}
+        self._degraded_notices = OrderedDict()  # 只节流故障重投；不充当永久回执
+        self._mail_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="outbox-mail")
+        self._open_inbox()
+
+    def _open_inbox(self):
+        if self.inbox is None:
+            with self._lock:
+                if self.inbox is None:
+                    try:
+                        self.inbox = InboxStore(self.inbox_path)
+                    except Exception:
+                        self._storage_warning()
+        return self.inbox
+
+    def _storage_warning(self):
+        self.storage_problem = "本机收件箱读写异常，请检查日志及磁盘。"
+        log.warning(self.storage_problem)
+
+    def inbox_status_text(self):
+        try:
+            state = self.inbox.status()
+        except Exception:
+            return self.storage_problem or "本机收件箱状态异常"
+        return "\n".join(filter(None, [
+            "待看：{} 篇；待派送：{}；派送失败：{}".format(state["unread"], state["pending"], state["failed"]),
+            "最近正式投递：" + (state["last_received"] or "尚无记录"),
+            "最近解析异常：" + state["last_parse_error"] if state["last_parse_error"] else "",
+            self.legacy_problem, self.storage_problem]))
+
+    def _parse_warning(self):
+        log.warning("正式推送解析异常，请在本机查看原始推送记录。")
+        try:
+            self.inbox.note_parse_error()
+        except Exception:
+            self._storage_warning()
 
     def handle_payload(self, payload: Any, ignore_keywords: bool = False) -> Dict[str, Any]:
-        """返回处理摘要，同时作为 HTTP 响应体。
-
-        ignore_keywords=True 用于联通性测试（?test=1）：
-        FeedWe 的测试消息标题是 "Test article title"，不含任何关键词，
-        正常模式下会被正确拦截，导致用户无法验证通路是否打通。
-        """
         articles = parse_payload(payload)
+        account = payload.get("accountName", "") if isinstance(payload, dict) else ""
+        test_envelope = isinstance(account, str) and account.strip() == "FeedWe System Test"
+        if ignore_keywords:
+            if not articles:
+                return {"ok": True, "parsed": 0, "notified": 0, "reason": "no_articles"}
+            items = []
+            for art in articles:
+                kws = ["（测试模式，跳过关键词）"]
+                self._dispatch(art, kws)
+                items.append({"title": art.title, "keywords": kws})
+            return {"ok": True, "parsed": len(articles), "notified": len(items), "items": items,
+                    "skipped_duplicate": 0, "skipped_keyword": 0}
+        if test_envelope:
+            return {"ok": True, "parsed": len(articles), "notified": 0, "skipped_keyword": len(articles),
+                    "skipped_duplicate": 0, "items": [], "batch_notifications": 0, "inbox_new": 0}
+        self._open_inbox()
+        raw_items = payload.get("articles") if isinstance(payload, dict) else None
         if not articles:
-            log.warning("payload 未解析出任何文章")
+            if not isinstance(payload, dict) or payload.get("event") in (None, "NEW_ARTICLE"):
+                self._parse_warning()
             return {"ok": True, "parsed": 0, "notified": 0, "reason": "no_articles"}
-
-        notified = []
-        skipped_dup = 0
-        skipped_kw = 0
-
+        partial = (isinstance(raw_items, list) and len(articles) < len(raw_items)
+                   and any(not parse_payload(item) for item in raw_items))
+        entries = []
         for art in articles:
-            text = art.title
-            if self.match_field == "title_and_summary":
-                text = f"{art.title}\n{art.summary}"
+            if isinstance(account, str) and account.strip():
+                art.account = account.strip()  # 作者名不等于这次推送所属的订阅号
+            text = art.title if self.match_field != "title_and_summary" else f"{art.title}\n{art.summary}"
+            kws = match_keywords(text, self.keywords).keywords
+            try:
+                legacy = bool(kws) and self.store.contains_article(art.url, art.title)
+            except Exception:
+                legacy = False  # 查不了旧记录时宁可多提醒一次
+            entries.append((art, kws, legacy))
+        channels = (["popup"] if self.notifier is not None else []) + (["email"] if self.email.enabled else [])
+        try:
+            result = self.inbox.ingest(entries, channels, batch_all=self.batch_all)
+        except Exception:
+            self._storage_warning()
+            # 入库失败不能吞掉即时提醒；返回 503 允许上游重投。这里宁可多提醒一次。
+            groups = {}
+            for art, kws, legacy in entries:
+                if legacy or not (kws or self.batch_all):
+                    continue
+                key = (art.account, art.url)
+                now = time.monotonic()
+                with self._lock:
+                    if key in self._degraded_notices and now - self._degraded_notices[key] < 300:
+                        continue
+                    self._degraded_notices[key] = now
+                    self._degraded_notices.move_to_end(key)
+                    if len(self._degraded_notices) > 2048:
+                        self._degraded_notices.popitem(last=False)
+                if kws:
+                    self._dispatch(art, kws)
+                elif self.batch_all:
+                    groups.setdefault(art.account or "未知来源", []).append(art)
+            for name, group in groups.items():
+                if self.notifier is not None:
+                    try:
+                        self.notifier.notify_batch(name, group)
+                    except Exception:
+                        log.warning("降级批弹窗失败")
+                if self.email.enabled:
+                    self._mail_pool.submit(self.email.send_batch, name, group)
+            return {"ok": False, "degraded": True, "parsed": len(articles), "error": "inbox_unavailable"}
+        self.storage_problem = ""
+        if partial:
+            self._parse_warning()
+        self._wake.set()
+        by_object = {id(a): kws for a, kws, _ in entries}
+        items = []
+        for art in result["hits"]:
+            items.append({"title": art.title, "keywords": by_object[id(art)]})
+            try:
+                self.store.mark_if_new(art.url, art.title)  # 兼容旧版统计，派送以独立持久队列为准
+            except Exception:
+                log.warning("更新旧版去重统计失败，不影响已入队提醒")
+        log.info("正式投递：解析 %d 篇，新收 %d 篇，关键词提醒 %d 条，按批提醒 %d 条",
+                 len(articles), result["new"], len(items), result["batches"])
+        return {"ok": True, "parsed": len(articles), "notified": len(items), "items": items,
+                "skipped_keyword": sum(not kws for _, kws, _ in entries),
+                "skipped_duplicate": result["duplicates"], "inbox_new": result["new"],
+                "batch_notifications": result["batches"]}
 
-            if ignore_keywords:
-                hit_kws = ["（测试模式，跳过关键词）"]
-                # 测试模式不写去重库：FeedWe 的测试消息标题/链接固定不变，
-                # 一旦入库，第二次点「发送测试消息」就会被判"已提醒过"而静默跳过。
-                # 测试模式的存在意义就是可反复验证，所以直接放行、不记录。
-                log.info("测试模式，直接提醒：%s", art.title)
-                self._dispatch(art, hit_kws)
-                notified.append({"title": art.title, "keywords": hit_kws})
-                continue
+    def pump_once(self):
+        """领取已落盘任务；弹窗和邮件分别记录回执，回执不会更改未读状态。"""
+        store = self.inbox
+        if store is None:
+            return
+        def complete(job_id, ok):
+            try:
+                store.finish_job(job_id, bool(ok))
+            except Exception:
+                with self._lock:
+                    self._unsaved_receipts[job_id] = ok
+                self._storage_warning()
+        # 临时写锁或磁盘故障恢复后只重写回执，不重新弹窗或发邮件。
+        with self._lock:
+            receipts, self._unsaved_receipts = self._unsaved_receipts, {}
+        for job_id, ok in receipts.items():
+            complete(job_id, ok)
+        for job in store.take_jobs():
+            arts, batch = job["articles"], job["kind"] == "batch"
+            first = arts[0]
+            account = first.account or "未知来源"
+            def done(ok, key=job["id"]):
+                complete(key, ok)
+            try:
+                if job["channel"] == "popup" and self.notifier is not None:
+                    if batch:
+                        self.notifier.notify_batch(account, arts, on_result=done)
+                    else:
+                        self.notifier.notify(first.title, build_alert_text(first, job["keywords"]), first.url, on_result=done)
+                elif job["channel"] == "email" and self.email.enabled:
+                    fn, args = (self.email.send_batch, (account, arts)) if batch else (self.email.send, (first, job["keywords"]))
+                    def deliver(send=fn, arguments=args, report=done):
+                        try:
+                            ok = send(*arguments)
+                        except Exception:
+                            ok = False
+                        report(ok)
+                    self._mail_pool.submit(deliver)
+                else:
+                    done(False)
+            except Exception:
+                done(False)
 
-            hit = match_keywords(text, self.keywords)
-            if not hit.matched:
-                skipped_kw += 1
-                log.info("未命中关键词，跳过：%s", art.title)
-                continue
-            hit_kws = hit.keywords
-
-            # 去重放在关键词之后：未命中的不必占库
-            with self._lock:
-                is_new = self.store.mark_if_new(art.url, art.title)
-            if not is_new:
-                skipped_dup += 1
-                log.info("已提醒过，跳过：%s", art.title)
-                continue
-
-            log.info("命中 %s | %s", hit_kws, art.title)
-            self._dispatch(art, hit_kws)
-            notified.append({"title": art.title, "keywords": hit_kws})
-
-        return {
-            "ok": True,
-            "parsed": len(articles),
-            "notified": len(notified),
-            "skipped_duplicate": skipped_dup,
-            "skipped_keyword": skipped_kw,
-            "items": notified,
-        }
+    def delivery_loop(self, stop_event):
+        recovered = False
+        while not stop_event.is_set():
+            self._wake.clear()
+            try:
+                if self._open_inbox() is not None:
+                    if not recovered:
+                        self.inbox.recover()
+                        recovered = True
+                    self.pump_once()
+            except Exception:
+                self._storage_warning()
+            self._wake.wait(2)
 
     def _dispatch(self, article, keywords: List[str]) -> None:
         if self.notifier is not None:
@@ -314,7 +449,7 @@ def make_handler(service: AlertService, token: str, health_requires_token: bool 
                 self._json(500, {"ok": False, "error": "internal_error"})
                 return
 
-            self._json(200, result)
+            self._json(503 if result.get("degraded") else 200, result)
 
     return Handler
 
@@ -348,7 +483,7 @@ def run(cfg: Dict[str, Any], base_dir: str, use_tray: bool = False) -> int:
             "或者改 config.json 里的 port 换一个端口。"
         )
         log.error("启动失败：%s", msg)
-        _report_startup_failure(cfg, port, msg)
+        _report_startup_failure(base_dir, port, msg)
         service.store.close()
         return 2
 
@@ -378,6 +513,7 @@ def run(cfg: Dict[str, Any], base_dir: str, use_tray: bool = False) -> int:
     if use_tray:
         try:
             from tray import TrayIcon
+            from inbox_view import open_inbox_window
 
             def status_provider() -> str:
                 return build_status_text(
@@ -386,12 +522,13 @@ def run(cfg: Dict[str, Any], base_dir: str, use_tray: bool = False) -> int:
                     email_enabled=service.email.enabled,
                     token_set=bool(token),
                     token_masked=mask_secret(token) if token else "",
-                )
+                ) + "\n" + service.inbox_status_text()
 
             tray = TrayIcon(
                 port=port,
                 status_provider=status_provider,
                 on_quit=request_shutdown,
+                on_open_inbox=lambda: open_inbox_window(service.inbox_path),
                 base_dir=base_dir,
                 token=token,
             )
@@ -404,6 +541,8 @@ def run(cfg: Dict[str, Any], base_dir: str, use_tray: bool = False) -> int:
     server_thread = threading.Thread(
         target=httpd.serve_forever, name="http", daemon=True
     )
+    delivery_thread = threading.Thread(target=service.delivery_loop, args=(stop_event,), name="outbox", daemon=True)
+    delivery_thread.start()
     server_thread.start()
 
     try:
@@ -421,6 +560,10 @@ def run(cfg: Dict[str, Any], base_dir: str, use_tray: bool = False) -> int:
             httpd.server_close()
         except Exception:
             pass
+        stop_event.set()
+        service._wake.set()
+        delivery_thread.join(timeout=5)
+        service._mail_pool.shutdown(wait=False)
         if tray is not None:
             tray.stop()
         service.store.close()
@@ -428,7 +571,7 @@ def run(cfg: Dict[str, Any], base_dir: str, use_tray: bool = False) -> int:
     return 0
 
 
-def _report_startup_failure(cfg: Dict[str, Any], port: int, msg: str) -> None:
+def _report_startup_failure(base_dir: str, port: int, msg: str) -> None:
     """启动失败时让用户"看得见"。
 
     静默运行时（pythonw + 托盘）没有任何窗口，失败必须主动冒出来——
@@ -444,12 +587,9 @@ def _report_startup_failure(cfg: Dict[str, Any], port: int, msg: str) -> None:
 
     # 2) 在程序目录留一个显眼的文本文件
     try:
-        import os as _os
         from datetime import datetime as _dt
 
-        # server.py 位于 <root>/src/，上一级就是程序根目录
-        root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
-        path = _os.path.join(root, "启动失败.txt")
+        path = os.path.join(base_dir, "启动失败.txt")
         with open(path, "w", encoding="utf-8") as f:
             f.write("时间：%s\n端口：%d\n\n%s\n" % (
                 _dt.now().strftime("%Y-%m-%d %H:%M:%S"), port, msg

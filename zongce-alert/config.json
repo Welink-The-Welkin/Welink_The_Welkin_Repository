@@ -4,7 +4,7 @@
   "host": "127.0.0.1",
   "_token说明": "留空即可——真实 token 从 secrets.local.json 读取，或用环境变量 ZONGCE_TOKEN 覆盖",
   "token": "",
-  "_关键词说明": "标题里出现任意一个就会提醒。按需增删",
+  "_关键词说明": "命中关键词的逐篇提醒；未命中的按批提醒由 batch_all_accounts 决定。",
   "keywords": [
     "综测",
     "综合素质测评",
@@ -14,8 +14,10 @@
     "德育分",
     "报名"
   ],
-  "_match_field": "title = 只看标题（推荐，噪音少）；title_and_summary = 标题加摘要",
+  "_match_field": "title = 只看标题；title_and_summary = 标题加推送中的非空摘要；没有摘要时仍只看标题，不会获取正文",
   "match_field": "title",
+  "_batch_all_accounts": "所有订阅号自动纳入：同一批未命中关键词的新文章按公众号合并提醒。关掉后仍进本机待看清单。",
+  "batch_all_accounts": true,
   "_health_requires_token": "true = /health 也要 token（推荐，因为它经隧道后公网可访问）",
   "health_requires_token": true,
   "_test_mode_allow_remote": "false = 只有本机能用 &test=1（推荐）。改成 true 会让隧道地址持有者也能全量放行",
