@@ -15,6 +15,23 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional
 from datetime import datetime
+from urllib.parse import parse_qs, urlsplit
+
+
+def is_safe_article_url(url):
+    """Only expose ordinary HTTP(S) article links without credentials to the user."""
+    if not isinstance(url, str) or re.search(r"[\s\\\x00-\x1f\x7f]|%(?![\da-fA-F]{2})|%(?:0[\da-f]|1[\da-f]|7f)", url, re.I):
+        return False
+    try:
+        p = urlsplit(url)
+        _ = p.port
+        if p.scheme not in ("http", "https") or not p.hostname or p.username is not None or "%" in p.netloc:
+            return False
+        if "[" in p.netloc and not re.fullmatch(r"\[[^]]+\](?::\d+)?", p.netloc):
+            return False
+        return not any(k.lower() in {"token", "access_token", "password"} for k in parse_qs(p.query, keep_blank_values=True))
+    except (ValueError, UnicodeError):
+        return False
 
 # 字段别名，按优先级排列
 _TITLE_KEYS = ("title", "Title", "headline", "name", "subject", "article_title")
@@ -252,11 +269,10 @@ def _try_known_shapes(payload: Any) -> List[Article]:
                 continue
             node = payload[key]
             if isinstance(node, list):
-                arts = [
-                    a
-                    for a in (_build_article(o, ctx) for o in node if isinstance(o, dict))
-                    if a
-                ]
+                # 逐条解析：有一篇正常不能让同批嵌套在子字段里的其他文章消失。
+                arts = []
+                for item in node:
+                    _walk(item, arts, ctx=ctx)
                 if arts:
                     return arts
             elif isinstance(node, dict):

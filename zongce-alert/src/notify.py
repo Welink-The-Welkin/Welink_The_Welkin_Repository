@@ -17,7 +17,7 @@ from email.mime.text import MIMEText
 from email.utils import formatdate
 from typing import Any, Dict, List, Optional
 
-from article_parser import Article
+from article_parser import Article, is_safe_article_url
 
 log = logging.getLogger(__name__)
 
@@ -49,15 +49,12 @@ def build_alert_text(article: Article, keywords: List[str]) -> str:
 
 def build_email_message(article: Article, keywords: List[str], cfg: Dict[str, Any]):
     """构造一封 HTML 邮件。"""
-    sender = (cfg.get("username") or "").strip()
-    to_addr = (cfg.get("to") or "").strip() or sender
-
     kw_str = "、".join(keywords) if keywords else "—"
-    subject = f"[综测提醒] {_truncate(article.title, 50)}"
+    subject = "[综测提醒] " + _truncate(" ".join(article.title.split()), 50)
 
     safe = {
         "title": html.escape(article.title),
-        "url": html.escape(article.url, quote=True),
+        "url": html.escape(article.url, quote=True) if is_safe_article_url(article.url) else "",
         "account": html.escape(article.account or "未知来源"),
         "time": html.escape(article.published_at or "未知时间"),
         "kw": html.escape(kw_str),
@@ -98,6 +95,28 @@ def build_email_message(article: Article, keywords: List[str], cfg: Dict[str, An
   </div>
 </body></html>
 """
+    return _message(subject, body, cfg)
+
+
+def _batch_title(account, articles):
+    return f"{_truncate(' '.join(account.split()) or '未知公众号', 50)}有 {len(articles)} 篇新文章待看"
+
+
+def build_batch_email(account, articles, cfg):
+    title = _batch_title(account, articles)
+    lines = []
+    for art in articles:
+        text = html.escape(_truncate(art.title, 300))
+        if is_safe_article_url(art.url):
+            text = '<a href="{}">{}</a>'.format(html.escape(art.url, quote=True), text)
+        lines.append('<li>' + text + '</li>')
+    body = '<h2>{}</h2><ol>{}</ol><p>可在本机托盘 → 待看文章中逐篇标记已看。</p>'.format(html.escape(title), ''.join(lines))
+    return _message('[订阅更新] ' + title, body, cfg)
+
+
+def _message(subject, body, cfg):
+    sender = (cfg.get("username") or "").strip()
+    to_addr = (cfg.get("to") or "").strip() or sender
     msg = MIMEText(body, "html", "utf-8")
     msg["Subject"] = Header(subject, "utf-8")
     # From 用纯地址：带中文显示名在 QQ/163 客户端容易进垃圾箱
@@ -121,11 +140,16 @@ class EmailSender:
             log.warning("邮件已启用但缺少 username/password，视为未启用")
 
     def send(self, article: Article, keywords: List[str]) -> bool:
+        return self._send(build_email_message, article, keywords)
+
+    def send_batch(self, account, articles) -> bool:
+        return self._send(build_batch_email, account, articles)
+
+    def _send(self, build, *args):
         if not self.enabled:
             return False
-
         try:
-            msg = build_email_message(article, keywords, self.cfg)
+            msg = build(*args, self.cfg)
             host = self.cfg.get("smtp_host", "smtp.qq.com")
             port = int(self.cfg.get("smtp_port", 465))
             timeout = 20
@@ -145,7 +169,7 @@ class EmailSender:
                 except Exception:
                     pass
 
-            log.info("邮件已发送：%s", article.title)
+            log.info("提醒邮件已交给 SMTP 服务器")
             return True
 
         except Exception as e:
@@ -171,8 +195,8 @@ def _toast_fallback(title: str, message: str) -> bool:
     try:
         from win10toast import ToastNotifier  # type: ignore
 
-        ToastNotifier().show_toast(title, message, duration=15, threaded=True)
-        return True
+        if ToastNotifier().show_toast(title, message, duration=15, threaded=False):
+            return True
     except Exception:
         pass
 
@@ -180,29 +204,27 @@ def _toast_fallback(title: str, message: str) -> bool:
         # 最后兜底：PowerShell 原生 Toast
         import subprocess
 
-        ps = f"""
+        import os
+        ps = """
+$ErrorActionPreference = 'Stop'
 [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType=WindowsRuntime] | Out-Null
 $t = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02)
 $texts = $t.GetElementsByTagName('text')
-$texts.Item(0).AppendChild($t.CreateTextNode({_ps_quote(title)})) | Out-Null
-$texts.Item(1).AppendChild($t.CreateTextNode({_ps_quote(message)})) | Out-Null
+$texts.Item(0).AppendChild($t.CreateTextNode($env:ZC_TITLE)) | Out-Null
+$texts.Item(1).AppendChild($t.CreateTextNode($env:ZC_BODY)) | Out-Null
 [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('综测提醒').Show([Windows.UI.Notifications.ToastNotification]::new($t))
 """
-        subprocess.run(
-            ["powershell", "-NoProfile", "-Command", ps],
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+            env=dict(os.environ, ZC_TITLE=_truncate(title, 200), ZC_BODY=_truncate(message, 600)),
             timeout=15,
             capture_output=True,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
-        return True
+        return result.returncode == 0
     except Exception as e:
         log.error("Toast 兜底也失败：%s", e)
         return False
-
-
-def _ps_quote(text: str) -> str:
-    """把字符串安全嵌入 PowerShell 单引号字面量。"""
-    return "'" + (text or "").replace("'", "''") + "'"
 
 
 class PopupNotifier:
@@ -215,6 +237,7 @@ class PopupNotifier:
         self.sound = bool(self.cfg.get("sound", True))
         self._queue: "queue.Queue[tuple]" = queue.Queue()
         self._thread: Optional[threading.Thread] = None
+        self._start_lock = threading.Lock()
         self._started = threading.Event()
         self._available = True
         # 诊断信息：最近一次弹窗是否真的显示成功，供 --test 报告
@@ -223,18 +246,41 @@ class PopupNotifier:
         self._shown = threading.Event()
 
     def start(self) -> None:
-        if self._thread and self._thread.is_alive():
-            return
-        self._thread = threading.Thread(target=self._run, name="popup", daemon=True)
-        self._thread.start()
-        self._started.wait(timeout=5)
+        with self._start_lock:
+            if self._available and not (self._thread and self._thread.is_alive()):
+                self._thread = threading.Thread(target=self._run, name="popup", daemon=True)
+                self._thread.start()
+        self._started.wait()
 
-    def notify(self, title: str, message: str, url: str = "") -> None:
+    def notify(self, title: str, message: str, url: str = "", on_result=None) -> None:
+        self._enqueue(title, message, url if is_safe_article_url(url) else "", on_result, False)
+
+    def notify_batch(self, account, articles, on_result=None) -> None:
+        preview = [_truncate(a.title, 48) for a in articles[:3]]
+        preview.append("全部文章见托盘 → 待看文章。")
+        self._enqueue(_batch_title(account, articles), "\n".join(preview), "", on_result, True)
+
+    def _enqueue(self, title, message, url, callback, batch):
+        reported = False
+        def receipt(ok):
+            nonlocal reported
+            if reported:
+                return
+            reported = True
+            self.last_show_ok = bool(ok)
+            self.last_error = "" if ok else "未能显示提醒"
+            self._shown.set()
+            if callback:
+                try:
+                    callback(bool(ok))
+                except Exception:
+                    log.warning("通知回执处理失败")
+        if self._available:
+            self.start()
         if not self._available:
-            _toast_fallback(title, message)
+            receipt(_toast_fallback(title, message))
             return
-        self.start()
-        self._queue.put((title, message, url))
+        self._queue.put((title, message, url, receipt, batch))
         if self.sound:
             _play_sound()
 
@@ -266,19 +312,23 @@ class PopupNotifier:
             item = self._queue.get()
             if item is None:
                 break
+            title, message, url, receipt, batch = item
+            displayed = False
+            def visible(ok):
+                nonlocal displayed
+                displayed = bool(ok)
+                receipt(ok)
             try:
-                self._show_one(tk, *item)
-                self.last_show_ok = True
-                self.last_error = ""
+                self._show_one(tk, title, message, url, visible, batch)
             except Exception as e:
-                self.last_show_ok = False
-                self.last_error = str(e)
-                log.error("弹窗渲染失败：%s", e)
-                _toast_fallback(item[0], item[1])
+                log.warning("弹窗渲染失败：%s", e)
+            if not displayed:
+                receipt(_toast_fallback(title, message))
 
-    def _show_one(self, tk, title: str, message: str, url: str) -> None:
+    def _show_one(self, tk, title: str, message: str, url: str, receipt, batch=False) -> None:
         win = tk.Tk()
-        win.title("★ 综测加分活动提醒 ★")
+        caption = "订阅号更新 · 待看文章" if batch else "综测加分活动提醒"
+        win.title(caption)
         win.configure(bg="#c62828")
         win.attributes("-topmost", self.always_on_top)
         win.resizable(False, False)
@@ -306,7 +356,7 @@ class PopupNotifier:
         head.pack(fill="x")
         head.pack_propagate(False)
         tk.Label(
-            head, text="⚠  综测加分活动提醒", bg="#c62828", fg="#ffffff",
+            head, text=caption, bg="#c62828", fg="#ffffff",
             font=("Microsoft YaHei UI", 16, "bold"), anchor="w", padx=20,
         ).pack(fill="both", expand=True)
 
@@ -385,10 +435,10 @@ class PopupNotifier:
 
         win.after(120, _report_state)
 
-        # 窗口已构建完成，进入事件循环前就标记成功。
-        # （不能等 mainloop 返回——那要等窗口关闭，语义不对）
-        self.last_show_ok = True
-        self.last_error = ""
-        self._shown.set()
+        # 根窗口映射到桌面才算显示；回执独立于关闭、打开原文或标为已看。
+        def mapped(event):
+            if event.widget is win and win.winfo_viewable():
+                receipt(True)
+        win.bind("<Map>", mapped, add="+")
 
         win.mainloop()

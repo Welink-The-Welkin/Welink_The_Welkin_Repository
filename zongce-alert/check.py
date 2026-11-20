@@ -94,18 +94,13 @@ def main() -> int:
     if kws:
         print(f"    关键词：{'、'.join(kws)}")
 
-    # 隧道地址
-    cb_file = os.path.join(BASE_DIR, "data", "callback-url.txt")
+    # 状态输出常用于排障；只说明隧道类型，不在这里打印带凭据的地址。
+    from tray import describe_tunnel_steps, read_callback_host
+
     print()
-    if os.path.exists(cb_file):
-        with open(cb_file, encoding="utf-8") as f:
-            cb = f.read().strip()
-        print("  回调地址（填到 FeedWe）：")
-        print(f"    {cb}")
-        print("    ⚠ 每次重启电脑后地址会变，需重新复制并更新 FeedWe")
-    else:
-        print("  回调地址：还没生成")
-        print("    → 运行 python start_tunnel.py")
+    print(describe_tunnel_steps(read_callback_host(BASE_DIR)))
+    print("  需要复制地址？右键托盘 →「打开回调地址文件」，或在插件文件夹打开 data\\callback-url.txt。")
+    print("  完整地址只填到自己的监测服务，不要公开或截图。")
 
     # 自启状态
     lnk = os.path.join(

@@ -9,6 +9,7 @@ import socket
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
@@ -26,7 +27,12 @@ def _free_port() -> int:
 
 class TestPortConflict(unittest.TestCase):
     def setUp(self):
-        self.tmpdir = tempfile.mkdtemp()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmpdir = tmp.name
+        toast = patch("notify._toast_fallback", return_value=True)
+        toast.start()
+        self.addCleanup(toast.stop)
         self.cfg = json.loads(json.dumps(DEFAULT_CONFIG))
         self.cfg["notify"]["popup"] = False
         self.cfg["email"]["enabled"] = False
@@ -34,14 +40,7 @@ class TestPortConflict(unittest.TestCase):
         self.cfg["storage"]["db_path"] = os.path.join(self.tmpdir, "seen.db")
         self.cfg["storage"]["raw_dir"] = os.path.join(self.tmpdir, "raw")
         self.cfg["token"] = "t"
-        self.fail_file = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            "启动失败.txt",
-        )
-
-    def tearDown(self):
-        if os.path.exists(self.fail_file):
-            os.remove(self.fail_file)
+        self.fail_file = os.path.join(self.tmpdir, "启动失败.txt")
 
     def test_端口被占时返回非零退出码而不抛异常(self):
         port = _free_port()

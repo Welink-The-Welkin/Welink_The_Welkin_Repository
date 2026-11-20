@@ -36,6 +36,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "token": "",
     "keywords": DEFAULT_KEYWORDS,
     "match_field": "title",  # title | title_and_summary
+    "batch_all_accounts": True,  # 无需维护公众号名单；仅关闭未命中时的批提醒
     "notify": {
         "popup": True,
         "sound": True,
@@ -197,7 +198,7 @@ def validate(cfg: Dict[str, Any]) -> list:
     if not isinstance(kw, list) or not [
         k for k in kw if isinstance(k, str) and k.strip()
     ]:
-        problems.append("keywords 为空——任何文章都不会命中，等于不提醒")
+        problems.append("keywords 为空——没有关键词即时提醒；批提醒取决于 batch_all_accounts")
 
     email = cfg.get("email") or {}
     if email.get("enabled"):

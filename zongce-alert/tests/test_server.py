@@ -88,7 +88,7 @@ class TestAlertService(unittest.TestCase):
         self.assertEqual(r["parsed"], 3)
         self.assertEqual(r["notified"], 2)
 
-    def test_标题与正文同时匹配模式(self):
+    def test_标题加摘要模式下摘要命中会提醒(self):
         s = self.make(match_field="title_and_summary")
         r = s.handle_payload({
             "title": "关于活动的通知",
@@ -96,8 +96,9 @@ class TestAlertService(unittest.TestCase):
             "url": "https://mp.weixin.qq.com/s/s1",
         })
         self.assertEqual(r["notified"], 1)
+        self.assertEqual(r["items"][0]["keywords"], ["综测", "加分"])
 
-    def test_只看标题模式下正文命中不算(self):
+    def test_只看标题模式下摘要命中不算(self):
         s = self.make(match_field="title")
         r = s.handle_payload({
             "title": "关于活动的通知",
@@ -105,6 +106,30 @@ class TestAlertService(unittest.TestCase):
             "url": "https://mp.weixin.qq.com/s/s2",
         })
         self.assertEqual(r["notified"], 0)
+
+    def test_缺失或空摘要不产生关键词命中(self):
+        s = self.make(match_field="title_and_summary", keywords=["综测", "None"])
+        summaries = ({}, {"summary": None}, {"summary": ""}, {"summary": " \t"})
+        for index, fields in enumerate(summaries):
+            with self.subTest(summary=fields):
+                r = s.handle_payload({"articles": [
+                    {"title": "关于活动的通知", "url": f"https://example.com/skip/{index}", **fields},
+                    {"title": "综测活动通知", "url": f"https://example.com/notify/{index}", **fields},
+                ]})
+                self.assertEqual(r["parsed"], 2)
+                self.assertEqual(r["skipped_keyword"], 1)
+                self.assertEqual(r["items"], [{"title": "综测活动通知", "keywords": ["综测"]}])
+
+    def test_摘要模式不匹配独立的正文字段(self):
+        s = self.make(match_field="title_and_summary")
+        r = s.handle_payload({
+            "title": "关于活动的通知",
+            "summary": "",
+            "content": "参加可获得综测加分",
+            "url": "https://example.com/body-only",
+        })
+        self.assertEqual(r["notified"], 0)
+        self.assertEqual(r["skipped_keyword"], 1)
 
     def test_无关payload返回no_articles(self):
         s = self.make()

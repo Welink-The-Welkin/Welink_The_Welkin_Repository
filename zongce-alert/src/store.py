@@ -66,18 +66,14 @@ class SeenStore:
         # 并发写由下面的 _lock 串行化，保证事务安全。
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._lock = threading.Lock()
-        with self._lock:
-            self._conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS seen (
-                    fp        TEXT PRIMARY KEY,
-                    title     TEXT,
-                    url       TEXT,
-                    seen_at   REAL NOT NULL
-                )
-                """
-            )
+        try:
+            self._conn.execute("""CREATE TABLE IF NOT EXISTS seen (
+                fp TEXT PRIMARY KEY, title TEXT, url TEXT, seen_at REAL NOT NULL
+            )""")
             self._conn.commit()
+        except sqlite3.Error:
+            self._conn.close()
+            raise
 
     def mark_if_new(self, url: Optional[str], title: Optional[str]) -> bool:
         """首次出现返回 True 并记录；已存在返回 False。
@@ -98,6 +94,24 @@ class SeenStore:
                 return True
             except sqlite3.IntegrityError:
                 return False
+
+    def contains_article(self, url: str, title: str) -> bool:
+        """只读旧库。历史指纹可能丢弃查询参数，不让指纹碰撞吞掉新文章。"""
+        with self._lock:
+            row = self._conn.execute("SELECT url FROM seen WHERE fp=?", (fingerprint(url, title),)).fetchone()
+        if not row:
+            return False
+        if row[0] == url:
+            return True
+        parts, old = urlsplit(url), urlsplit(row[0])
+        if parts.netloc.lower() != "mp.weixin.qq.com" or old.netloc.lower() != parts.netloc.lower() or old.path != parts.path:
+            return False
+        if re.fullmatch(r"/s/[A-Za-z0-9_-]+", parts.path):
+            return True
+        q, prev = parse_qs(parts.query), parse_qs(old.query)
+        # 没有公众号或文章签名时，仅凭 mid/idx 不能证明是同一篇。
+        return (parts.path == "/s" and "mid" in q and ("__biz" in q or "sn" in q)
+                and ("idx" in q or "sn" in q) and all(q.get(k) == prev.get(k) for k in _ID_KEYS))
 
     def count(self) -> int:
         with self._lock:

@@ -8,6 +8,7 @@
 import ctypes
 import logging
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -71,12 +72,51 @@ def build_menu_labels(port: int) -> List[str]:
     """
     return [
         "查看状态",
+        "待看文章",
         "在浏览器中查看状态",
         "打开日志",
         "打开回调地址文件",
-        "重启后要做什么？",
+        "帮助",
         "退出",
     ]
+
+
+_HELP_TOPICS = (
+    ("第一次使用：怎样收到第一篇文章？",
+     "1. 双击「启动.bat」。点任务栏右下角的 ^，右键红底白勾。\n"
+     "2. 在 FeedWe 的「订阅管理」添加想看的公众号。\n"
+     "3. 点托盘「打开回调地址文件」，复制完整地址；不要公开。\n"
+     "   在 FeedWe 的「自定义 Webhook」中粘贴并保存。\n"
+     "   没有地址？看插件文件夹里的 docs\\QUICKSTART.md 第 4 步。\n"
+     "   已配好就跳过，不用重新生成回调密码。\n"
+     "4. 等订阅号发新文并投递，先看「查看状态」里的「最近正式投递」。\n"
+     "   再到「待看文章」点「刷新」；看到那篇的标题才算收到。"),
+    ("收到提醒后，去哪里看文章？",
+     "右键红底白勾，点「待看文章」→「刷新」。选中一篇，点「打开原文」。\n"
+     "打开不会自动标记已看；读完点「标记已看」，这篇才会从待看列表移走。\n\n"
+     "默认提醒所有订阅号，但只算本机收到并解析出的新文章。\n"
+     "含关键词的逐篇提醒；同一次推送里，同一公众号的其余文章合并成一条提醒，列表里仍可逐篇看。"),
+    ("测试成功，为什么待看还是空的？",
+     "「自检.bat」只验证本机通知，不增加待看文章。\n"
+     "如果启用了邮件，它会真的发一封自检邮件。\n\n"
+     "FeedWe 的 System Test 发到默认回调地址时，\n"
+     "不弹窗、不进待看，也不更新「最近正式投递」。\n"
+     "不用改地址或开公网测试。等订阅号发新文章，再看「查看状态」和「待看文章」。"),
+    ("公众号发文了，却没收到提醒？",
+     "先点托盘「查看状态」，看「最近正式投递」的时间和待看篇数。\n\n"
+     "时间没更新：确认该号发了新文、FeedWe 仍有订阅。\n"
+     "再查隧道是否连通、自定义 Webhook 是否填了当前完整地址。\n"
+     "时间有更新：在「待看文章」点「刷新」，找那篇的标题。\n"
+     "仍没提醒，查「待派送」「派送失败」「最近解析异常」，再点「打开日志」。\n\n"
+     "本机只能处理送到这里的文章。不要删除数据库，删库不能补回漏送的文章。"),
+    ("有弹窗，为什么没邮件？",
+     "点托盘「查看状态」，看「邮件通知」。\n"
+     "未启用：按插件文件夹 docs\\CONFIG.md 的邮件步骤开启。\n\n"
+     "已开启：先查收件箱和垃圾邮件，再核对收件地址和邮箱授权码。\n"
+     "授权码不是登录密码，不要展示或分享。\n"
+     "双击「自检.bat」验证：邮件启用时会发自检邮件，可按窗口结果检查是否收到。"),
+    ("电脑重启后，要重新设置吗？", None),  # 点击时才根据本机回调地址生成答案。
+)
 
 
 def read_callback_host(base_dir: str) -> Optional[str]:
@@ -86,82 +126,40 @@ def read_callback_host(base_dir: str) -> Optional[str]:
     """
     path = os.path.join(base_dir, "data", "callback-url.txt")
     try:
-        with open(path, encoding="utf-8", errors="ignore") as f:
+        with open(path, encoding="utf-8") as f:
             url = f.read().strip()
-    except OSError:
-        return None
-    if not url:
-        return None
-    return urlsplit(url).hostname or None
+        if any(c.isspace() or not c.isprintable() for c in url):
+            return None
+        parts = urlsplit(url)
+        if parts.scheme != "https" or parts.username is not None:
+            return None
+        _ = parts.port  # urlsplit 在读取 port 时才检查端口是否合法。
+        host = parts.hostname or ""
+        if re.fullmatch(r"(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z0-9-]+", host):
+            return host
+    except (OSError, ValueError):  # 包括无法解码的文件、括号或端口损坏的地址。
+        pass
+    return None
+
+
+def describe_tunnel_steps(host: Optional[str]) -> str:
+    """托盘和状态脚本使用同一份说明，不回显地址或凭据。"""
+    if host and host.endswith(".ts.net"):
+        return ("Tailscale Funnel 使用固定地址。先确认 Tailscale 已连接，\n"
+                "Funnel 已开启；地址没变就不用重填 FeedWe 的 Webhook。")
+    if host and host.endswith(".trycloudflare.com"):
+        return ("Cloudflare 临时隧道：在插件文件夹运行 python start_tunnel.py，\n"
+                "保持窗口开着。把新的完整地址更新到 FeedWe 的 Webhook。")
+    return ("没能识别回调地址。先看 docs\\QUICKSTART.md 第 4 步确认隧道：\n"
+            "Tailscale Funnel 用固定地址；Cloudflare 临时隧道重开后，\n"
+            "需更新 FeedWe 的地址并保持窗口开着。")
 
 
 def describe_restart_steps(host: Optional[str]) -> str:
-    """按当前回调地址的主机名，给出重启后真正该做的事。
-
-    临时隧道的地址会变、Funnel 的不会——两种情况混着说，
-    用户就会按错的那套去操作（比如白跑一趟去改 FeedWe）。
-    """
-    head = "程序会随开机自启自动运行（装过自启的话）。"
-    common_tail = (
-        "怎么确认在用哪种地址：\n"
-        "  右键托盘 →「打开回调地址文件」，看域名。\n"
-        "    以 .ts.net 结尾  →  Tailscale Funnel\n"
-        "    以 .trycloudflare.com 结尾  →  Cloudflare 临时隧道"
-    )
-
-    if host and host.endswith(".ts.net"):
-        return "\n".join([
-            "你用的是 Tailscale Funnel，地址固定不变。",
-            "",
-            "重启后只需要：",
-            "1. 等 Tailscale 自己连上（托盘图标出现即算就绪）",
-            "2. 启动本程序（双击 启动.bat）",
-            "3. FeedWe 后台的 Webhook 不用动，地址不会变",
-            "",
-            "只有这三种情况才需要回 FeedWe 改一次：",
-            "  · 换了电脑（机器名变了，域名跟着变）",
-            "  · 退出了 tailnet 或改了 tailnet 名称",
-            "  · 用 python run.py --gen-token 轮换了 token",
-            "",
-            head,
-            "托盘图标出现就说明 Tailscale 和本程序都在跑。",
-            "",
-            "如果长时间收不到推送，先看 data\\alert.log，",
-            "那多半是程序没起来，而不是隧道的问题。",
-        ])
-
-    if host and host.endswith(".trycloudflare.com"):
-        return "\n".join([
-            "你用的是 Cloudflare 临时隧道，地址每次启动都会变。",
-            "",
-            "重启后要：",
-            "1. 运行 python start_tunnel.py，等它打印新地址",
-            "2. 复制 data\\callback-url.txt 里的完整地址",
-            "3. 粘到 FeedWe 后台的 Webhook 设置里",
-            "",
-            "嫌麻烦的话，可以改用 Tailscale Funnel，地址固定：",
-            "  python start_tunnel.py --mode funnel",
-            "",
-            head,
-        ])
-
-    return "\n".join([
-        "还没读到当前的回调地址（data\\callback-url.txt 不存在或为空）。",
-        "",
-        "请先确定自己用的是哪种隧道：",
-        "",
-        "【A. Tailscale Funnel】地址固定，重启后什么都不用改",
-        "  1. 确认托盘图标出现（Tailscale 已连上）",
-        "  2. 双击 启动.bat",
-        "  3. FeedWe 后台不用动",
-        "  启动命令：python start_tunnel.py --mode funnel",
-        "",
-        "【B. Cloudflare 临时隧道】地址每次都变",
-        "  1. python start_tunnel.py，记下新地址",
-        "  2. 粘到 FeedWe 后台的 Webhook 设置里",
-        "",
-        common_tail,
-    ])
+    startup = ("已装自启也先确认：红底白勾还在，不用重复启动。\n"
+               "没看到图标就双击「查看状态.bat」；若未运行，再双击「启动.bat」。\n"
+               "图标只说明本机程序在运行，不代表隧道已连通。")
+    return startup + "\n\n" + describe_tunnel_steps(host)
 
 
 def make_icon_image(size: int = 64):
@@ -203,10 +201,12 @@ class TrayIcon:
         on_quit: Callable[[], None],
         base_dir: str,
         token: str = "",
+        on_open_inbox: Optional[Callable[[], Optional[bool]]] = None,
     ):
         self.port = port
         self._status_provider = status_provider
         self._on_quit = on_quit
+        self._on_open_inbox = on_open_inbox
         self.base_dir = base_dir
         # /health 默认要鉴权，托盘打开浏览器时必须自动带上
         self._token = token or ""
@@ -283,6 +283,17 @@ class TrayIcon:
             log.info("用户查看状态：\n%s", text)
             _show_async("综测加分提醒 · 当前状态", text)
 
+        def open_inbox(icon=None, item=None):
+            if self._on_open_inbox is None:
+                _show_async("待看文章", "本次运行未启用待看文章。")
+                return
+            try:
+                if self._on_open_inbox() is not False:
+                    return
+            except Exception:
+                log.warning("待看文章窗口启动失败")
+            _show_async("待看文章", "打开窗口失败，请重试。")
+
         def open_health(icon=None, item=None):
             webbrowser.open(self.health_url())
 
@@ -294,9 +305,11 @@ class TrayIcon:
             path = os.path.join(self.base_dir, "data", "callback-url.txt")
             self._open_path(path, fallback=self.base_dir)
 
-        def show_restart_hint(icon=None, item=None):
-            host = read_callback_host(self.base_dir)
-            _show_async("重启后要做什么？", describe_restart_steps(host))
+        def help_item(question, answer):
+            def show_help(icon, item):
+                text = answer if answer is not None else describe_restart_steps(read_callback_host(self.base_dir))
+                _show_async(question, text)
+            return MenuItem(question, show_help)
 
         def quit_app(icon=None, item=None):
             log.info("用户从托盘退出程序")
@@ -312,11 +325,12 @@ class TrayIcon:
 
         return Menu(
             MenuItem("查看状态", show_status, default=True),
+            MenuItem("待看文章", open_inbox),
             MenuItem("在浏览器中查看状态", open_health),
             MenuItem("打开日志", open_log),
             MenuItem("打开回调地址文件", open_callback),
             Menu.SEPARATOR,
-            MenuItem("重启后要做什么？", show_restart_hint),
+            MenuItem("帮助", Menu(*(help_item(q, a) for q, a in _HELP_TOPICS))),
             Menu.SEPARATOR,
             MenuItem("退出", quit_app),
         )

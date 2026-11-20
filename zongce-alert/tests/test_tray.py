@@ -2,6 +2,7 @@
 
 GUI 本身（pystray 图标）靠手动验证，但"状态文案""菜单项"这类逻辑必须可测。
 """
+import inspect
 import os
 import sys
 import tempfile
@@ -45,23 +46,30 @@ class _FakeTray:
             raise AssertionError("通知气泡不该再被用作状态展示")
 
 
+HELP_QUESTIONS = (
+    "第一次使用：怎样收到第一篇文章？",
+    "收到提醒后，去哪里看文章？",
+    "测试成功，为什么待看还是空的？",
+    "公众号发文了，却没收到提醒？",
+    "有弹窗，为什么没邮件？",
+    "电脑重启后，要重新设置吗？",
+)
+
+
+def _menu_actions(menu):
+    return {it.label: _menu_actions(it.action) if isinstance(it.action, _FakeMenu) else it.action
+            for it in menu.items if it != _FakeMenu.SEPARATOR}
+
+
 def _built_menu(base_dir, status_text="状态占位"):
-    """返回 {label: action} 的菜单映射，供直接调用菜单回调。"""
+    """保留菜单层级，便于按用户实际看到的问题调用回调。"""
     icon = tray_mod.TrayIcon(
         port=8765,
         status_provider=lambda: status_text,
         on_quit=lambda: None,
         base_dir=base_dir,
     )
-    menu = icon._build_menu(_FakeTray)
-    plain = _FakeTray.MenuItem
-    pairs = {}
-    for it in menu.items:
-        if it == _FakeMenu.SEPARATOR:
-            continue
-        assert isinstance(it, plain), it
-        pairs[it.label] = it.action
-    return pairs, icon
+    return _menu_actions(icon._build_menu(_FakeTray)), icon
 
 
 class TestStatusText(unittest.TestCase):
@@ -106,6 +114,94 @@ class TestMenuLabels(unittest.TestCase):
         with tempfile.TemporaryDirectory() as base:
             pairs, _ = _built_menu(base)
         self.assertEqual(list(pairs.keys()), build_menu_labels(port=8765))
+
+
+class TestHelpMenu(unittest.TestCase):
+    def test_原顶层入口和顺序不变且帮助是六题子菜单(self):
+        menu, icon = _built_menu(".")
+        self.assertEqual(list(menu), ["查看状态", "待看文章", "在浏览器中查看状态", "打开日志",
+                                      "打开回调地址文件", "帮助", "退出"])
+        self.assertTrue(icon._build_menu(_FakeTray).items[0].default)
+        self.assertEqual(tuple(menu["帮助"]), HELP_QUESTIONS)
+        for action in menu["帮助"].values():
+            self.assertEqual(len(inspect.signature(action).parameters), 2)
+
+    def test_逐题弹出对应短答且不执行帮助中提到的操作(self):
+        terms = (
+            ("启动.bat", "右下角", "^", "FeedWe", "订阅", "打开回调地址文件", "完整地址",
+             "自定义 Webhook", r"docs\QUICKSTART.md", "不要公开", "最近正式投递", "待看文章"),
+            ("收到", "解析", "默认", "关键词", "同一次", "合并", "待看文章", "刷新", "打开原文", "标记已看", "不会自动"),
+            ("自检.bat", "本机", "邮件", "System Test", "不弹", "待看", "最近正式投递", "公网"),
+            ("查看状态", "最近正式投递", "待看", "订阅", "隧道", "Webhook", "刷新", "待派送", "派送失败", "最近解析异常", "打开日志"),
+            ("查看状态", "邮件", "垃圾", "授权码", "自检.bat"),
+            ("自启", "隧道", "图标"),
+        )
+        with mock.patch.object(tray_mod, "_show_async") as show, \
+                mock.patch.object(tray_mod, "read_callback_host", return_value=None) as read_host, \
+                mock.patch.object(tray_mod.webbrowser, "open") as browser, \
+                mock.patch.object(tray_mod.TrayIcon, "_open_path") as open_path, \
+                mock.patch.object(tray_mod.subprocess, "Popen") as launch:
+            menu, _ = _built_menu(".")
+            show.assert_not_called()
+            self.assertIn("帮助", menu)
+            for question, expected in zip(HELP_QUESTIONS, terms):
+                with self.subTest(question=question):
+                    read_host.assert_not_called()
+                    menu["帮助"][question](None, None)
+                    show.assert_called_once()
+                    title, body = show.call_args.args
+                    self.assertIn(question, title)
+                    for term in expected:
+                        self.assertIn(term, body)
+                    self.assertLessEqual(len(body), 260)
+                    self.assertLessEqual(len(body.splitlines()), 10)
+                    self.assertLessEqual(max(map(len, body.splitlines())), 48)
+                    show.reset_mock()
+            read_host.assert_called_once_with(".")
+            browser.assert_not_called()
+            open_path.assert_not_called()
+            launch.assert_not_called()
+
+
+class TestInboxMenu(unittest.TestCase):
+    def test_待看文章只调用无参本机回调(self):
+        open_inbox = mock.Mock()
+        icon = tray_mod.TrayIcon(8765, mock.Mock(), mock.Mock(), ".", "dummy",
+                                 on_open_inbox=open_inbox)
+        menu = icon._build_menu(_FakeTray)
+        item = next(it for it in menu.items if getattr(it, "label", None) == "待看文章")
+        open_inbox.assert_not_called()
+        with mock.patch.object(tray_mod.webbrowser, "open") as browser:
+            item.action(icon, item)
+        open_inbox.assert_called_once_with()
+        browser.assert_not_called()
+
+    def test_未接线或回调失败不泄露原因(self):
+        with tempfile.TemporaryDirectory() as base:
+            menu, _ = _built_menu(base)
+            with mock.patch.object(tray_mod, "_show_async") as show:
+                menu["待看文章"](None, None)
+                show.assert_called_once()
+            icon = tray_mod.TrayIcon(8765, mock.Mock(), mock.Mock(), base,
+                                     on_open_inbox=mock.Mock(side_effect=OSError("dummy-secret")))
+            item = next(it for it in icon._build_menu(_FakeTray).items
+                        if getattr(it, "label", None) == "待看文章")
+            with mock.patch.object(tray_mod, "_show_async") as show, \
+                    self.assertLogs("tray", level="WARNING") as logs:
+                item.action(icon, item)
+            show.assert_called_once()
+            self.assertNotIn("dummy-secret", str(show.call_args) + str(logs.output))
+
+
+    def test_窗口启动回报失败时给出可见提示(self):
+        icon = tray_mod.TrayIcon(8765, mock.Mock(), mock.Mock(), ".",
+                                 on_open_inbox=lambda: False)
+        menu = icon._build_menu(_FakeTray)
+        item = next(it for it in menu.items if getattr(it, "label", None) == "待看文章")
+        with mock.patch.object(tray_mod, "_show_async") as show:
+            item.action(icon, item)
+        show.assert_called_once()
+        self.assertIn("失败", show.call_args.args[1])
 
 
 class TestIconImage(unittest.TestCase):
@@ -157,7 +253,10 @@ class TestMenuActuallyResponds(unittest.TestCase):
         with mock.patch.object(tray_mod, "_show_message_box") as box, \
                 mock.patch.object(tray_mod.threading, "Thread") as th:
             th.return_value.start.return_value = None
-            self.menu["重启后要做什么？"](None, None)
+            self.assertIn("帮助", self.menu)
+            self.menu["帮助"][HELP_QUESTIONS[-1]](None, None)
+            th.return_value.start.assert_called_once_with()
+            box.assert_not_called()
             th.call_args.kwargs["target"]()
         box.assert_called_once()
         self.assertIn("重启", box.call_args.args[0])
@@ -214,12 +313,19 @@ class TestRestartSteps(unittest.TestCase):
         text = describe_restart_steps("laptop-x.tail1234.ts.net")
         self.assertIn("Funnel", text)
         self.assertIn("不用", text)
+        self.assertIn("自启", text)
+        self.assertIn("未运行", text, "装了自启但启动失败时，也要告诉用户如何恢复")
+        self.assertIn("图标", text)
+        self.assertNotIn("即算就绪", text)
         self.assertNotIn("每次重启都会变", text)
 
     def test_临时隧道地址要求重填(self):
         text = describe_restart_steps("random-words-here.trycloudflare.com")
         self.assertIn("临时隧道", text)
         self.assertIn("start_tunnel.py", text)
+        self.assertIn("窗口", text)
+        self.assertIn("完整地址", text)
+        self.assertIn("Webhook", text)
 
     def test_地址未知时给出两种方案(self):
         for host in (None, "", "example.com"):
@@ -233,6 +339,34 @@ class TestRestartSteps(unittest.TestCase):
             host = read_callback_host(base)
         self.assertEqual(host, "laptop-x.tail1234.ts.net")
         self.assertNotIn("abcdefghij", host)
+
+    def test_损坏或不支持的地址使用未知指引而非猜测隧道(self):
+        with tempfile.TemporaryDirectory() as base:
+            for authority in ("https://[broken.ts.net", "https://private.ts.net:bad",
+                              "ftp://private.ts.net", "https://private.ts.net.example.org",
+                              "https://name@private.ts.net", "https://bad host.ts.net"):
+                with self.subTest(authority=authority):
+                    _write_callback(base, authority + "/hook?token=dummy-secret")
+                    host = read_callback_host(base)
+                    self.assertEqual(describe_restart_steps(host), describe_restart_steps(None))
+
+    def test_每次点重启题都按当前地址回答且不显示主机或凭据(self):
+        with tempfile.TemporaryDirectory() as base, mock.patch.object(tray_mod, "_show_async") as show:
+            menu, _ = _built_menu(base)
+            self.assertIn("帮助", menu)
+            restart = menu["帮助"][HELP_QUESTIONS[-1]]
+            for host in (None, "private.ts.net", "private.trycloudflare.com", "[broken-private"):
+                with self.subTest(host=host):
+                    if host:
+                        _write_callback(base, f"https://{host}/hook?token=dummy-secret")
+                    restart(None, None)
+                    show.assert_called_once()
+                    title, body = show.call_args.args
+                    expected_host = None if host == "[broken-private" else host
+                    self.assertEqual(body, describe_restart_steps(expected_host))
+                    for private_text in ("private", "https://", "dummy-secret"):
+                        self.assertNotIn(private_text, title + body)
+                    show.reset_mock()
 
     def test_文件缺失返回None(self):
         with tempfile.TemporaryDirectory() as base:

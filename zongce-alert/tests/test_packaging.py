@@ -70,6 +70,11 @@ class TestPyProject(unittest.TestCase):
         self.assertIn("optional-dependencies", text)
         self.assertIn("pystray", text)
 
+    def test_收件箱模块包含在发行包内(self):
+        modules = re.search(r"^py-modules\s*=\s*\[([^]]+)\]", _read(self.path), re.M).group(1)
+        for name in ("inbox_store", "inbox_view"):
+            self.assertIn('"' + name + '"', modules)
+
     def test_核心依赖为空(self):
         """主程序只用标准库，硬依赖应为空列表。"""
         text = _read(self.path)
@@ -460,6 +465,19 @@ class TestDocsMatchCode(unittest.TestCase):
     写文档最容易犯的错是「按自己的想象写」，比如把某个日志说成 DEBUG 级，
     实际却是 INFO；或者引用了根本不存在的日志文案。用户照着文档排查就会走空。
     """
+
+    def test_新手能从首页和菜单说明找到帮助(self):
+        sys.path.insert(0, os.path.join(ROOT, "src"))
+        from tray import build_menu_labels
+
+        self.assertIn("帮助", build_menu_labels(port=8765))
+        self.assertIn("帮助", _read(os.path.join(ROOT, "README.md")))
+        config_doc = _read(os.path.join(DOCS, "CONFIG.md"))
+        menu_table = config_doc.split("### 托盘菜单", 1)[1].split("\n### ", 1)[0]
+        entries = [line.split("|")[1].strip().strip("*`") for line in menu_table.splitlines()
+                   if line.startswith("|")]
+        self.assertIn("帮助", entries)
+        self.assertNotIn("重启后要做什么？", entries)
 
     def test_配置文档记录的键都存在于默认配置(self):
         """CONFIG.md 里以 `"键":` 形式出现的名字，必须真能在默认配置里找到。
